@@ -1,0 +1,25 @@
+File describing the known bugs of the scripts.
+
+"plot_csv_data.py"
+
+    - The linear fit, "--fit-range [metavar1] [metavar2]", only fits the non-normalized data. The code does not fit with the
+    normalized resistance nor does it compute parameters with normalized values.
+
+    - When using "--normalized", if one also wants to plot the linear fit on some zoomed plot by also using "--show-fit-on zoom1";
+    it does not work for some reason. However, if one uses "--show-fit-on main" then it does show the fit on the main plot.
+
+    - "no-split" is redundant since if one does not use "branches" it has the same outcome. This should be changed to an argument
+    named "split" where seperate plots, e.g. one for coldown and one for warmup, are plotted and ideally analysed seperately.
+    This will allow for discrete analysis and plotting of warmup and cooling down cycles which can provide very different results
+    depending on the sample and therefore be interesting and usefull to analyse seperately. 
+
+
+
+
+
+
+
+
+
+
+
