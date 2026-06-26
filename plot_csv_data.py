@@ -91,31 +91,135 @@ def _fit_color(show_branches, dataset_color):
     """
     return "k" if show_branches else dataset_color
 
+def _scale_fit_for_plot(fit, R_ref):
+    """Return a copy of a fit dict whose polynomial is scaled by 1/R_ref.
+
+    Used when overlaying a fit (computed on raw R in Ohm) onto a
+    normalised R/R_ref plot. When R_ref == 1 the original dict is
+    returned unchanged.
+    """
+    if R_ref == 1.0:
+        return fit
+    scaled = dict(fit)
+    scaled["poly"] = np.poly1d([fit["slope"] / R_ref, fit["intercept"] / R_ref])
+    return scaled
 
 # ==================================================================
-# Generic CSV loading (shared by every analyze_* function)
+# CSV loading — one public entry point, one private loader per
+# instrument format.  Adding a new format later means writing a new
+# _load_csv_<name> function and adding its key to load_csv's dispatch
+# dict; nothing else in the module needs to change.
 # ==================================================================
 
-def load_csv(csv_path):
-    """Load a PPMS/MultiVu-style measurement CSV file.
+def _load_csv_ppms(csv_path):
+    """Load a PPMS / MultiVu-style measurement CSV.
 
-    Parameters
-    ----------
-    csv_path : str
-        Path to the .csv file.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Raw columns, sorted chronologically by 'Time Stamp (sec)'
-        (if present) so every analyze_* function can assume the
-        rows are already in acquisition order.
+    Rows are sorted by 'Time Stamp (sec)' if that column is present,
+    so downstream functions can assume chronological order.
+    Column names are returned as-is (PPMS naming conventions).
     """
     df = pd.read_csv(csv_path)
     if "Time Stamp (sec)" in df.columns:
         df = df.sort_values("Time Stamp (sec)").reset_index(drop=True)
     return df
 
+
+def _load_csv_rack(csv_path, channel, current):
+    """Load a custom-rack measurement CSV and normalise to PPMS conventions.
+
+    The rack stores the lock-in amplifier output voltage for each
+    channel (R1, R2, R3).  Resistance is computed as R = V / I using
+    the source current supplied by the user.  The selected channel is
+    mapped to 'Bridge 1' column names so that `analyze_RT` and every
+    downstream function works without modification.
+
+    The rack does not record a per-point standard deviation; the error
+    column is filled with zeros. Error bars are therefore meaningless
+    for rack data and should not be plotted (omit --errorbars).
+
+    Parameters
+    ----------
+    csv_path : str
+    channel : int
+        Lock-in channel to use: 1, 2, or 3 (columns R1, R2, R3).
+    current : float
+        Source current in Amperes (e.g. 1e-6 for 1 µA).
+
+    Returns
+    -------
+    pandas.DataFrame with columns matching PPMS Bridge-1 conventions:
+        'Temperature (K)'             — from Tsample
+        'Bridge 1 Resistivity (Ohm)' — R{channel} / current
+        'Bridge 1 Std. Dev. (Ohm)'   — 0.0  (not recorded by rack)
+    """
+    df = pd.read_csv(csv_path)
+
+    T_col = "Tsample"
+    V_col = f"R{channel}"
+    for col in (T_col, V_col):
+        if col not in df.columns:
+            raise ValueError(
+                f"Column '{col}' not found in rack CSV "
+                f"(channel={channel}). "
+                f"Available columns: {df.columns.tolist()}"
+            )
+
+    return pd.DataFrame({
+        "Temperature (K)":             df[T_col].astype(float).values,
+        "Bridge 1 Resistivity (Ohm)":  df[V_col].astype(float).values / current,
+        "Bridge 1 Std. Dev. (Ohm)":    0.0,
+    })
+
+
+_LOADERS = {
+    "ppms": _load_csv_ppms,
+    "rack": _load_csv_rack,
+}
+
+
+def load_csv(csv_path, source="ppms", current=None, channel=2):
+    """Load a transport-measurement CSV file from any supported instrument.
+
+    Dispatches to the appropriate format-specific loader based on
+    `source` and always returns a DataFrame with PPMS-compatible column
+    names, so every analyze_* function works regardless of origin.
+
+    Parameters
+    ----------
+    csv_path : str
+    source : {'ppms', 'rack'}
+        Instrument that produced the file:
+          'ppms' — PPMS / MultiVu (default).
+          'rack' — Custom rack with lock-in amplifier (Tsample + R channels).
+    current : float, optional
+        Source current in Amperes. **Required** when source='rack'
+        (e.g. current=1e-6 for 1 µA).  Ignored for source='ppms'.
+    channel : int
+        Lock-in channel to read from the rack CSV (1→R1, 2→R2, 3→R3).
+        Default: 2.  Ignored for source='ppms'.
+
+    Returns
+    -------
+    pandas.DataFrame with PPMS Bridge-1 column names in all cases.
+
+    Raises
+    ------
+    ValueError
+        If source is unknown, or if source='rack' and current is None.
+    """
+    if source not in _LOADERS:
+        raise ValueError(
+            f"Unknown source '{source}'. "
+            f"Choose one of: {list(_LOADERS)}"
+        )
+    if source == "rack":
+        if current is None:
+            raise ValueError(
+                "source='rack' requires the 'current' parameter "
+                "(source current in Amperes, e.g. current=1e-6 for 1 µA)."
+            )
+        return _load_csv_rack(csv_path, channel=channel, current=current)
+    return _load_csv_ppms(csv_path)
 
 # ==================================================================
 # R(T): resistance vs. temperature
@@ -134,9 +238,9 @@ def _RT_columns(bridge):
     return (f"Bridge {bridge} Resistivity (Ohm-m)",
             f"Bridge {bridge} Std. Dev. (Ohm-m)")
 
-
 def analyze_RT(data_source, bridge=1, area_correction=1.0,
-                split_branches=True, dropna=True, skip_points=0):
+                split_branches=True, dropna=True, skip_points=0,
+                source="ppms", current=None, channel=2):
     """Extract R(T) data from a transport CSV file.
 
     Parameters
@@ -182,7 +286,9 @@ def analyze_RT(data_source, bridge=1, area_correction=1.0,
                    (only present if split_branches=True)
         'bridge' : int, the bridge number used
     """
-    df = data_source if isinstance(data_source, pd.DataFrame) else load_csv(data_source)
+    df = (data_source if isinstance(data_source, pd.DataFrame)
+          else load_csv(data_source, source=source,
+                        current=current, channel=channel))
 
     res_col, err_col = _RT_columns(bridge)
 
@@ -211,6 +317,7 @@ def analyze_RT(data_source, bridge=1, area_correction=1.0,
         "T_ref": T_ref, "R_ref": R_ref,
         "R_norm": R_norm, "dR_norm": dR_norm,
         "bridge": bridge,
+        "source": source,
     }
 
     if split_branches and len(T) > 0:
@@ -891,6 +998,20 @@ def _add_RT_parser(subparsers):
                          "--rrr-temp when computing R_low (default: 0.5 K). "
                          "Increase if few data points fall near that "
                          "temperature.")
+    p.add_argument("--source", choices=["ppms", "rack"], default="ppms",
+                    help="Instrument that produced the CSV file(s): "
+                         "'ppms' for PPMS/MultiVu (default), "
+                         "'rack' for the custom rack with lock-in amplifier.")
+    p.add_argument("--current", type=float, default=None, metavar="AMPS",
+                    help="Source current in Amperes. Required when "
+                         "--source rack (e.g. --current 1e-6 for 1 µA). "
+                         "Used to convert the recorded voltage to resistance: "
+                         "R = V / I.")
+    p.add_argument("--channel", type=int, default=2, choices=[1, 2, 3],
+                    metavar="{1,2,3}",
+                    help="Lock-in amplifier channel to read from the rack CSV "
+                         "(1→R1, 2→R2, 3→R3). Default: 2. "
+                         "Only relevant when --source rack.")
     return p
 
 
@@ -907,9 +1028,13 @@ def _run_RT(args):
     # ---- load + fit data for every input file ----
     datasets = []
     for csv_file, label, color in zip(args.csv_files, labels, color_cycle):
-        data = analyze_RT(csv_file, bridge=args.bridge,
+        data = analyze_RT(csv_file,
+                           bridge=1 if args.source == "rack" else args.bridge,
                            split_branches=not args.no_split,
-                           skip_points=args.skip_points)
+                           skip_points=args.skip_points,
+                           source=args.source,
+                           current=args.current,
+                           channel=args.channel)
  
         fit = None
         if args.fit_range is not None:
@@ -956,6 +1081,10 @@ def _run_RT(args):
                 f"({rrr_result['n_pts_low']} pts in window) "
                 f"= {rrr_result['RRR']:.2f}"
             )
+
+        if args.source == "rack" and args.current is None:
+            raise ValueError("--source rack requires --current AMPS "
+                             "(e.g. --current 1e-6 for 1 µA).")
  
         plot_RT(data, ax=ax, show_errorbars=args.errorbars,
                 show_branches=args.branches, normalized=args.normalized,
@@ -966,7 +1095,11 @@ def _run_RT(args):
     if "main" in show_fit_on:
         for ds in datasets:
             if ds["fit"] is not None:
-                plot_linear_fit(ds["fit"], ax=ax,
+                display_fit = _scale_fit_for_plot(
+                        ds["fit"],
+                        ds["data"]["R_ref"] if args.normalized else 1.0,
+                    )
+                plot_linear_fit(display_fit, ax=ax,
                                  color=_fit_color(args.branches, ds["color"]),
                                  label=f"{ds['label']} linear fit")
  
@@ -995,9 +1128,13 @@ def _run_RT(args):
         if f"zoom{i}" in show_fit_on:
             for ds in datasets:
                 if ds["fit"] is not None:
-                    plot_linear_fit(ds["fit"], ax=zoom_ax,
-                                     color=_fit_color(args.branches, ds["color"]),
-                                     label=f"{ds['label']} linear fit")
+                    display_fit = _scale_fit_for_plot(
+                            ds["fit"],
+                            ds["data"]["R_ref"] if args.normalized else 1.0,
+                        )
+                    plot_linear_fit(display_fit, ax=ax,
+                                    color=_fit_color(args.branches, ds["color"]),
+                                    label=f"{ds['label']} linear fit")
  
         zoom_path = f"{base}_zoom_{xmin:g}-{xmax:g}{ext}"
         zoom_fig.savefig(zoom_path)
