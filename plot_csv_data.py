@@ -833,8 +833,20 @@ def plot_linear_fit(fit, ax, x_range=None, color="k", ls="--", lw=1.0,
     ax.plot(x, y, ls=ls, lw=lw, color=color, marker="none", label=label, **kwargs)
  
     if show_fit_window:
-        ax.axvspan(*fit["x_range"], color=color, alpha=0.08, lw=0,
-                    label="_nolegend_")
+        # Clip the shaded band to the axes' current x-limits before
+        # calling axvspan. Without clipping, a fit range that extends
+        # beyond the zoom window (e.g. fit over 12–300 K on a 2–20 K
+        # panel) causes matplotlib to silently expand the x-axis to
+        # fit the full span, de-zooming the panel and making the fit
+        # line invisible. The clip ensures axvspan never draws outside
+        # what is already visible; if the fit window doesn't intersect
+        # the zoom at all, nothing is drawn.
+        view_lo, view_hi = ax.get_xlim()
+        span_lo = max(fit["x_range"][0], view_lo)
+        span_hi = min(fit["x_range"][1], view_hi)
+        if span_lo < span_hi:
+            ax.axvspan(span_lo, span_hi, color=color, alpha=0.08, lw=0,
+                        label="_nolegend_")
  
     return ax
 
@@ -1081,10 +1093,6 @@ def _run_RT(args):
                 f"({rrr_result['n_pts_low']} pts in window) "
                 f"= {rrr_result['RRR']:.2f}"
             )
-
-        if args.source == "rack" and args.current is None:
-            raise ValueError("--source rack requires --current AMPS "
-                             "(e.g. --current 1e-6 for 1 µA).")
  
         plot_RT(data, ax=ax, show_errorbars=args.errorbars,
                 show_branches=args.branches, normalized=args.normalized,
@@ -1102,7 +1110,7 @@ def _run_RT(args):
                 plot_linear_fit(display_fit, ax=ax,
                                  color=_fit_color(args.branches, ds["color"]),
                                  label=f"{ds['label']} linear fit")
- 
+        ax.legend()
     fig.savefig(args.output)
     print(f"Saved {args.output}")
  
@@ -1121,7 +1129,6 @@ def _run_RT(args):
                         show_branches=args.branches,
                         normalized=args.normalized,
                         label=ds["label"], color=ds["color"])
- 
         # fit overlay: x_range=None lets plot_linear_fit default to
         # the zoom panel's x-limits, so the line is extrapolated across
         # the full window even if fit was computed on a different range.
@@ -1132,17 +1139,16 @@ def _run_RT(args):
                             ds["fit"],
                             ds["data"]["R_ref"] if args.normalized else 1.0,
                         )
-                    plot_linear_fit(display_fit, ax=ax,
+                    plot_linear_fit(display_fit, ax=zoom_ax,
                                     color=_fit_color(args.branches, ds["color"]),
                                     label=f"{ds['label']} linear fit")
- 
+            zoom_ax.legend()
         zoom_path = f"{base}_zoom_{xmin:g}-{xmax:g}{ext}"
         zoom_fig.savefig(zoom_path)
         print(f"Saved {zoom_path}")
 
 PLOT_TYPES = {
     "RT": (_add_RT_parser, _run_RT),
-    # "IV": (_add_IV_parser, _run_IV),   # to be added later
 }
 
 def main():
