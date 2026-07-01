@@ -123,102 +123,36 @@ def _load_csv_ppms(csv_path):
         df = df.sort_values("Time Stamp (sec)").reset_index(drop=True)
     return df
 
-
-def _load_csv_rack(csv_path, channel, current):
-    """Load a custom-rack measurement CSV and normalise to PPMS conventions.
-
-    The rack stores the lock-in amplifier output voltage for each
-    channel (R1, R2, R3).  Resistance is computed as R = V / I using
-    the source current supplied by the user.  The selected channel is
-    mapped to 'Bridge 1' column names so that `analyze_RT` and every
-    downstream function works without modification.
-
-    The rack does not record a per-point standard deviation; the error
-    column is filled with zeros. Error bars are therefore meaningless
-    for rack data and should not be plotted (omit --errorbars).
-
-    Parameters
-    ----------
-    csv_path : str
-    channel : int
-        Lock-in channel to use: 1, 2, or 3 (columns R1, R2, R3).
-    current : float
-        Source current in Amperes (e.g. 1e-6 for 1 µA).
-
-    Returns
-    -------
-    pandas.DataFrame with columns matching PPMS Bridge-1 conventions:
-        'Temperature (K)'             — from Tsample
-        'Bridge 1 Resistivity (Ohm)' — R{channel} / current
-        'Bridge 1 Std. Dev. (Ohm)'   — 0.0  (not recorded by rack)
-    """
+def _load_csv_rack(csv_path, signal_col, current):
     df = pd.read_csv(csv_path)
 
     T_col = "Tsample"
-    V_col = f"R{channel}"
+    V_col = signal_col
     for col in (T_col, V_col):
         if col not in df.columns:
-            raise ValueError(
-                f"Column '{col}' not found in rack CSV "
-                f"(channel={channel}). "
-                f"Available columns: {df.columns.tolist()}"
-            )
+            raise ValueError(f"Column '{col}' not found. Available: {df.columns.tolist()}")
 
     return pd.DataFrame({
-        "Temperature (K)":             df[T_col].astype(float).values,
-        "Bridge 1 Resistivity (Ohm)":  df[V_col].astype(float).values / current,
-        "Bridge 1 Std. Dev. (Ohm)":    0.0,
+        "Temperature (K)": df[T_col].astype(float).values,
+        "Bridge 1 Resistivity (Ohm)": df[V_col].astype(float).values / current,
+        "Bridge 1 Std. Dev. (Ohm)": 0.0,
     })
-
 
 _LOADERS = {
     "ppms": _load_csv_ppms,
     "rack": _load_csv_rack,
 }
 
-
-def load_csv(csv_path, source="ppms", current=None, channel=2):
-    """Load a transport-measurement CSV file from any supported instrument.
-
-    Dispatches to the appropriate format-specific loader based on
-    `source` and always returns a DataFrame with PPMS-compatible column
-    names, so every analyze_* function works regardless of origin.
-
-    Parameters
-    ----------
-    csv_path : str
-    source : {'ppms', 'rack'}
-        Instrument that produced the file:
-          'ppms' — PPMS / MultiVu (default).
-          'rack' — Custom rack with lock-in amplifier (Tsample + R channels).
-    current : float, optional
-        Source current in Amperes. **Required** when source='rack'
-        (e.g. current=1e-6 for 1 µA).  Ignored for source='ppms'.
-    channel : int
-        Lock-in channel to read from the rack CSV (1→R1, 2→R2, 3→R3).
-        Default: 2.  Ignored for source='ppms'.
-
-    Returns
-    -------
-    pandas.DataFrame with PPMS Bridge-1 column names in all cases.
-
-    Raises
-    ------
-    ValueError
-        If source is unknown, or if source='rack' and current is None.
-    """
+def load_csv(csv_path, source="ppms", current=None, channel=2, signal_col=None):
+    """Load a transport-measurement CSV file from any supported instrument."""
     if source not in _LOADERS:
-        raise ValueError(
-            f"Unknown source '{source}'. "
-            f"Choose one of: {list(_LOADERS)}"
-        )
+        raise ValueError(f"Unknown source '{source}'.")
     if source == "rack":
         if current is None:
-            raise ValueError(
-                "source='rack' requires the 'current' parameter "
-                "(source current in Amperes, e.g. current=1e-6 for 1 µA)."
-            )
-        return _load_csv_rack(csv_path, channel=channel, current=current)
+            raise ValueError("source='rack' requires the 'current' parameter.")
+        if signal_col is None:
+            signal_col = f"R{channel}"
+        return _load_csv_rack(csv_path, signal_col=signal_col, current=current)
     return _load_csv_ppms(csv_path)
 
 # ==================================================================
@@ -240,7 +174,7 @@ def _RT_columns(bridge):
 
 def analyze_RT(data_source, bridge=1, area_correction=1.0,
                 split_branches=True, dropna=True, skip_points=0,
-                source="ppms", current=None, channel=2):
+                source="ppms", current=None, channel=2, signal_col=None):
     """Extract R(T) data from a transport CSV file.
 
     Parameters
@@ -287,8 +221,8 @@ def analyze_RT(data_source, bridge=1, area_correction=1.0,
         'bridge' : int, the bridge number used
     """
     df = (data_source if isinstance(data_source, pd.DataFrame)
-          else load_csv(data_source, source=source,
-                        current=current, channel=channel))
+        else load_csv(data_source, source=source,
+                    current=current, channel=channel, signal_col=signal_col))
 
     res_col, err_col = _RT_columns(bridge)
 
@@ -299,16 +233,28 @@ def analyze_RT(data_source, bridge=1, area_correction=1.0,
     if dropna:
         sub = sub.dropna(subset=[res_col]).reset_index(drop=True)
 
+    # Reference point for normalization: prefer a high-T point (normal state)
+    # Fall back to first point if no high-T data is available
     T = sub["Temperature (K)"].to_numpy(dtype=float)
     R = sub[res_col].to_numpy(dtype=float) * area_correction
     dR = sub[err_col].to_numpy(dtype=float) * area_correction
 
-    # Reference point: first measurement temperature after skipping,
-    # rounded to the nearest integer (displayed on the normalised axis
-    # label so the reader knows exactly what R was divided by).
-    T_ref = int(round(float(T[0]))) if len(T) > 0 else 0
-    mask_ref = np.abs(T - T_ref) <= 1.0
-    R_ref = float(np.mean(R[mask_ref])) if np.any(mask_ref) else float(R[0])
+    if len(T) > 0:
+        # Try to find a reference near the highest temperature (normal state)
+        T_max = float(np.max(T))
+        T_ref_candidate = int(round(T_max))
+        mask_ref = np.abs(T - T_ref_candidate) <= 2.0  # wider window for sparse data
+        if np.any(mask_ref):
+            R_ref = float(np.mean(R[mask_ref]))
+            T_ref = T_ref_candidate
+        else:
+            # Fallback to first point
+            T_ref = int(round(float(T[0])))
+            mask_ref = np.abs(T - T_ref) <= 1.0
+            R_ref = float(np.mean(R[mask_ref])) if np.any(mask_ref) else float(R[0])
+    else:
+        T_ref = 0
+        R_ref = 1.0
     R_norm  = R  / R_ref
     dR_norm = dR / R_ref
 
@@ -318,6 +264,7 @@ def analyze_RT(data_source, bridge=1, area_correction=1.0,
         "R_norm": R_norm, "dR_norm": dR_norm,
         "bridge": bridge,
         "source": source,
+        "signal_col": signal_col,
     }
 
     if split_branches and len(T) > 0:
@@ -328,7 +275,6 @@ def analyze_RT(data_source, bridge=1, area_correction=1.0,
 
     return result
 
-
 def _draw_RT(ax, T, R, dR, show_errorbars, color, marker, markersize,
              label, **kwargs):
     """Low-level draw step shared by both branches/no-branches cases."""
@@ -338,7 +284,6 @@ def _draw_RT(ax, T, R, dR, show_errorbars, color, marker, markersize,
                     label=label, **kwargs)
     else:
         ax.plot(T, R, marker, color=color, ms=ms, label=label, **kwargs)
-
 
 def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
             normalized=False, color="k", branch_colors=None, marker="o",
@@ -432,6 +377,9 @@ def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
 
     return ax
 
+# ==================================================================
+# I(V) and dV/dI: current vs voltage
+# ==================================================================
 
 # ==================================================================
 # Generic "zoom-in" helpers
@@ -1023,9 +971,70 @@ def _add_RT_parser(subparsers):
                     metavar="{1,2,3}",
                     help="Lock-in amplifier channel to read from the rack CSV "
                          "(1→R1, 2→R2, 3→R3). Default: 2. "
-                         "Only relevant when --source rack.")
+                         "Only relevant when --source rack. Legacy single-channel.")
+    p.add_argument("--rack-signals", nargs="*", default=None,
+                    help="For source='rack', specify multiple signal columns "
+                         "and optional legends, e.g. X1:Josephson R2:bottom_flake "
+                         "X2:top_flake. Each item is 'col' or 'col:legend'. "
+                         "If provided, treats as multiple datasets from one CSV, "
+                         "overrides --channel and --labels for rack.")
     return p
 
+def _add_IV_dVdI_parser(subparsers):
+    p = subparsers.add_parser("IV_dVdI", help="I(V) and dV/dI")
+    p.add_argument("csv_files", nargs="+",
+                    help="One or more measurement CSV file(s) to plot together")
+    p.add_argument("--errorbars", action="store_true",
+                    help="Plot with error bars (default: off)")
+    p.add_argument("--branches", action="store_true",
+                    help="Color forward/backward branches separately")
+    p.add_argument("--skip-points", type=int, default=0,
+                    help="Discard this many points from the start of the run "
+                         "(e.g. turning on the sourcemeter and the current jumping from 0 to a given value)")
+    p.add_argument("--labels", nargs="+", default=None,
+                    help="Legend label(s), one per CSV file "
+                         "(defaults to each file's name)")
+    p.add_argument("-o", "--output", default="RT_plot.pdf",
+                    help="Output figure path (default: RT_plot.pdf)")
+    p.add_argument("--figsize", nargs=2, type=float, default=(8.6, 6.0),
+                    metavar=("WIDTH_CM", "HEIGHT_CM"),
+                    help="Figure size in cm (default: 8.6 6.0)")
+    p.add_argument("--find-Rn", action="store_true",
+                    help="Determine the normal state resistance." \
+                    "defined as the slope of the I(V) curve in the" \
+                    "normal region at positive bias.")
+    p.add_argument("--find-Jc", action="store_true",
+                    help="Determine the critical current density in kA/cm2")
+    p.add_argument("--find-IcRn", action="store_true",
+                    help="Calculate the Josephson coupling strength")
+    p.add_argument("--normalized", action="store_true",
+                    help="Calculate dV/dI normalized with Rn")
+    p.add_argument("--source", choices=["ppms", "rack"], default="ppms",
+                    help="Instrument that produced the CSV file(s): "
+                         "'ppms' for PPMS/MultiVu (default), "
+                         "'rack' for the custom rack with lock-in amplifier.")
+    p.add_argument("--current", type=float, default=None, metavar="AMPS",
+                    help="Source current in Amperes. Required when "
+                         "--source rack (e.g. --current 1e-6 for 1 µA). "
+                         "Used to convert the recorded voltage to resistance: "
+                         "R = V / I.")
+    p.add_argument("--channel-dV", type=int, default=2, choices=[1, 2, 3],
+                    metavar="{1,2,3}",
+                    help="Lock-in amplifier channel to read from the rack CSV "
+                         "(1→R1/X1, 2→R2/X2, 3→R3/X3). Default: 2. "
+                         "Only relevant when --source rack.")
+    p.add_argument("--channel-dI", type=int, default=1, choices=[1, 2, 3],
+                    metavar="{1,2,3}",
+                    help="Lock-in amplifier channel to read from the rack CSV "
+                         "(1→R1/X1, 2→R2/X2, 3→R3/X3). Default: 1. "
+                         "Only relevant when --source rack.")
+    p.add_argument("--compute-dIdV", action="store_true",
+                    help="From the values of the dV and dI data, numerically" \
+                    "compute the differenciated dI/dV values and plot them " \
+                    "in function of the bias voltage calculated from the sourced current" \
+                    "Is with the value of the circuit resistance given as an " \
+                    "input by the user.")
+    return p
 
 def _run_RT(args):
     """Execute the `RT` subcommand: call analyze_RT / plot_RT and save."""
@@ -1039,65 +1048,131 @@ def _run_RT(args):
  
     # ---- load + fit data for every input file ----
     datasets = []
-    for csv_file, label, color in zip(args.csv_files, labels, color_cycle):
-        data = analyze_RT(csv_file,
-                           bridge=1 if args.source == "rack" else args.bridge,
-                           split_branches=not args.no_split,
-                           skip_points=args.skip_points,
-                           source=args.source,
-                           current=args.current,
-                           channel=args.channel)
- 
-        fit = None
-        if args.fit_range is not None:
-            fit = fit_linear_RT(data, tuple(args.fit_range),
-                                 branch=args.fit_branch)
-            print(
-                f"[{label}] Linear fit over "
-                f"{args.fit_range[0]:g}–{args.fit_range[1]:g} K "
-                f"({fit['n_points']} pts, "
-                f"branch={args.fit_branch or 'both'}):\n"
-                f"  dR/dT  = {fit['slope']:.4g} ± {fit['slope_err']:.2g} Ω/K\n"
-                f"  R(T=0) = {fit['intercept']:.4g} ± {fit['intercept_err']:.2g} Ω"
-            )
- 
-        if args.find_tc:
-            tc_result = find_Tc_RT(
-                data,
-                criterion=args.tc_criterion,
-                T_normal_range=(tuple(args.tc_normal_range)
-                                if args.tc_normal_range else None),
-            )
-            pct = int(round(tc_result["criterion"] * 100))
-            print(
-                f"[{label}] Tc ({pct}% criterion, "
-                f"R_normal = {tc_result['R_normal']:.4g} Ω from "
-                f"{tc_result['n_normal_points']} pts):"
-            )
-            for branch_name, Tc_val in tc_result["Tc_branches"].items():
-                val_str = f"{Tc_val:.1f} K" if Tc_val is not None else "not found"
-                print(f"  {branch_name.capitalize():<12}: {val_str}")
-            mean_str = (f"{tc_result['Tc']:.1f} K"
-                        if tc_result["Tc"] is not None else "not found")
-            print(f"  {'Mean':<12}: {mean_str}")
- 
-        if args.rrr:
-            if args.rrr_temp is None:
-                raise ValueError("--rrr requires --rrr-temp T_LOW")
-            rrr_result = compute_RRR_RT(data, T_low=args.rrr_temp,
-                                         window=args.rrr_window)
-            print(
-                f"[{label}] RRR = R({rrr_result['T_high']} K) / "
-                f"R({rrr_result['T_low']} K) "
-                f"= {rrr_result['R_high']:.4g} / {rrr_result['R_low']:.4g} "
-                f"({rrr_result['n_pts_low']} pts in window) "
-                f"= {rrr_result['RRR']:.2f}"
-            )
- 
-        plot_RT(data, ax=ax, show_errorbars=args.errorbars,
-                show_branches=args.branches, normalized=args.normalized,
-                label=label, color=color)
-        datasets.append({"data": data, "label": label, "color": color, "fit": fit})
+    is_multi_rack = (args.source == "rack" and getattr(args, 'rack_signals', None) is not None and len(getattr(args, 'rack_signals', [])) > 0)
+
+    for csv_file in args.csv_files:
+        if is_multi_rack:
+            signal_list = []
+            for item in args.rack_signals:
+                if ':' in item:
+                    col, leg = [x.strip() for x in item.split(':', 1)]
+                    signal_list.append((col, leg))
+                else:
+                    col = item.strip()
+                    signal_list.append((col, col))
+            
+            csv_base = os.path.splitext(os.path.basename(csv_file))[0]
+            for s_idx, (sig_col, leg) in enumerate(signal_list):
+                color = color_cycle[s_idx % len(color_cycle)]
+                data = analyze_RT(csv_file,
+                                   bridge=1,
+                                   split_branches=not args.no_split,
+                                   skip_points=args.skip_points,
+                                   source=args.source,
+                                   current=args.current,
+                                   signal_col=sig_col)
+                label = leg
+                fit = None
+                if args.fit_range is not None:
+                    fit = fit_linear_RT(data, tuple(args.fit_range), branch=args.fit_branch)
+                    print(f"[{csv_base} | {label}] Linear fit over {args.fit_range[0]:g}–{args.fit_range[1]:g} K ({fit['n_points']} pts, branch={args.fit_branch or 'both'})")
+                if args.find_tc:
+                    tc_result = find_Tc_RT(
+                        data,
+                        criterion=args.tc_criterion,
+                        T_normal_range=(tuple(args.tc_normal_range)
+                                        if args.tc_normal_range else None),
+                    )
+                    pct = int(round(tc_result["criterion"] * 100))
+                    print(
+                        f"[{label}] Tc ({pct}% criterion, "
+                        f"R_normal = {tc_result['R_normal']:.4g} Ω from "
+                        f"{tc_result['n_normal_points']} pts):"
+                    )
+                    for branch_name, Tc_val in tc_result["Tc_branches"].items():
+                        val_str = f"{Tc_val:.1f} K" if Tc_val is not None else "not found"
+                        print(f"  {branch_name.capitalize():<12}: {val_str}")
+                    mean_str = (f"{tc_result['Tc']:.1f} K"
+                                if tc_result["Tc"] is not None else "not found")
+                    print(f"  {'Mean':<12}: {mean_str}")
+                if args.rrr:
+                    if args.rrr_temp is None:
+                        raise ValueError("--rrr requires --rrr-temp T_LOW")
+                    rrr_result = compute_RRR_RT(data, T_low=args.rrr_temp,
+                                                window=args.rrr_window)
+                    print(
+                        f"[{label}] RRR = R({rrr_result['T_high']} K) / "
+                        f"R({rrr_result['T_low']} K) "
+                        f"= {rrr_result['R_high']:.4g} / {rrr_result['R_low']:.4g} "
+                        f"({rrr_result['n_pts_low']} pts in window) "
+                        f"= {rrr_result['RRR']:.2f}"
+                    )
+                plot_RT(data, ax=ax, show_errorbars=args.errorbars,
+                        show_branches=args.branches, normalized=args.normalized,
+                        label=label, color=color)
+                datasets.append({"data": data, "label": label, "color": color, "fit": fit})
+        else:
+            # Original single-dataset per file logic
+            label = labels[csv_file]
+            color = color_cycle[csv_file % len(color_cycle)]
+            data = analyze_RT(csv_file,
+                               bridge=1 if args.source == "rack" else args.bridge,
+                               split_branches=not args.no_split,
+                               skip_points=args.skip_points,
+                               source=args.source,
+                               current=args.current,
+                               channel=args.channel)
+
+            fit = None
+            if args.fit_range is not None:
+                fit = fit_linear_RT(data, tuple(args.fit_range),
+                                     branch=args.fit_branch)
+                print(
+                    f"[{label}] Linear fit over "
+                    f"{args.fit_range[0]:g}–{args.fit_range[1]:g} K "
+                    f"({fit['n_points']} pts, "
+                    f"branch={args.fit_branch or 'both'}):\n"
+                    f"  dR/dT  = {fit['slope']:.4g} ± {fit['slope_err']:.2g} Ω/K\n"
+                    f"  R(T=0) = {fit['intercept']:.4g} ± {fit['intercept_err']:.2g} Ω"
+                )
+
+            if args.find_tc:
+                tc_result = find_Tc_RT(
+                    data,
+                    criterion=args.tc_criterion,
+                    T_normal_range=(tuple(args.tc_normal_range)
+                                    if args.tc_normal_range else None),
+                )
+                pct = int(round(tc_result["criterion"] * 100))
+                print(
+                    f"[{label}] Tc ({pct}% criterion, "
+                    f"R_normal = {tc_result['R_normal']:.4g} Ω from "
+                    f"{tc_result['n_normal_points']} pts):"
+                )
+                for branch_name, Tc_val in tc_result["Tc_branches"].items():
+                    val_str = f"{Tc_val:.1f} K" if Tc_val is not None else "not found"
+                    print(f"  {branch_name.capitalize():<12}: {val_str}")
+                mean_str = (f"{tc_result['Tc']:.1f} K"
+                            if tc_result["Tc"] is not None else "not found")
+                print(f"  {'Mean':<12}: {mean_str}")
+
+            if args.rrr:
+                if args.rrr_temp is None:
+                    raise ValueError("--rrr requires --rrr-temp T_LOW")
+                rrr_result = compute_RRR_RT(data, T_low=args.rrr_temp,
+                                             window=args.rrr_window)
+                print(
+                    f"[{label}] RRR = R({rrr_result['T_high']} K) / "
+                    f"R({rrr_result['T_low']} K) "
+                    f"= {rrr_result['R_high']:.4g} / {rrr_result['R_low']:.4g} "
+                    f"({rrr_result['n_pts_low']} pts in window) "
+                    f"= {rrr_result['RRR']:.2f}"
+                )
+
+            plot_RT(data, ax=ax, show_errorbars=args.errorbars,
+                    show_branches=args.branches, normalized=args.normalized,
+                    label=label, color=color)
+            datasets.append({"data": data, "label": label, "color": color, "fit": fit})
  
     # ---- optionally draw fit on the main panel ----
     if "main" in show_fit_on:
@@ -1147,8 +1222,12 @@ def _run_RT(args):
         zoom_fig.savefig(zoom_path)
         print(f"Saved {zoom_path}")
 
+def _run_IV_dVdI(args):
+    print()
+
 PLOT_TYPES = {
     "RT": (_add_RT_parser, _run_RT),
+    "IV_dVdI": (_add_IV_dVdI_parser, _run_IV_dVdI),
 }
 
 def main():
