@@ -445,19 +445,21 @@ def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack", curr
     }
 
 def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k", 
-                 marker="o", markersize=None, label=None, **kwargs):
-    """Plot with convenient units."""
+                 marker="o", markersize=None, label=None, figsize=None, **kwargs):
+    """Plot I(V) related quantities with paper style and figsize support."""
     set_paper_style()
 
     created_fig = ax is None
     if created_fig:
-        fig, ax = plt.subplots(figsize=(6.5, 5))
+        if figsize is None:
+            figsize = (8.6, 6.0)
+        fig, ax = plt.subplots(figsize=(figsize[0]/2.54, figsize[1]/2.54))
 
     # Unit scaling
-    I_ma = data["I"] * 1e3          # A → mA
-    V_mv = data["V"] * 1e3          # V → mV
-    dV_uv = data["dV"] * 1e6        # V → µV
-    dI_ma = data["dI"] * 1e3        # A → mA
+    I_ma = data["I"] * 1e3
+    V_mv = data["V"] * 1e3
+    dV_uv = data["dV"] * 1e6
+    dI_ma = data["dI"] * 1e3
 
     if plot_type == "iv":
         x, y = I_ma, V_mv
@@ -505,16 +507,15 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
         fig.tight_layout()
     return ax
 
-def plot_iv_diagnostics(data, base_name="iv_diagnostics"):
-    """Generate several useful diagnostic plots for I(V) analysis."""
+def plot_iv_diagnostics(data, base_name="iv_diagnostics", figsize=(8.6, 6.0)):
     set_paper_style()
     types = ['iv', 'dvdI', 'dv', 'di', 't']
     for t in types:
-        fig, ax = plt.subplots(figsize=(6.5, 5))
-        plot_IV_dVdI(data, ax=ax, plot_type=t, show_branches=True)
+        fig, ax = plt.subplots(figsize=(figsize[0]/2.54, figsize[1]/2.54))
+        plot_IV_dVdI(data, ax=ax, plot_type=t, show_branches=True, figsize=figsize)
         fig.savefig(f"{base_name}_{t}.pdf")
         plt.close(fig)
-    print(f"Saved diagnostic plots: {base_name}_*.pdf")
+    print(f"Saved diagnostic plots for {base_name}")
 
 # ==================================================================
 # Generic "zoom-in" helpers
@@ -1122,9 +1123,11 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument("--channel-dI", type=int, default=1, choices=[1,2,3],
                     help="Channel for dI (default: 1)")
     p.add_argument("--errorbars", action="store_true")
-    p.add_argument("--branches", action="store_true", default=True,
-                    help="Color forward/backward branches differently")
+    p.add_argument("--branches", action="store_true", default=True)
     p.add_argument("-o", "--output", default="IV_plot.pdf")
+    p.add_argument("--figsize", nargs=2, type=float, default=(8.6, 6.0),
+                    metavar=("WIDTH_CM", "HEIGHT_CM"),
+                    help="Figure size in cm (default: 8.6 6.0)")
     p.add_argument("--source", choices=["rack"], default="rack")
     return p
 
@@ -1318,7 +1321,8 @@ def _run_IV_dVdI(args):
     set_paper_style()
     for csv_file in args.csv_files:
         data = analyze_IV_dVdI(csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI)
-        plot_iv_diagnostics(data, base_name="iv_diagnostics_" + os.path.splitext(os.path.basename(csv_file))[0])
+        base = os.path.splitext(os.path.basename(csv_file))[0]
+        plot_iv_diagnostics(data, base_name=f"iv_diagnostics_{base}", figsize=args.figsize)
         print(f"Processed {csv_file}")
 
 PLOT_TYPES = {
