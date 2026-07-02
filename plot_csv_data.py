@@ -31,6 +31,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+import re
+import glob
+
 
 # ==================================================================
 # Style / display helpers
@@ -148,6 +151,7 @@ def _load_csv_rack(csv_path, mode="rt", **kwargs):
         channel_dI = kwargs.get("channel_dI", 1)
         dV_col = f"R{channel_dV}"
         dI_col = f"X{channel_dI}"
+        
         return pd.DataFrame({
             "Current (A)": df["Is"].astype(float).values,
             "Voltage (V)": df["Vdmm"].astype(float).values,
@@ -433,6 +437,8 @@ def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack", curr
         i_turn = np.where(diffs < 0)[0][0] + 1
         branch[i_turn:] = "backward"
 
+    is_bf = np.any(diffs < 0) if 'diffs' in locals() else False
+
     return {
         "I": I,
         "V": V,
@@ -442,7 +448,35 @@ def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack", curr
         "T": T,
         "branch": branch,
         "source": source,
+        "is_bf": is_bf,
     }
+
+def load_multi_iv_files(pattern_or_list, channel_dV=2, channel_dI=1):
+    import glob
+    if isinstance(pattern_or_list, str):
+        expanded = os.path.expanduser(pattern_or_list)
+        files = glob.glob(expanded)
+    else:
+        files = pattern_or_list if isinstance(pattern_or_list, list) else [pattern_or_list]
+    
+    files = [f for f in files if f.endswith('.csv')]
+    
+    datasets = []
+    for f in sorted(files):
+        match = re.search(r'_(\d+\.?\d*)K_', f)
+        T = float(match.group(1)) if match else None
+        data = analyze_IV_dVdI(f, channel_dV=channel_dV, channel_dI=channel_dI)
+        data['T_mean'] = T or np.mean(data['T'])
+        data['filename'] = f
+        datasets.append(data)
+
+    if datasets:
+        bf_statuses = [d.get('is_bf', False) for d in datasets]
+        if not all(x == bf_statuses[0] for x in bf_statuses):
+            raise ValueError("All files must be either Forward-only or BF measurements. Mixed types detected.")
+        print(f"Loaded {len(datasets)} files. BF mode: {bf_statuses[0]}")
+    
+    return datasets
 
 def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k", 
                  marker="o", markersize=None, label=None, figsize=None, **kwargs):
@@ -516,6 +550,92 @@ def plot_iv_diagnostics(data, base_name="iv_diagnostics", figsize=(8.6, 6.0)):
         fig.savefig(f"{base_name}_{t}.pdf")
         plt.close(fig)
     print(f"Saved diagnostic plots for {base_name}")
+
+def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0)):
+    """Create I(V) overlay and 2D dV/dI map for multiple temperatures."""
+    set_paper_style()
+    
+    is_bf = datasets[0].get('is_bf', False) if datasets else False
+
+    # 1. I(V) overlay plot(s)
+    if not is_bf:
+        # Forward-only case - same as before
+        fig, ax = plt.subplots(figsize=figsize)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(datasets)))
+        
+        for i, data in enumerate(datasets):
+            T = data['T_mean']
+            label = f"{T:.1f} K"
+            color = colors[i]
+            I_ma = data['I'] * 1e3
+            V_mv = data['V'] * 1e3
+            ax.plot(I_ma, V_mv, color=color, label=label)
+        
+        ax.set_xlabel("Current (mA)")
+        ax.set_ylabel("Voltage (mV)")
+        ax.set_title("I(V) at different temperatures")
+        ax.legend(title="Temperature")
+        fig.tight_layout()
+        fig.savefig(f"{output_prefix}_IV_overlay.pdf")
+        plt.close(fig)
+    else:
+        # BF case: separate Forward and Backward plots
+        colors = plt.cm.tab10(np.linspace(0, 1, len(datasets)))
+        
+        # Forward sweep
+        fig, ax = plt.subplots(figsize=figsize)
+        for i, data in enumerate(datasets):
+            T = data['T_mean']
+            label = f"{T:.1f} K"
+            color = colors[i]
+            I_ma = data['I'] * 1e3
+            V_mv = data['V'] * 1e3
+            ax.plot(I_ma, V_mv, color=color, label=label)
+        
+        ax.set_xlabel("Current (mA)")
+        ax.set_ylabel("Voltage (mV)")
+        ax.set_title("I(V) at different temperatures (Forward sweep)")
+        ax.legend(title="Temperature")
+        fig.tight_layout()
+        fig.savefig(f"{output_prefix}_IV_forward.pdf")
+        plt.close(fig)
+        
+        # Backward sweep
+        fig, ax = plt.subplots(figsize=figsize)
+        for i, data in enumerate(datasets):
+            T = data['T_mean']
+            label = f"{T:.1f} K"
+            color = colors[i]
+            I_ma = data['I'] * 1e3
+            V_mv = data['V'] * 1e3
+            ax.plot(I_ma, V_mv, color=color, label=label)
+        
+        ax.set_xlabel("Current (mA)")
+        ax.set_ylabel("Voltage (mV)")
+        ax.set_title("I(V) at different temperatures (Backward sweep)")
+        ax.legend(title="Temperature")
+        fig.tight_layout()
+        fig.savefig(f"{output_prefix}_IV_backward.pdf")
+        plt.close(fig)
+    
+    # 2. 2D dV/dI intensity map
+    fig, ax = plt.subplots(figsize=figsize)
+    I_ma = datasets[0]["I"] * 1e3   # mA
+    T_values = np.array([d['T_mean'] for d in datasets])
+    dVdI_grid = np.zeros((len(T_values), len(I_ma)))
+    for i, d in enumerate(datasets):
+        dVdI_grid[i] = d["dVdI"] * 1e3  # mΩ
+    
+    im = ax.pcolormesh(I_ma, T_values, dVdI_grid, shading='auto', cmap='viridis')
+    fig.colorbar(im, ax=ax, label=r'dV/dI (m$\Omega$)')
+    ax.set_xlabel("Current (mA)")
+    ax.set_ylabel("Temperature (K)")
+    ax.set_title("dV/dI Intensity Map")
+    fig.tight_layout()
+    fig.savefig(f"{output_prefix}_dVdI_map.pdf")
+    plt.close(fig)
+    
+    print(f"Saved multi-T plots: {output_prefix}_*.pdf")
 
 # ==================================================================
 # Generic "zoom-in" helpers
@@ -1109,7 +1229,7 @@ def _add_RT_parser(subparsers):
                          "Only relevant when --source rack. Legacy single-channel.")
     p.add_argument("--rack-signals", nargs="*", default=None,
                     help="For source='rack', specify multiple signal columns "
-                         "and optional legends, e.g. X1:Josephson R2:bottom_flake "
+                         "and optional legends, e.g. 'X1:Josephson' 'R2:bottom_flake' "
                          "X2:top_flake. Each item is 'col' or 'col:legend'. "
                          "If provided, treats as multiple datasets from one CSV, "
                          "overrides --channel and --labels for rack.")
@@ -1123,8 +1243,8 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument("--channel-dI", type=int, default=1, choices=[1,2,3],
                     help="Channel for dI (default: 1)")
     p.add_argument("--errorbars", action="store_true")
-    p.add_argument("--branches", action="store_true", default=True)
     p.add_argument("-o", "--output", default="IV_plot.pdf")
+    p.add_argument("--multi-temp", action="store_true", help="Load multiple files at different T and create T-I map")
     p.add_argument("--figsize", nargs=2, type=float, default=(8.6, 6.0),
                     metavar=("WIDTH_CM", "HEIGHT_CM"),
                     help="Figure size in cm (default: 8.6 6.0)")
