@@ -123,20 +123,41 @@ def _load_csv_ppms(csv_path):
         df = df.sort_values("Time Stamp (sec)").reset_index(drop=True)
     return df
 
-def _load_csv_rack(csv_path, signal_col, current):
+def _load_csv_rack(csv_path, mode="rt", **kwargs):
+    """Unified loader for rack data. Modes are cleanly separated."""
     df = pd.read_csv(csv_path)
 
-    T_col = "Tsample"
-    V_col = signal_col
-    for col in (T_col, V_col):
-        if col not in df.columns:
-            raise ValueError(f"Column '{col}' not found. Available: {df.columns.tolist()}")
+    if mode == "rt":
+        # R(T) mode - needs current scaling
+        signal_col = kwargs.get("signal_col")
+        current = kwargs.get("current")
+        if current is None:
+            raise ValueError("R(T) mode requires 'current' (source current in Amperes).")
+        V_col = signal_col or f"R{kwargs.get('channel', 2)}"
+        if V_col not in df.columns:
+            raise ValueError(f"Column '{V_col}' not found for R(T).")
+        return pd.DataFrame({
+            "Temperature (K)": df["Tsample"].astype(float).values,
+            "Bridge 1 Resistivity (Ohm)": df[V_col].astype(float).values / current,
+            "Bridge 1 Std. Dev. (Ohm)": 0.0,
+        })
 
-    return pd.DataFrame({
-        "Temperature (K)": df[T_col].astype(float).values,
-        "Bridge 1 Resistivity (Ohm)": df[V_col].astype(float).values / current,
-        "Bridge 1 Std. Dev. (Ohm)": 0.0,
-    })
+    elif mode == "iv":
+        # I(V) mode - no scaling needed, Is and Vdmm are direct
+        channel_dV = kwargs.get("channel_dV", 2)
+        channel_dI = kwargs.get("channel_dI", 1)
+        dV_col = f"R{channel_dV}"
+        dI_col = f"X{channel_dI}"
+        return pd.DataFrame({
+            "Current (A)": df["Is"].astype(float).values,
+            "Voltage (V)": df["Vdmm"].astype(float).values,
+            "dV": df[dV_col].astype(float).values if dV_col in df.columns else np.nan,
+            "dI": df[dI_col].astype(float).values if dI_col in df.columns else np.nan,
+            "Tsample": df["Tsample"].astype(float).values,
+        })
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
 _LOADERS = {
     "ppms": _load_csv_ppms,
@@ -381,6 +402,120 @@ def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
 # I(V) and dV/dI: current vs voltage
 # ==================================================================
 
+def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack", current=None):
+    """Extract I(V) and dV/dI data from rack CSV.
+
+    Returns a dict with:
+        'I': current array
+        'V': voltage array
+        'dV': lock-in dV signal
+        'dI': lock-in dI signal
+        'dVdI': computed differential resistance (dV/dI)
+        'T': temperature (usually constant)
+    """
+    df = _load_csv_rack(data_source, mode="iv", channel_dV=channel_dV, channel_dI=channel_dI)
+
+    I = df["Current (A)"].to_numpy(dtype=float)
+    V = df["Voltage (V)"].to_numpy(dtype=float)
+    dV = df["dV"].to_numpy(dtype=float)
+    dI = df["dI"].to_numpy(dtype=float)
+    T = df["Tsample"].to_numpy(dtype=float)
+
+    # Compute dV/dI (handle small dI)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dVdI = np.where(np.abs(dI) > 1e-9, dV / dI, np.nan)
+
+    # Simple branch detection (forward vs backward sweep)
+    branch = np.full(len(I), "forward", dtype=object)
+    diffs = np.diff(I)
+    if np.any(diffs < 0):
+        # has backward sweep
+        i_turn = np.where(diffs < 0)[0][0] + 1
+        branch[i_turn:] = "backward"
+
+    return {
+        "I": I,
+        "V": V,
+        "dV": dV,
+        "dI": dI,
+        "dVdI": dVdI,
+        "T": T,
+        "branch": branch,
+        "source": source,
+    }
+
+def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k", 
+                 marker="o", markersize=None, label=None, **kwargs):
+    """Plot with convenient units."""
+    set_paper_style()
+
+    created_fig = ax is None
+    if created_fig:
+        fig, ax = plt.subplots(figsize=(6.5, 5))
+
+    # Unit scaling
+    I_ma = data["I"] * 1e3          # A → mA
+    V_mv = data["V"] * 1e3          # V → mV
+    dV_uv = data["dV"] * 1e6        # V → µV
+    dI_ma = data["dI"] * 1e3        # A → mA
+
+    if plot_type == "iv":
+        x, y = I_ma, V_mv
+        xlabel = "Current (mA)"
+        ylabel = "Voltage (mV)"
+    elif plot_type == "dvdI":
+        x, y = I_ma, data["dVdI"] * 1000   # Ohm → mΩ
+        xlabel = "Current (mA)"
+        ylabel = r"dV/dI (m$\Omega$)"
+    elif plot_type == "dv":
+        x, y = I_ma, dV_uv
+        xlabel = "Current (mA)"
+        ylabel = "dV ($\mu$V)"
+    elif plot_type == "di":
+        x, y = I_ma, dI_ma
+        xlabel = "Current (mA)"
+        ylabel = "dI (mA)"
+    elif plot_type == "t":
+        x, y = I_ma, data["T"]
+        xlabel = "Current (mA)"
+        ylabel = "Temperature (K)"
+    else:
+        raise ValueError(f"Unknown plot_type: {plot_type}")
+
+    if show_branches and "branch" in data:
+        colors = {"forward": color, "backward": "tab:red"}
+        for b_name in ["forward", "backward"]:
+            mask = data["branch"] == b_name
+            if not np.any(mask):
+                continue
+            lbl = b_name.capitalize()
+            ax.plot(x[mask], y[mask], marker, color=colors.get(b_name, color), 
+                    ms=markersize or 3, label=lbl, **kwargs)
+    else:
+        ax.plot(x, y, marker, color=color, ms=markersize or 3, label=label, **kwargs)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.tick_params(direction='in', top=True, right=True, labelsize=8)
+    ax.xaxis.label.set_size(9)
+    ax.yaxis.label.set_size(9)
+    if label or show_branches:
+        ax.legend(frameon=False, fontsize=8)
+    if created_fig:
+        fig.tight_layout()
+    return ax
+
+def plot_iv_diagnostics(data, base_name="iv_diagnostics"):
+    """Generate several useful diagnostic plots for I(V) analysis."""
+    set_paper_style()
+    types = ['iv', 'dvdI', 'dv', 'di', 't']
+    for t in types:
+        fig, ax = plt.subplots(figsize=(6.5, 5))
+        plot_IV_dVdI(data, ax=ax, plot_type=t, show_branches=True)
+        fig.savefig(f"{base_name}_{t}.pdf")
+        plt.close(fig)
+    print(f"Saved diagnostic plots: {base_name}_*.pdf")
+
 # ==================================================================
 # Generic "zoom-in" helpers
 #
@@ -400,7 +535,6 @@ def _autoscale_y_to_xrange(ax, x, y, xmin, xmax, pad_frac=0.1):
     span = ymax - ymin if ymax > ymin else (abs(ymax) if ymax else 1.0)
     pad = pad_frac * span
     ax.set_ylim(ymin - pad, ymax + pad)
-
 
 def plot_zoomed(plot_func, data, x_key, y_key, xlim, ax=None,
                  autoscale_y=True, y_pad_frac=0.1, **plot_kwargs):
@@ -981,59 +1115,17 @@ def _add_RT_parser(subparsers):
     return p
 
 def _add_IV_dVdI_parser(subparsers):
-    p = subparsers.add_parser("IV_dVdI", help="I(V) and dV/dI")
-    p.add_argument("csv_files", nargs="+",
-                    help="One or more measurement CSV file(s) to plot together")
-    p.add_argument("--errorbars", action="store_true",
-                    help="Plot with error bars (default: off)")
-    p.add_argument("--branches", action="store_true",
-                    help="Color forward/backward branches separately")
-    p.add_argument("--skip-points", type=int, default=0,
-                    help="Discard this many points from the start of the run "
-                         "(e.g. turning on the sourcemeter and the current jumping from 0 to a given value)")
-    p.add_argument("--labels", nargs="+", default=None,
-                    help="Legend label(s), one per CSV file "
-                         "(defaults to each file's name)")
-    p.add_argument("-o", "--output", default="RT_plot.pdf",
-                    help="Output figure path (default: RT_plot.pdf)")
-    p.add_argument("--figsize", nargs=2, type=float, default=(8.6, 6.0),
-                    metavar=("WIDTH_CM", "HEIGHT_CM"),
-                    help="Figure size in cm (default: 8.6 6.0)")
-    p.add_argument("--find-Rn", action="store_true",
-                    help="Determine the normal state resistance." \
-                    "defined as the slope of the I(V) curve in the" \
-                    "normal region at positive bias.")
-    p.add_argument("--find-Jc", action="store_true",
-                    help="Determine the critical current density in kA/cm2")
-    p.add_argument("--find-IcRn", action="store_true",
-                    help="Calculate the Josephson coupling strength")
-    p.add_argument("--normalized", action="store_true",
-                    help="Calculate dV/dI normalized with Rn")
-    p.add_argument("--source", choices=["ppms", "rack"], default="ppms",
-                    help="Instrument that produced the CSV file(s): "
-                         "'ppms' for PPMS/MultiVu (default), "
-                         "'rack' for the custom rack with lock-in amplifier.")
-    p.add_argument("--current", type=float, default=None, metavar="AMPS",
-                    help="Source current in Amperes. Required when "
-                         "--source rack (e.g. --current 1e-6 for 1 µA). "
-                         "Used to convert the recorded voltage to resistance: "
-                         "R = V / I.")
-    p.add_argument("--channel-dV", type=int, default=2, choices=[1, 2, 3],
-                    metavar="{1,2,3}",
-                    help="Lock-in amplifier channel to read from the rack CSV "
-                         "(1→R1/X1, 2→R2/X2, 3→R3/X3). Default: 2. "
-                         "Only relevant when --source rack.")
-    p.add_argument("--channel-dI", type=int, default=1, choices=[1, 2, 3],
-                    metavar="{1,2,3}",
-                    help="Lock-in amplifier channel to read from the rack CSV "
-                         "(1→R1/X1, 2→R2/X2, 3→R3/X3). Default: 1. "
-                         "Only relevant when --source rack.")
-    p.add_argument("--compute-dIdV", action="store_true",
-                    help="From the values of the dV and dI data, numerically" \
-                    "compute the differenciated dI/dV values and plot them " \
-                    "in function of the bias voltage calculated from the sourced current" \
-                    "Is with the value of the circuit resistance given as an " \
-                    "input by the user.")
+    p = subparsers.add_parser("IV", help="I(V) and dV/dI analysis")
+    p.add_argument("csv_files", nargs="+", help="CSV file(s)")
+    p.add_argument("--channel-dV", type=int, default=2, choices=[1,2,3],
+                    help="Channel for dV (default: 2)")
+    p.add_argument("--channel-dI", type=int, default=1, choices=[1,2,3],
+                    help="Channel for dI (default: 1)")
+    p.add_argument("--errorbars", action="store_true")
+    p.add_argument("--branches", action="store_true", default=True,
+                    help="Color forward/backward branches differently")
+    p.add_argument("-o", "--output", default="IV_plot.pdf")
+    p.add_argument("--source", choices=["rack"], default="rack")
     return p
 
 def _run_RT(args):
@@ -1223,11 +1315,15 @@ def _run_RT(args):
         print(f"Saved {zoom_path}")
 
 def _run_IV_dVdI(args):
-    print()
+    set_paper_style()
+    for csv_file in args.csv_files:
+        data = analyze_IV_dVdI(csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI)
+        plot_iv_diagnostics(data, base_name="iv_diagnostics_" + os.path.splitext(os.path.basename(csv_file))[0])
+        print(f"Processed {csv_file}")
 
 PLOT_TYPES = {
     "RT": (_add_RT_parser, _run_RT),
-    "IV_dVdI": (_add_IV_dVdI_parser, _run_IV_dVdI),
+    "IV": (_add_IV_dVdI_parser, _run_IV_dVdI),
 }
 
 def main():
