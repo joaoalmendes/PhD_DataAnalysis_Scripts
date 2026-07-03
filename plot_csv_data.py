@@ -712,7 +712,6 @@ def plot_zoomed(plot_func, data, x_key, y_key, xlim, ax=None,
 
     return ax
 
-
 # ==================================================================
 # Linear fit helpers — generic analysis + display
 #
@@ -802,7 +801,6 @@ def fit_linear(data, x_key, y_key, x_range, err_key=None, weighted=True,
         "poly":           np.poly1d(coeffs),
     }
 
-
 def fit_linear_RT(data, T_range, weighted=True, branch=None):
     """Linear fit of R(T) over a temperature window.
 
@@ -868,7 +866,6 @@ def _find_Tc_crossing(T_sorted, R_sorted, R_threshold):
     else:
         Tc = T1 + (T2 - T1) * (R_threshold - R1) / (R2 - R1)
     return round(Tc, 1)
-
 
 def find_Tc_RT(data, criterion=0.5, T_normal_range=None):
     """Determine the superconducting transition temperature Tc from R(T).
@@ -1053,7 +1050,6 @@ def plot_linear_fit(fit, ax, x_range=None, color="k", ls="--", lw=1.0,
  
     return ax
 
-
 def compute_RRR_RT(data, T_low, window=0.5):
     """Compute the Residual Resistance Ratio (RRR) from R(T) data.
 
@@ -1237,14 +1233,17 @@ def _add_RT_parser(subparsers):
 
 def _add_IV_dVdI_parser(subparsers):
     p = subparsers.add_parser("IV", help="I(V) and dV/dI analysis")
-    p.add_argument("csv_files", nargs="+", help="CSV file(s)")
+    p.add_argument('csv_files', nargs='*', default=[], 
+                       help='Input CSV file(s) for single file mode')
+    p.add_argument("--multi-temp", type=str, nargs='?', const='',
+                    help="Run multi-temperature analysis. Provide glob pattern (required)," \
+                    " e.g. '~/PhD/scripts/260626_NbSe2_IV_*K*_004_processed.csv'")
     p.add_argument("--channel-dV", type=int, default=2, choices=[1,2,3],
                     help="Channel for dV (default: 2)")
     p.add_argument("--channel-dI", type=int, default=1, choices=[1,2,3],
                     help="Channel for dI (default: 1)")
     p.add_argument("--errorbars", action="store_true")
     p.add_argument("-o", "--output", default="IV_plot.pdf")
-    p.add_argument("--multi-temp", action="store_true", help="Load multiple files at different T and create T-I map")
     p.add_argument("--figsize", nargs=2, type=float, default=(8.6, 6.0),
                     metavar=("WIDTH_CM", "HEIGHT_CM"),
                     help="Figure size in cm (default: 8.6 6.0)")
@@ -1439,11 +1438,25 @@ def _run_RT(args):
 
 def _run_IV_dVdI(args):
     set_paper_style()
-    for csv_file in args.csv_files:
-        data = analyze_IV_dVdI(csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI)
-        base = os.path.splitext(os.path.basename(csv_file))[0]
-        plot_iv_diagnostics(data, base_name=f"iv_diagnostics_{base}", figsize=args.figsize)
-        print(f"Processed {csv_file}")
+    if args.multi_temp is not None:
+        if not args.multi_temp or args.multi_temp.strip() == "":
+            raise ValueError("Error: --multi-temp requires a file pattern. Example:\n"
+                           "  --multi-temp '~/PhD/scripts/260626_NbSe2_IV_*K*_004_processed.csv'")
+        pattern = args.multi_temp
+        if not glob.glob(os.path.expanduser(pattern)):
+            print(f"Warning: No files matched pattern: {pattern}")
+        else:
+            print(f"Running multi-temperature mode with pattern: {pattern}")
+            datasets = load_multi_iv_files(pattern)
+            plot_multi_temp_iv(datasets, output_prefix="multi_temp")
+            return
+    elif args.csv_files:
+        for csv_file in args.csv_files:
+            data = analyze_IV_dVdI(csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI)
+            base = os.path.splitext(os.path.basename(csv_file))[0]
+            plot_iv_diagnostics(data, base_name=f"iv_diagnostics_{base}", figsize=args.figsize)
+            print(f"Processed {csv_file}")
+            return
 
 PLOT_TYPES = {
     "RT": (_add_RT_parser, _run_RT),
