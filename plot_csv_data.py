@@ -34,7 +34,6 @@ import matplotlib.pyplot as plt
 import re
 import glob
 
-
 # ==================================================================
 # Style / display helpers
 # (the only section that should contain rcParams, default colors,
@@ -67,7 +66,6 @@ def set_paper_style():
         "legend.fontsize": 7,
         "savefig.bbox": "tight",
     })
-
 
 def _default_RT_branch_colors():
     """Default branch colors for R(T) plots."""
@@ -403,7 +401,7 @@ def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
     return ax
 
 # ==================================================================
-# I(V) and dV/dI: current vs voltage
+# I(V) and dV/dI: Loading and Plotting
 # ==================================================================
 
 def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack", current=None):
@@ -626,7 +624,7 @@ def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0))
     for i, d in enumerate(datasets):
         dVdI_grid[i] = d["dVdI"] * 1e3  # mΩ
     
-    im = ax.pcolormesh(I_ma, T_values, dVdI_grid, shading='auto', cmap='viridis')
+    im = ax.pcolormesh(I_ma, T_values, dVdI_grid, shading='auto', cmap='plasma')
     fig.colorbar(im, ax=ax, label=r'dV/dI (m$\Omega$)')
     ax.set_xlabel("Current (mA)")
     ax.set_ylabel("Temperature (K)")
@@ -636,6 +634,88 @@ def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0))
     plt.close(fig)
     
     print(f"Saved multi-T plots: {output_prefix}_*.pdf")
+
+# ==================================================================
+# I(V) and dV/dI: Data Analysis and Numerical Calculations
+# ==================================================================
+
+from scipy.signal import find_peaks
+
+import numpy as np
+from scipy.signal import find_peaks
+from scipy.stats import linregress
+
+def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last"):
+    """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
+    I = data['I']
+    V = data['V']
+    dV = data.get('dV', None)
+    is_bf = data.get('is_bf', False)
+    branch = data.get('branch', np.full(len(I), "forward", dtype=object))
+    
+    results = {
+        'T_K': round(np.mean(data.get('T', np.nan)),2),
+        'is_bf': is_bf,
+    }
+    
+    # Signal for transition detection
+    signal = dV if dV is not None and not np.all(np.isnan(dV)) else np.abs(V)
+    
+    def find_ic(I_seg, signal_seg, mode="last"):
+        if len(I_seg) < 10:
+            return abs(I_seg[-1])
+        diffs = np.diff(signal_seg)
+        peaks, _ = find_peaks(diffs, height=np.std(diffs)*1.5, distance=5)
+        if len(peaks) == 0:
+            return abs(I_seg[-1])
+        jump_idx = peaks[-1] if mode == "last" else peaks[0]
+        return abs(I_seg[jump_idx + 1])
+    
+    # Ic
+    if not is_bf:
+        Ic = find_ic(I, signal, ic_mode)
+        results['Ic_mA'] = Ic * 1000
+        results['Ic+'] = Ic * 1000
+        results['Ic-'] = np.nan
+    else:
+        fwd = branch == "forward"
+        bwd = branch == "backward"
+        Ic_plus = find_ic(I[fwd], signal[fwd], ic_mode) if np.any(fwd) else np.nan
+        Ic_minus = find_ic(I[bwd], signal[bwd], ic_mode) if np.any(bwd) else np.nan
+        results['Ic_mA'] = (Ic_plus + Ic_minus) / 2 * 1000 if not np.isnan(Ic_plus) else np.nan
+        results['Ic+_mA'] = Ic_plus * 1000
+        results['Ic-_mA'] = Ic_minus * 1000
+    
+    # Jc
+    results['Jc_kA/cm2'] = results.get('Ic_mA', np.nan) / (area_um2 * 1e-2) if not np.isnan(results.get('Ic_mA', np.nan)) else np.nan
+    
+    # R_N linear fits
+    def fit_Rn(I_seg, V_seg, criterion):
+        if len(I_seg) < 5:
+            return np.nan
+        V_max = np.max(np.abs(V_seg))
+        high_bias = np.abs(V_seg) > criterion * V_max
+        if np.sum(high_bias) < 3:
+            return np.nan
+        slope, _, _, _, _ = linregress(I_seg[high_bias], V_seg[high_bias])
+        return slope
+    
+    # Positive side
+    pos = I > 0
+    results['Rn+_mOhm'] = fit_Rn(I[pos], V[pos], rn_criterion) * 1000 if np.any(pos) else np.nan
+    
+    # Negative side
+    neg = I < 0
+    results['Rn-_mOhm'] = fit_Rn(I[neg], V[neg], rn_criterion) * 1000 if np.any(neg) else np.nan
+    
+    results['Rn_mean_mOhm'] = np.nanmean([results['Rn+_mOhm'], results['Rn-_mOhm']])
+    
+    # Ic * R_N
+    results['IcRn_mV'] = results['Ic_mA'] * results['Rn_mean_mOhm'] * 1e-3 if not np.isnan(results['Ic_mA']) and not np.isnan(results['Rn_mean_mOhm']) else np.nan
+    # Jc * R_N
+    results['JcRn_V/m2'] = results['Jc_kA/cm2'] * results['Rn_mean_mOhm'] * 1e-4 if not np.isnan(results['Jc_kA/cm2']) and not np.isnan(results['Rn_mean_mOhm']) else np.nan
+    
+    return results
 
 # ==================================================================
 # Generic "zoom-in" helpers
@@ -1248,6 +1328,16 @@ def _add_IV_dVdI_parser(subparsers):
                     metavar=("WIDTH_CM", "HEIGHT_CM"),
                     help="Figure size in cm (default: 8.6 6.0)")
     p.add_argument("--source", choices=["rack"], default="rack")
+    p.add_argument('--area', type=float, default=1.0, 
+                       help="Cross-section area in um² for Jc calculation (default=1.0)")
+
+    p.add_argument('--rn-criterion', type=float, default=0.5,
+                       help="Fraction of max |V| to use for normal-state R_N linear fit (default=0.5)")
+
+    p.add_argument('--ic-mode', choices=['last', 'first'], default='last',
+                       help="Which jump to use for Ic in multi-jump curves (default=last)")
+    p.add_argument('--analyze', action='store_true', 
+                       help="Perform numerical analysis (Ic, Jc, RN, etc.) in addition to plotting")
     return p
 
 def _run_RT(args):
@@ -1455,6 +1545,18 @@ def _run_IV_dVdI(args):
             data = analyze_IV_dVdI(csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI)
             base = os.path.splitext(os.path.basename(csv_file))[0]
             plot_iv_diagnostics(data, base_name=f"iv_diagnostics_{base}", figsize=args.figsize)
+
+            if getattr(args, 'analyze', False):
+                params = compute_iv_parameters(data, area_um2=args.area, 
+                                               rn_criterion=args.rn_criterion, 
+                                               ic_mode=args.ic_mode)
+                print(f"\n=== IV Analysis Results for {csv_file} ===")
+                for k, v in params.items():
+                    if isinstance(v, float):
+                        print(f"  {k:12s}: {v:.6g}")
+                    else:
+                        print(f"  {k:12s}: {v}")
+            
             print(f"Processed {csv_file}")
             return
 
