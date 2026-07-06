@@ -645,7 +645,98 @@ import numpy as np
 from scipy.signal import find_peaks
 from scipy.stats import linregress
 
-def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", peak_height_factor=1.5):
+def compute_gap_from_didv(data, advanced=False, figsize=None):
+    """Estimate superconducting gap from I(V) data."""
+    if not advanced:
+        return {}
+    
+    I = data['I']
+    V = data['V']
+    is_bf = data.get('is_bf', False)
+    branch = data.get('branch', np.full(len(I), "forward", dtype=object))
+    
+    I_ma = I * 1000
+    V_mv = V * 1000
+    
+    results = {}
+    
+        # Steepest slope method (inflection point)
+        # Find largest voltage jump (better for Ic-like transition)
+        # Largest voltage jump method (robust for switching)
+    dV = np.diff(V_mv)
+    jump_idx = np.argmax(np.abs(dV))
+    Vc_mean = abs(V_mv[jump_idx + 1])
+    
+    results['Vc_mean_mV'] = Vc_mean
+    results['Delta_meV'] = Vc_mean / 2 # approximate gap in meV
+    
+    if is_bf:
+        fwd = branch == "forward"
+        bwd = branch == "backward"
+        if np.any(fwd):
+            dV_fwd = np.diff(V_mv[fwd])
+            idx_fwd = np.argmax(np.abs(dV_fwd))
+            Vc_fwd = abs(V_mv[fwd][idx_fwd + 1])
+        else:
+            Vc_fwd = np.nan
+        if np.any(bwd):
+            dV_bwd = np.diff(V_mv[bwd])
+            idx_bwd = np.argmax(np.abs(dV_bwd))
+            Vc_bwd = abs(V_mv[bwd][idx_bwd + 1])
+        else:
+            Vc_bwd = np.nan
+        results['Vc_fwd_mV'] = Vc_fwd
+        results['Vc_bwd_mV'] = Vc_bwd
+    
+    set_paper_style()
+        # Main plot
+        # Main plot with capped y-axis
+        # Main plot
+        # Main plot with aggressive capping
+        # Main plot
+    fig, ax = plt.subplots(figsize=figsize)
+    didv_plot = np.gradient(I_ma, V_mv)
+    # Exclude points very close to zero
+    mask_nonzero = np.abs(V_mv) > 0.05  # mV
+    noise_level = np.std(didv_plot[mask_nonzero & (np.abs(didv_plot) < np.percentile(np.abs(didv_plot[mask_nonzero]), 50))])
+    cap = noise_level * 10
+    didv_plot = np.clip(didv_plot, -cap, cap)
+    ax.plot(V_mv, didv_plot, 'b-', label='dI/dV')
+    if not np.isnan(Vc_mean):
+        ax.axvline(Vc_mean, color='r', linestyle='--', label=f'Vc ≈ {Vc_mean:.3f} mV')
+        ax.axvline(-Vc_mean, color='r', linestyle='--')
+    ax.set_xlabel("Voltage (mV)")
+    ax.set_ylabel("dI/dV (mA/mV)")
+    ax.set_title("dI/dV vs V (capped)")
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    base = data.get('filename', 'didv').replace('.csv', '')
+    fig.savefig(f"{base}_didv.pdf")
+    plt.close(fig)
+    
+    # Tight zoom
+    if not np.isnan(Vc_mean):
+        fig, ax = plt.subplots(figsize=figsize)
+        zoom_range = Vc_mean * 1.2
+        mask = (np.abs(V_mv) < zoom_range) & (np.abs(V_mv) > 0.05)
+        didv_zoom = np.gradient(I_ma, V_mv)[mask]
+        didv_zoom = np.clip(didv_zoom, -cap, cap)
+        ax.plot(V_mv[mask], didv_zoom, 'b-', label='dI/dV')
+        ax.axvline(Vc_mean, color='r', linestyle='--')
+        ax.axvline(-Vc_mean, color='r', linestyle='--')
+        ax.set_xlabel("Voltage (mV)")
+        ax.set_ylabel("dI/dV (mA/mV)")
+        ax.set_title("Zoomed dI/dV around Gap")
+        ax.legend()
+        ax.grid(True)
+        plt.tight_layout()
+        fig.savefig(f"{base}_didv_zoom.pdf")
+        plt.close(fig)
+    
+    return results
+
+def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", peak_height_factor=1.0, advanced=False, capacitance=None, figsize=None):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
     I = data['I']
     V = data['V']
@@ -734,6 +825,40 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", 
     # Jc * R_N
     results['JcRn_V/m2'] = results['Jc_kA/cm2'] * results['Rn_mean_mOhm'] * 1e-4 if not np.isnan(results['Jc_kA/cm2']) and not np.isnan(results['Rn_mean_mOhm']) else np.nan
     
+    # === Advanced Analysis ===
+    if advanced:
+        # Diode efficiency
+        if not np.isnan(results['Ic+_mA']) and not np.isnan(results['Ic-_mA']):
+            asym = abs(results['Ic+_mA'] - abs(results['Ic-_mA'])) / (results['Ic+_mA'] + abs(results['Ic-_mA']))
+            results['Diode_Efficiency'] = asym
+        
+        if is_bf:
+            # Per branch
+            if not np.isnan(results.get('Ic+_fwd_mA', np.nan)) and not np.isnan(results.get('Ic-_fwd_mA', np.nan)):
+                asym_fwd = abs(results['Ic+_fwd_mA'] - abs(results['Ic-_fwd_mA'])) / (results['Ic+_fwd_mA'] + abs(results['Ic-_fwd_mA']))
+                results['Diode_Efficiency_fwd'] = asym_fwd
+            if not np.isnan(results.get('Ic+_bwd_mA', np.nan)) and not np.isnan(results.get('Ic-_bwd_mA', np.nan)):
+                asym_bwd = abs(results['Ic+_bwd_mA'] - abs(results['Ic-_bwd_mA'])) / (results['Ic+_bwd_mA'] + abs(results['Ic-_bwd_mA']))
+                results['Diode_Efficiency_bwd'] = asym_bwd
+        # Stewart-McCumber from retrapping current (BF only)
+        if is_bf and 'Ic+_f_mA' in results and 'Ic+_b_mA' in results:
+            Ic = results['Ic+_f_mA']
+            Ir = results['Ic+_b_mA']
+            if Ir > 1e-9:  # avoid division by zero
+                beta_c = (4*Ic / (np.pi * Ir)) ** 2
+                beta_c = 1.62 * (Ic/Ir)**2
+                results['Beta_C'] = beta_c
+                
+                # Capacitance
+                if not np.isnan(results.get('Rn_mean_mOhm', np.nan)):
+                    Rn = results['Rn_mean_mOhm'] / 1000  # Ohm
+                    Phi0 = 2.067833848e-15
+                    C = (beta_c * Phi0) / (2 * np.pi * Ic*1e-3 * Rn**2)
+                    results['C_fF'] = C * 1e15  # fF
+                    results['C_uF/cm2'] = C * 1e6 / (area_um2 * 1e-8)  # uF/cm² (area in um2 -> cm2)
+        gap_results = compute_gap_from_didv(data, advanced=True, figsize=figsize)
+        results.update(gap_results)
+
     return results
 
 # ==================================================================
@@ -1359,6 +1484,11 @@ def _add_IV_dVdI_parser(subparsers):
                        help="Perform numerical analysis (Ic, Jc, RN, etc.) in addition to plotting")
     p.add_argument('--peak-height-factor', type=float, default=1.5,
                        help="Sensitivity threshold for peak detection in dV (higher = less sensitive to noise). Default 1.5")
+    p.add_argument('--advanced', action='store_true', 
+                       help="Perform advanced analysis (diode efficiency, Stewart-McCumber, gap, etc.)")
+    p.add_argument('--capacitance', type=float, default=None,
+                       help="Junction capacitance in Farads for Stewart-McCumber calculation")
+    p.add_argument('--plot-didv', action='store_true', help="Plot dI/dV and find Riedel peaks")
     return p
 
 def _run_RT(args):
@@ -1571,7 +1701,10 @@ def _run_IV_dVdI(args):
                 params = compute_iv_parameters(data, area_um2=args.area, 
                                                rn_criterion=args.rn_criterion, 
                                                ic_mode=args.ic_mode,
-                                               peak_height_factor=args.peak_height_factor)
+                                               peak_height_factor=args.peak_height_factor,
+                                               advanced=getattr(args, 'advanced', False),
+                                               capacitance=getattr(args, 'capacitance', None),
+                                               figsize=args.figsize)
                 print(f"\n=== IV Analysis Results for {csv_file} ===")
                 for k, v in params.items():
                     if isinstance(v, float):
