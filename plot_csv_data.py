@@ -645,7 +645,7 @@ import numpy as np
 from scipy.signal import find_peaks
 from scipy.stats import linregress
 
-def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last"):
+def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", peak_height_factor=1.5):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
     I = data['I']
     V = data['V']
@@ -661,30 +661,49 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last"):
     # Signal for transition detection
     signal = dV if dV is not None and not np.all(np.isnan(dV)) else np.abs(V)
     
-    def find_ic(I_seg, signal_seg, mode="last"):
+    def find_ic_in_direction(I_seg, signal_seg, mode="last", direction_sign=1, peak_height_factor=1.0):
         if len(I_seg) < 10:
             return abs(I_seg[-1])
-        diffs = np.diff(signal_seg)
-        peaks, _ = find_peaks(diffs, height=np.std(diffs)*1.5, distance=5)
+        if direction_sign > 0:
+            mask = I_seg > 0
+        else:
+            mask = I_seg < 0
+        if not np.any(mask):
+            return np.nan
+        I_dir = I_seg[mask]
+        sig_dir = signal_seg[mask]
+        diffs = np.diff(sig_dir)
+        peaks, _ = find_peaks(diffs, height=np.std(diffs)*peak_height_factor, distance=5)
         if len(peaks) == 0:
-            return abs(I_seg[-1])
+            return abs(I_dir[-1])
         jump_idx = peaks[-1] if mode == "last" else peaks[0]
-        return abs(I_seg[jump_idx + 1])
+        return abs(I_dir[jump_idx + 1])
     
-    # Ic
-    if not is_bf:
-        Ic = find_ic(I, signal, ic_mode)
-        results['Ic_mA'] = Ic * 1000
-        results['Ic+'] = Ic * 1000
-        results['Ic-'] = np.nan
-    else:
+    # Overall Ic+ and Ic-
+    Ic_plus = find_ic_in_direction(I, signal, mode=ic_mode, direction_sign=1, peak_height_factor=peak_height_factor)
+    Ic_minus = find_ic_in_direction(I, signal, mode=ic_mode, direction_sign=-1, peak_height_factor=peak_height_factor)
+    
+    results['Ic+_mA'] = Ic_plus * 1000
+    results['Ic-_mA'] = Ic_minus * 1000
+    results['Ic_mA'] = (Ic_plus + Ic_minus) / 2 * 1000 if not np.isnan(Ic_plus) and not np.isnan(Ic_minus) else np.nan
+    
+    if is_bf:
+        # Per-branch analysis
         fwd = branch == "forward"
         bwd = branch == "backward"
-        Ic_plus = find_ic(I[fwd], signal[fwd], ic_mode) if np.any(fwd) else np.nan
-        Ic_minus = find_ic(I[bwd], signal[bwd], ic_mode) if np.any(bwd) else np.nan
-        results['Ic_mA'] = (Ic_plus + Ic_minus) / 2 * 1000 if not np.isnan(Ic_plus) else np.nan
-        results['Ic+_mA'] = Ic_plus * 1000
-        results['Ic-_mA'] = Ic_minus * 1000
+        
+        # Forward branch
+        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], mode=ic_mode, direction_sign=1, peak_height_factor=peak_height_factor) if np.any(fwd) else np.nan
+        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], mode=ic_mode, direction_sign=-1, peak_height_factor=peak_height_factor) if np.any(fwd) else np.nan
+        
+        # Backward branch
+        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], mode=ic_mode, direction_sign=1, peak_height_factor=peak_height_factor) if np.any(bwd) else np.nan
+        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], mode=ic_mode, direction_sign=-1, peak_height_factor=peak_height_factor) if np.any(bwd) else np.nan
+        
+        results['Ic+_f_mA'] = Ic_plus_fwd * 1000
+        results['Ic-_f_mA'] = Ic_minus_fwd * 1000
+        results['Ic+_b_mA'] = Ic_plus_bwd * 1000
+        results['Ic-_b_mA'] = Ic_minus_bwd * 1000
     
     # Jc
     results['Jc_kA/cm2'] = results.get('Ic_mA', np.nan) / (area_um2 * 1e-2) if not np.isnan(results.get('Ic_mA', np.nan)) else np.nan
@@ -1338,6 +1357,8 @@ def _add_IV_dVdI_parser(subparsers):
                        help="Which jump to use for Ic in multi-jump curves (default=last)")
     p.add_argument('--analyze', action='store_true', 
                        help="Perform numerical analysis (Ic, Jc, RN, etc.) in addition to plotting")
+    p.add_argument('--peak-height-factor', type=float, default=1.5,
+                       help="Sensitivity threshold for peak detection in dV (higher = less sensitive to noise). Default 1.5")
     return p
 
 def _run_RT(args):
@@ -1549,7 +1570,8 @@ def _run_IV_dVdI(args):
             if getattr(args, 'analyze', False):
                 params = compute_iv_parameters(data, area_um2=args.area, 
                                                rn_criterion=args.rn_criterion, 
-                                               ic_mode=args.ic_mode)
+                                               ic_mode=args.ic_mode,
+                                               peak_height_factor=args.peak_height_factor)
                 print(f"\n=== IV Analysis Results for {csv_file} ===")
                 for k, v in params.items():
                     if isinstance(v, float):
