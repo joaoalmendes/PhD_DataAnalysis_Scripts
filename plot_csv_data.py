@@ -736,7 +736,7 @@ def compute_gap_from_didv(data, advanced=False, figsize=None):
     
     return results
 
-def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", peak_height_factor=1.0, advanced=False, capacitance=None, figsize=None):
+def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, figsize=None):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
     I = data['I']
     V = data['V']
@@ -752,7 +752,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", 
     # Signal for transition detection
     signal = dV if dV is not None and not np.all(np.isnan(dV)) else np.abs(V)
     
-    def find_ic_in_direction(I_seg, signal_seg, mode="last", direction_sign=1, peak_height_factor=1.0):
+    def find_ic_in_direction(I_seg, signal_seg, direction_sign=1):
         if len(I_seg) < 10:
             return abs(I_seg[-1])
         if direction_sign > 0:
@@ -763,16 +763,16 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", 
             return np.nan
         I_dir = I_seg[mask]
         sig_dir = signal_seg[mask]
+        # Largest jump in signal
         diffs = np.diff(sig_dir)
-        peaks, _ = find_peaks(diffs, height=np.std(diffs)*peak_height_factor, distance=5)
-        if len(peaks) == 0:
+        if len(diffs) == 0:
             return abs(I_dir[-1])
-        jump_idx = peaks[-1] if mode == "last" else peaks[0]
+        jump_idx = np.argmax(np.abs(diffs))
         return abs(I_dir[jump_idx + 1])
     
     # Overall Ic+ and Ic-
-    Ic_plus = find_ic_in_direction(I, signal, mode=ic_mode, direction_sign=1, peak_height_factor=peak_height_factor)
-    Ic_minus = find_ic_in_direction(I, signal, mode=ic_mode, direction_sign=-1, peak_height_factor=peak_height_factor)
+    Ic_plus = find_ic_in_direction(I, signal, direction_sign=1)
+    Ic_minus = find_ic_in_direction(I, signal, direction_sign=-1)
     
     results['Ic+_mA'] = Ic_plus * 1000
     results['Ic-_mA'] = Ic_minus * 1000
@@ -784,12 +784,12 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_mode="last", 
         bwd = branch == "backward"
         
         # Forward branch
-        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], mode=ic_mode, direction_sign=1, peak_height_factor=peak_height_factor) if np.any(fwd) else np.nan
-        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], mode=ic_mode, direction_sign=-1, peak_height_factor=peak_height_factor) if np.any(fwd) else np.nan
+        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=1) if np.any(fwd) else np.nan
+        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=-1) if np.any(fwd) else np.nan
         
         # Backward branch
-        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], mode=ic_mode, direction_sign=1, peak_height_factor=peak_height_factor) if np.any(bwd) else np.nan
-        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], mode=ic_mode, direction_sign=-1, peak_height_factor=peak_height_factor) if np.any(bwd) else np.nan
+        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=1) if np.any(bwd) else np.nan
+        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=-1) if np.any(bwd) else np.nan
         
         results['Ic+_f_mA'] = Ic_plus_fwd * 1000
         results['Ic-_f_mA'] = Ic_minus_fwd * 1000
@@ -1486,8 +1486,6 @@ def _add_IV_dVdI_parser(subparsers):
                        help="Sensitivity threshold for peak detection in dV (higher = less sensitive to noise). Default 1.5")
     p.add_argument('--advanced', action='store_true', 
                        help="Perform advanced analysis (diode efficiency, Stewart-McCumber, gap, etc.)")
-    p.add_argument('--capacitance', type=float, default=None,
-                       help="Junction capacitance in Farads for Stewart-McCumber calculation")
     p.add_argument('--plot-didv', action='store_true', help="Plot dI/dV and find Riedel peaks")
     return p
 
@@ -1699,11 +1697,8 @@ def _run_IV_dVdI(args):
 
             if getattr(args, 'analyze', False):
                 params = compute_iv_parameters(data, area_um2=args.area, 
-                                               rn_criterion=args.rn_criterion, 
-                                               ic_mode=args.ic_mode,
-                                               peak_height_factor=args.peak_height_factor,
+                                               rn_criterion=args.rn_criterion,
                                                advanced=getattr(args, 'advanced', False),
-                                               capacitance=getattr(args, 'capacitance', None),
                                                figsize=args.figsize)
                 print(f"\n=== IV Analysis Results for {csv_file} ===")
                 for k, v in params.items():

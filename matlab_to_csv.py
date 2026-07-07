@@ -85,7 +85,7 @@ def save_to_csv(mat_path):
     base_name = Path(mat_path).stem
     cwd = Path(os.getcwd())
     
-    csv_path = cwd / f"{base_name}_processed.csv"
+    csv_path = cwd / f"{base_name}.csv"
     comments_path = cwd / f"{base_name}_comments.txt"
 
     # Save comments
@@ -128,14 +128,14 @@ def save_to_csv(mat_path):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        file_path = f"/home/joaoalmendes/PhD/260519B/{sys.argv[1]}"
+        file_path = f"/home/joaoalmendes/PhD/{sys.argv[1]}"
         if os.path.exists(file_path):
             print(f"Processing: {file_path}")
             save_to_csv(file_path)
         else:
             print(f"File not found: {file_path}")
     else:
-        attachments_dir = "/home/joaoalmendes/PhD/260519B/"
+        attachments_dir = "/home/joaoalmendes/PhD/"
         import glob
         mat_files = glob.glob(os.path.join(attachments_dir, "*.mat"))
         for f in mat_files:
