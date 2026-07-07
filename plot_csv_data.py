@@ -635,6 +635,90 @@ def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0))
     
     print(f"Saved multi-T plots: {output_prefix}_*.pdf")
 
+def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
+                                       output_prefix="multi_t",
+                                       n_T_bins=100, n_I_bins=200,
+                                       clim_pct=(2, 98)):
+    """Load a multi-T rack IV file and produce a 2D dV/dI colour map.
+
+    Uses 2D binning (not a pivot) so it works correctly even when T drifts
+    continuously during the current sweep, giving nearly-unique (T, I) pairs
+    rather than a clean regular grid.
+    """
+    from scipy.stats import binned_statistic_2d
+
+    print("Loading multi-T file...")
+    df = _load_csv_rack(filepath, mode="iv",
+                        channel_dV=channel_dV, channel_dI=channel_dI)
+    print(f"  {len(df):,} rows, "
+          f"{df['Tsample'].nunique()} unique temperatures, "
+          f"{df['Current (A)'].nunique()} unique currents")
+
+    # ---- 1. Vectorised dV/dI ------------------------------------------------
+    valid = (
+        (np.abs(df["dI"]) > 1e-12)
+        & df["dV"].notna()
+        & df["dI"].notna()
+    )
+    n_dropped = (~valid).sum()
+    if n_dropped:
+        print(f"  Dropped {n_dropped:,} rows with |dI| ≈ 0 or NaN")
+    df = df.loc[valid].copy()
+    df["dVdI"] = (df["dV"] / df["dI"]) * 1000   # mΩ
+
+    T_vals    = df["Tsample"].values
+    I_vals_uA = df["Current (A)"].values * 1e6   # µA for display
+    dVdI_vals = df["dVdI"].values
+
+    # ---- 2. 2D binning (replaces pivot_table) --------------------------------
+    # pivot_table only fills cells that have an exact (T, I) match; when T
+    # drifts continuously, every row has a unique pair, giving a grid that is
+    # >99.9% NaN.  binned_statistic_2d aggregates nearby points into shared
+    # bins, giving a dense, displayable grid.
+    print(f"Binning into {n_T_bins} T × {n_I_bins} I grid...")
+    Z, T_edges, I_edges, _ = binned_statistic_2d(
+        T_vals, I_vals_uA, dVdI_vals,
+        statistic="mean",
+        bins=[n_T_bins, n_I_bins],
+    )
+    T_centers = 0.5 * (T_edges[:-1] + T_edges[1:])
+    I_centers = 0.5 * (I_edges[:-1] + I_edges[1:])
+
+    nan_frac = np.isnan(Z).mean()
+    print(f"  NaN fraction in grid: {nan_frac:.1%}  "
+          f"(if still high, reduce n_T_bins / n_I_bins)")
+
+    vmin, vmax = np.nanpercentile(dVdI_vals, list(clim_pct))
+    print(f"  dV/dI colour range "
+          f"({clim_pct[0]}–{clim_pct[1]}th pct): {vmin:.3f} – {vmax:.3f} mΩ")
+
+    # ---- 3. Plot ------------------------------------------------------------
+    set_paper_style()
+    fig, ax = plt.subplots(figsize=(8.6 / 2.54, 6 / 2.54),
+                            constrained_layout=True)
+
+    # Build a masked array so NaN cells are transparent, not white
+    Z_masked = np.ma.masked_invalid(Z)
+
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad(color="white")          # NaN → white (matches paper background)
+
+    im = ax.pcolormesh(
+        I_centers, T_centers, Z_masked,
+        cmap=cmap,
+        vmin=vmin, vmax=vmax,
+        rasterized=True,                 # bitmap inside PDF → small file
+        shading="nearest",
+    )
+    fig.colorbar(im, ax=ax, label=r"d$V$/d$I$ (m$\Omega$)")
+    ax.set_xlabel(r"Current ($\mu$A)")
+    ax.set_ylabel("Temperature (K)")
+
+    out = f"{output_prefix}_dVdI_map.pdf"
+    fig.savefig(out, dpi=300)
+    plt.close(fig)
+    print(f"Saved: {out}")
+
 # ==================================================================
 # I(V) and dV/dI: Data Analysis and Numerical Calculations
 # ==================================================================
@@ -846,7 +930,6 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, 
             Ir = results['Ic+_b_mA']
             if Ir > 1e-9:  # avoid division by zero
                 beta_c = (4*Ic / (np.pi * Ir)) ** 2
-                beta_c = 1.62 * (Ic/Ir)**2
                 results['Beta_C'] = beta_c
                 
                 # Capacitance
@@ -1477,16 +1560,19 @@ def _add_IV_dVdI_parser(subparsers):
 
     p.add_argument('--rn-criterion', type=float, default=0.5,
                        help="Fraction of max |V| to use for normal-state R_N linear fit (default=0.5)")
-
-    p.add_argument('--ic-mode', choices=['last', 'first'], default='last',
-                       help="Which jump to use for Ic in multi-jump curves (default=last)")
     p.add_argument('--analyze', action='store_true', 
                        help="Perform numerical analysis (Ic, Jc, RN, etc.) in addition to plotting")
-    p.add_argument('--peak-height-factor', type=float, default=1.5,
-                       help="Sensitivity threshold for peak detection in dV (higher = less sensitive to noise). Default 1.5")
     p.add_argument('--advanced', action='store_true', 
                        help="Perform advanced analysis (diode efficiency, Stewart-McCumber, gap, etc.)")
     p.add_argument('--plot-didv', action='store_true', help="Plot dI/dV and find Riedel peaks")
+    p.add_argument('--multi-t-file', type=str, nargs='?', const='',
+                       help="Single file with multiple temperatures. Provide filename for 2D dV/dI map")
+    p.add_argument("--n-T-bins", type=int, default=23, metavar="N",
+                help="Number of temperature bins for the 2D dV/dI grid "
+                     "(default: 23). Decrease if NaN fraction is still high.")
+    p.add_argument("--n-I-bins", type=int, default=200, metavar="N",
+                help="Number of current bins for the 2D dV/dI grid "
+                     "(default: 200). Decrease if NaN fraction is still high.")
     return p
 
 def _run_RT(args):
@@ -1709,6 +1795,17 @@ def _run_IV_dVdI(args):
             
             print(f"Processed {csv_file}")
             return
+    elif getattr(args, 'multi_t_file', None):
+        filepath = args.multi_t_file
+        print(f"Running 2D dV/dI map from single multi-T file: {filepath}")
+        plot_2d_dvdi_map_from_single_file(
+                                            filepath,
+                                            channel_dV=args.channel_dV,
+                                            channel_dI=args.channel_dI,
+                                            n_T_bins=args.n_T_bins,
+                                            n_I_bins=args.n_I_bins,
+                                        )
+        return
 
 PLOT_TYPES = {
     "RT": (_add_RT_parser, _run_RT),
