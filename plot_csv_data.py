@@ -539,7 +539,7 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
         fig.tight_layout()
     return ax
 
-def plot_iv_diagnostics(data, base_name="iv_diagnostics", figsize=(8.6, 6.0)):
+def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0)):
     set_paper_style()
     types = ['iv', 'dvdI', 'dv', 'di', 't']
     for t in types:
@@ -667,7 +667,7 @@ def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
     df["dVdI"] = (df["dV"] / df["dI"]) * 1000   # mΩ
 
     T_vals    = df["Tsample"].values
-    I_vals_uA = df["Current (A)"].values * 1e6   # µA for display
+    I_vals_mA = df["Current (A)"].values * 1e3   # mA for display
     dVdI_vals = df["dVdI"].values
 
     # ---- 2. 2D binning (replaces pivot_table) --------------------------------
@@ -677,7 +677,7 @@ def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
     # bins, giving a dense, displayable grid.
     print(f"Binning into {n_T_bins} T × {n_I_bins} I grid...")
     Z, T_edges, I_edges, _ = binned_statistic_2d(
-        T_vals, I_vals_uA, dVdI_vals,
+        T_vals, I_vals_mA, dVdI_vals,
         statistic="mean",
         bins=[n_T_bins, n_I_bins],
     )
@@ -824,7 +824,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, 
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
     I = data['I']
     V = data['V']
-    dV = data.get('dV', None)
+    dVdI = data.get('dVdI', None)
     is_bf = data.get('is_bf', False)
     branch = data.get('branch', np.full(len(I), "forward", dtype=object))
     
@@ -834,7 +834,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, 
     }
     
     # Signal for transition detection
-    signal = dV if dV is not None and not np.all(np.isnan(dV)) else np.abs(V)
+    signal = dVdI if dVdI is not None and not np.all(np.isnan(dVdI)) else np.abs(V)
     
     def find_ic_in_direction(I_seg, signal_seg, direction_sign=1):
         if len(I_seg) < 10:
@@ -1779,7 +1779,7 @@ def _run_IV_dVdI(args):
         for csv_file in args.csv_files:
             data = analyze_IV_dVdI(csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI)
             base = os.path.splitext(os.path.basename(csv_file))[0]
-            plot_iv_diagnostics(data, base_name=f"iv_diagnostics_{base}", figsize=args.figsize)
+            plot_iv_diagnostics(data, base_name=f"{base}", figsize=args.figsize)
 
             if getattr(args, 'analyze', False):
                 params = compute_iv_parameters(data, area_um2=args.area, 
