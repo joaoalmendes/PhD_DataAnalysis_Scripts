@@ -636,7 +636,6 @@ def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0))
     print(f"Saved multi-T plots: {output_prefix}_*.pdf")
 
 def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
-                                       output_prefix="multi_t",
                                        n_T_bins=100, n_I_bins=200,
                                        clim_pct=(2, 98)):
     """Load a multi-T rack IV file and produce a 2D dV/dI colour map.
@@ -710,11 +709,12 @@ def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
         rasterized=True,                 # bitmap inside PDF → small file
         shading="nearest",
     )
-    fig.colorbar(im, ax=ax, label=r"d$V$/d$I$ (m$\Omega$)")
-    ax.set_xlabel(r"Current ($\mu$A)")
+    fig.colorbar(im, ax=ax, label=r"dV/dI (m$\Omega$)")
+    ax.set_xlabel(r"Current (mA)")
     ax.set_ylabel("Temperature (K)")
 
-    out = f"{output_prefix}_dVdI_map.pdf"
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    out = f"{base}_dVdI_map.pdf"
     fig.savefig(out, dpi=300)
     plt.close(fig)
     print(f"Saved: {out}")
