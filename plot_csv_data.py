@@ -726,8 +726,8 @@ def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
 from scipy.signal import find_peaks
 
 import numpy as np
-from scipy.signal import find_peaks
 from scipy.stats import linregress
+from scipy.ndimage import gaussian_filter1d
 
 def compute_gap_from_didv(data, advanced=False, figsize=None):
     """Estimate superconducting gap from I(V) data."""
@@ -796,7 +796,7 @@ def compute_gap_from_didv(data, advanced=False, figsize=None):
     ax.grid(True)
     plt.tight_layout()
     base = data.get('filename', 'didv').replace('.csv', '')
-    fig.savefig(f"{base}_didv.pdf")
+    #fig.savefig(f"{base}_didv.pdf")
     plt.close(fig)
     
     # Tight zoom
@@ -815,12 +815,12 @@ def compute_gap_from_didv(data, advanced=False, figsize=None):
         ax.legend()
         ax.grid(True)
         plt.tight_layout()
-        fig.savefig(f"{base}_didv_zoom.pdf")
+        #fig.savefig(f"{base}_didv_zoom.pdf")
         plt.close(fig)
     
     return results
 
-def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, figsize=None):
+def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outlier_thresh=5.0, advanced=False, figsize=None):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
     I = data['I']
     V = data['V']
@@ -836,8 +836,10 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, 
     # Signal for transition detection
     signal = dVdI if dVdI is not None and not np.all(np.isnan(dVdI)) else np.abs(V)
     
-    def find_ic_in_direction(I_seg, signal_seg, direction_sign=1):
-        if len(I_seg) < 10:
+    def find_ic_in_direction(I_seg, signal_seg, direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh):
+        """Find Ic by largest cumulative change, ignoring outliers."""
+        signal_seg = gaussian_filter1d(signal_seg, sigma=2) #If the data is too noisy, e.g. near Tc
+        if len(I_seg) < 2 * span:
             return abs(I_seg[-1])
         if direction_sign > 0:
             mask = I_seg > 0
@@ -847,16 +849,29 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, 
             return np.nan
         I_dir = I_seg[mask]
         sig_dir = signal_seg[mask]
-        # Largest jump in signal
-        diffs = np.diff(sig_dir)
-        if len(diffs) == 0:
-            return abs(I_dir[-1])
-        jump_idx = np.argmax(np.abs(diffs))
-        return abs(I_dir[jump_idx + 1])
+        
+        max_change = 0
+        best_idx = 0
+        for i in range(len(sig_dir) - span):
+            window = sig_dir[i:i+span+1]
+            # Remove outliers
+            median = np.median(window)
+            mad = np.median(np.abs(window - median))
+            if mad == 0:
+                mad = 1e-10
+            outliers = np.abs(window - median) > outlier_threshold * mad
+            clean_window = window[~outliers]
+            if len(clean_window) < 3:
+                continue
+            change = np.sum(np.abs(np.diff(clean_window)))
+            if change > max_change:
+                max_change = change
+                best_idx = i + span // 2
+        return abs(I_dir[best_idx])
     
     # Overall Ic+ and Ic-
-    Ic_plus = find_ic_in_direction(I, signal, direction_sign=1)
-    Ic_minus = find_ic_in_direction(I, signal, direction_sign=-1)
+    Ic_plus = find_ic_in_direction(I, signal, direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh)
+    Ic_minus = find_ic_in_direction(I, signal, direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh)
     
     results['Ic+_mA'] = Ic_plus * 1000
     results['Ic-_mA'] = Ic_minus * 1000
@@ -868,12 +883,12 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, advanced=False, 
         bwd = branch == "backward"
         
         # Forward branch
-        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=1) if np.any(fwd) else np.nan
-        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=-1) if np.any(fwd) else np.nan
+        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(fwd) else np.nan
+        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(fwd) else np.nan
         
         # Backward branch
-        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=1) if np.any(bwd) else np.nan
-        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=-1) if np.any(bwd) else np.nan
+        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(bwd) else np.nan
+        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(bwd) else np.nan
         
         results['Ic+_f_mA'] = Ic_plus_fwd * 1000
         results['Ic-_f_mA'] = Ic_minus_fwd * 1000
@@ -1573,6 +1588,10 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument("--n-I-bins", type=int, default=200, metavar="N",
                 help="Number of current bins for the 2D dV/dI grid "
                      "(default: 200). Decrease if NaN fraction is still high.")
+    p.add_argument('--ic-span', type=int, default=10,
+                   help="Span for jump detection in Ic (default 10)")
+    p.add_argument('--outlier-thresh', type=float, default=5.0,
+                   help="Outlier threshold for Ic detection (default 5.0)")
     return p
 
 def _run_RT(args):
@@ -1784,6 +1803,8 @@ def _run_IV_dVdI(args):
             if getattr(args, 'analyze', False):
                 params = compute_iv_parameters(data, area_um2=args.area, 
                                                rn_criterion=args.rn_criterion,
+                                               ic_span=args.ic_span,
+                                               outlier_thresh=getattr(args, 'outlier_thresh', 5.0),
                                                advanced=getattr(args, 'advanced', False),
                                                figsize=args.figsize)
                 print(f"\n=== IV Analysis Results for {csv_file} ===")
