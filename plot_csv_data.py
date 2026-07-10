@@ -835,9 +835,10 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
     
     # Signal for transition detection
     signal = dVdI if dVdI is not None and not np.all(np.isnan(dVdI)) else np.abs(V)
-    #signal_seg = gaussian_filter1d(signal_seg, sigma=2) #If the data is too noisy, e.g. near Tc
+    
     def find_ic_in_direction(I_seg, signal_seg, direction_sign=1, span=10, outlier_threshold=5.0, diff_threshold=0.001):
         """Outlier removal + only sum significant differences."""
+        #signal_seg = gaussian_filter1d(signal_seg, sigma=2) #If the data is too noisy, e.g. near Tc
         if len(I_seg) < 2 * span:
             return abs(I_seg[-1])
         if direction_sign > 0:
@@ -929,18 +930,9 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
     # === Advanced Analysis ===
     if advanced:
         # Diode efficiency
-        if not np.isnan(results['Ic+_mA']) and not np.isnan(results['Ic-_mA']):
-            asym = abs(results['Ic+_mA'] - abs(results['Ic-_mA'])) / (results['Ic+_mA'] + abs(results['Ic-_mA']))
-            results['Diode_Efficiency'] = asym
-        
         if is_bf:
-            # Per branch
-            if not np.isnan(results.get('Ic+_fwd_mA', np.nan)) and not np.isnan(results.get('Ic-_fwd_mA', np.nan)):
-                asym_fwd = abs(results['Ic+_fwd_mA'] - abs(results['Ic-_fwd_mA'])) / (results['Ic+_fwd_mA'] + abs(results['Ic-_fwd_mA']))
-                results['Diode_Efficiency_fwd'] = asym_fwd
-            if not np.isnan(results.get('Ic+_bwd_mA', np.nan)) and not np.isnan(results.get('Ic-_bwd_mA', np.nan)):
-                asym_bwd = abs(results['Ic+_bwd_mA'] - abs(results['Ic-_bwd_mA'])) / (results['Ic+_bwd_mA'] + abs(results['Ic-_bwd_mA']))
-                results['Diode_Efficiency_bwd'] = asym_bwd
+            asym_fwd = 100 * ((abs(results['Ic+_f_mA']) - abs(results['Ic-_b_mA'])) / (abs(results['Ic+_f_mA']) + abs(results['Ic-_b_mA'])))
+            results['Diode_Efficiency_%'] = asym_fwd
         # Stewart-McCumber from retrapping current (BF only)
         if is_bf and 'Ic+_f_mA' in results and 'Ic+_b_mA' in results:
             Ic = results['Ic+_f_mA']
