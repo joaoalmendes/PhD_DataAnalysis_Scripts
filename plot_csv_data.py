@@ -729,96 +729,264 @@ import numpy as np
 from scipy.stats import linregress
 from scipy.ndimage import gaussian_filter1d
 
-def compute_gap_from_didv(data, advanced=False, figsize=None):
-    """Estimate superconducting gap from I(V) data."""
-    if not advanced:
-        return {}
-    
-    I = data['I']
-    V = data['V']
-    is_bf = data.get('is_bf', False)
-    branch = data.get('branch', np.full(len(I), "forward", dtype=object))
-    
-    I_ma = I * 1000
-    V_mv = V * 1000
-    
-    results = {}
-    
-        # Steepest slope method (inflection point)
-        # Find largest voltage jump (better for Ic-like transition)
-        # Largest voltage jump method (robust for switching)
-    dV = np.diff(V_mv)
-    jump_idx = np.argmax(np.abs(dV))
-    Vc_mean = abs(V_mv[jump_idx + 1])
-    
-    results['Vc_mean_mV'] = Vc_mean
-    results['Delta_meV'] = Vc_mean / 2 # approximate gap in meV
-    
-    if is_bf:
-        fwd = branch == "forward"
-        bwd = branch == "backward"
-        if np.any(fwd):
-            dV_fwd = np.diff(V_mv[fwd])
-            idx_fwd = np.argmax(np.abs(dV_fwd))
-            Vc_fwd = abs(V_mv[fwd][idx_fwd + 1])
-        else:
-            Vc_fwd = np.nan
-        if np.any(bwd):
-            dV_bwd = np.diff(V_mv[bwd])
-            idx_bwd = np.argmax(np.abs(dV_bwd))
-            Vc_bwd = abs(V_mv[bwd][idx_bwd + 1])
-        else:
-            Vc_bwd = np.nan
-        results['Vc_fwd_mV'] = Vc_fwd
-        results['Vc_bwd_mV'] = Vc_bwd
-    
-    set_paper_style()
-        # Main plot
-        # Main plot with capped y-axis
-        # Main plot
-        # Main plot with aggressive capping
-        # Main plot
-    fig, ax = plt.subplots(figsize=figsize)
-    didv_plot = np.gradient(I_ma, V_mv)
-    # Exclude points very close to zero
-    mask_nonzero = np.abs(V_mv) > 0.05  # mV
-    noise_level = np.std(didv_plot[mask_nonzero & (np.abs(didv_plot) < np.percentile(np.abs(didv_plot[mask_nonzero]), 50))])
-    cap = noise_level * 10
-    didv_plot = np.clip(didv_plot, -cap, cap)
-    ax.plot(V_mv, didv_plot, 'b-', label='dI/dV')
-    if not np.isnan(Vc_mean):
-        ax.axvline(Vc_mean, color='r', linestyle='--', label=f'Vc ≈ {Vc_mean:.3f} mV')
-        ax.axvline(-Vc_mean, color='r', linestyle='--')
-    ax.set_xlabel("Voltage (mV)")
-    ax.set_ylabel("dI/dV (mA/mV)")
-    ax.set_title("dI/dV vs V (capped)")
-    ax.legend()
-    ax.grid(True)
-    plt.tight_layout()
-    base = data.get('filename', 'didv').replace('.csv', '')
-    #fig.savefig(f"{base}_didv.pdf")
-    plt.close(fig)
-    
-    # Tight zoom
-    if not np.isnan(Vc_mean):
-        fig, ax = plt.subplots(figsize=figsize)
-        zoom_range = Vc_mean * 1.2
-        mask = (np.abs(V_mv) < zoom_range) & (np.abs(V_mv) > 0.05)
-        didv_zoom = np.gradient(I_ma, V_mv)[mask]
-        didv_zoom = np.clip(didv_zoom, -cap, cap)
-        ax.plot(V_mv[mask], didv_zoom, 'b-', label='dI/dV')
-        ax.axvline(Vc_mean, color='r', linestyle='--')
-        ax.axvline(-Vc_mean, color='r', linestyle='--')
-        ax.set_xlabel("Voltage (mV)")
-        ax.set_ylabel("dI/dV (mA/mV)")
-        ax.set_title("Zoomed dI/dV around Gap")
-        ax.legend()
-        ax.grid(True)
+# ==================================================================
+# dI/dV analysis for superconducting gap extraction
+#
+# Physical picture
+# ----------------
+# In a current-biased V(I) measurement:
+#   - I is the independent (swept) variable → uniform spacing
+#   - V is the output → not uniform
+#   - dV/dI  = differential resistance (high in resistive state, ~0 in SC state)
+#   - dI/dV  = differential conductance (Riedel peaks appear here)
+#
+# The Riedel singularity (Josephson pair tunneling) appears as a peak
+# in dI/dV at |V| = 2Δ/e.  For a weak-link / SNS junction, Multiple
+# Andreev Reflection (MAR) produces additional features at |V| = 2Δ/(n·e)
+# for n = 2, 3, ... The main gap is extracted from the n=1 peak (highest |V|).
+#
+# The superconducting branch (|V| ≈ 0 for |I| < Ic) must be excluded
+# before computing dI/dV because 1/(dV/dI) → ∞ there.
+# ==================================================================
+
+def analyze_didv(data, smooth_window=11, smooth_poly=3,
+                  sc_voltage_threshold_mV=0.1,
+                  peak_prominence_rel=0.15,
+                  n_mar_peaks=3):
+    """Compute dI/dV from current-biased V(I) data and find gap features.
+
+    Uses a Savitzky-Golay filter to simultaneously smooth and differentiate
+    V(I) — the standard approach for noisy spectroscopy data. The Riedel
+    peak (and MAR subharmonics) are located with scipy.signal.find_peaks on
+    the resistive branch only.
+
+    Parameters
+    ----------
+    data : dict
+        Must contain:
+          'I'      : ndarray, current in Amperes (the swept quantity)
+          'V'      : ndarray, measured voltage in Volts
+        Optionally:
+          'branch' : ndarray of 'forward'/'backward' per point
+          'is_bf'  : bool, True if both branches are present
+    smooth_window : int, optional
+        Savitzky-Golay window length (must be odd). Defaults to ~5% of
+        the number of points (minimum 11). Increase for noisier data.
+    smooth_poly : int
+        Polynomial order for the SG filter (default 3). Must be less
+        than smooth_window.
+    sc_voltage_threshold_mV : float
+        Points with |V| < this threshold (mV) are considered to be on
+        the superconducting branch and are excluded from dI/dV
+        (avoids the 1/(dV/dI≈0) divergence). Default: 0.1 mV.
+    peak_prominence_rel : float
+        Minimum peak prominence as a fraction of the maximum dI/dV on
+        the resistive branch. Increase to suppress noise peaks (0–1).
+    n_mar_peaks : int
+        How many MAR sub-harmonic peaks to search for (n=1 is the
+        main gap at 2Δ, n=2 at Δ, etc.). Default: 3.
+
+    Returns
+    -------
+    dict with keys:
+        'I_sorted', 'V_mV', 'dVdI_Ohm', 'dIdV_mA_per_mV'
+            Arrays on the sorted-I grid (full data, including SC branch).
+        'V_res_mV', 'dIdV_res'
+            Arrays restricted to the resistive branch (|V| > threshold)
+            where peak-finding is done.
+        'peaks_V_mV', 'peaks_dIdV'
+            Voltage and dI/dV values at each detected peak (sorted by
+            decreasing |V|, i.e. n=1 first).
+        'gap_V_mV'
+            Estimated gap voltage = voltage of the highest-|V| peak.
+            None if no peaks found.
+        'Delta_meV'
+            Estimated gap energy = gap_V_mV / 2 (for a symmetric S-I-S
+            junction where V_gap = 2Δ/e). For MAR in an SNS junction
+            this is still a reasonable first estimate. None if no peaks.
+        'smooth_window'
+            Actual window length used (for reproducibility reporting).
+        'branches_processed' : list of branch names analyzed
+    """
+    from scipy.signal import savgol_filter, find_peaks
+
+    I = np.asarray(data["I"], dtype=float)
+    V = np.asarray(data["V"], dtype=float)
+    branch_arr = np.asarray(data.get("branch", np.full(len(I), "all")))
+    is_bf = data.get("is_bf", False)
+
+    # ---- sort by current (SG filter requires uniform independent variable) --
+    order = np.argsort(I)
+    I_s = I[order]
+    V_s = V[order]
+    b_s = branch_arr[order]
+
+    # Convert to working units
+    V_mV = V_s * 1e3       # mV
+    I_mA = I_s * 1e3       # mA
+
+    # ---- Savitzky-Golay window selection ------------------------------------
+    n = len(I_s)
+    if smooth_window is None:
+        smooth_window = max(11, n // 20)
+    if smooth_window % 2 == 0:
+        smooth_window += 1          # must be odd
+    smooth_window = min(smooth_window, n - 1 if (n - 1) % 2 == 1 else n - 2)
+    if smooth_poly >= smooth_window:
+        smooth_poly = smooth_window - 1
+
+    # ---- dV/dI via SG derivative (smooth + differentiate simultaneously) ----
+    # delta = spacing of the independent variable (I in mA)
+    dI_step = float(np.median(np.diff(I_mA)))
+    if abs(dI_step) < 1e-12:
+        raise ValueError(
+            "Current step size is effectively zero — check that 'I' is "
+            "the swept (source) variable, not the measured one."
+        )
+
+    # savgol_filter(y, window, poly, deriv=1, delta=dx) returns dy/dx
+    dVdI_mV_per_mA = savgol_filter(
+        V_mV, smooth_window, smooth_poly,
+        deriv=1, delta=abs(dI_step)
+    )   # units: mV/mA = Ω
+
+    # ---- restrict to resistive branch for dI/dV ----------------------------
+    # In the SC branch dV/dI ≈ 0 → 1/(dV/dI) diverges and carries no
+    # gap information; exclude those points.
+    res_mask = np.abs(V_mV) > sc_voltage_threshold_mV
+    V_res = V_mV[res_mask]
+    dVdI_res = dVdI_mV_per_mA[res_mask]
+
+    # Safe inversion: only where dV/dI is reliably non-zero
+    safe = np.abs(dVdI_res) > 1e-6        # mV/mA = Ω; avoids divide-by-zero
+    dIdV_res = np.full(dVdI_res.shape, np.nan)
+    dIdV_res[safe] = 1.0 / dVdI_res[safe]  # 1/Ω = mA/mV (conductance)
+
+    # ---- peak finding in dI/dV vs |V| (positive half only for symmetry) ----
+    pos_mask = V_res > 0
+    V_pos = V_res[pos_mask]
+    dIdV_pos = dIdV_res[pos_mask]
+
+    peaks_V, peaks_dIdV = np.array([]), np.array([])
+    gap_V_mV = None
+    Delta_meV = None
+
+    if np.any(np.isfinite(dIdV_pos)):
+        baseline = np.nanmedian(dIdV_pos)
+        max_val  = np.nanmax(dIdV_pos)
+        prominence_abs = peak_prominence_rel * (max_val - baseline)
+
+        peak_idx, props = find_peaks(
+            np.nan_to_num(dIdV_pos, nan=baseline),
+            prominence=max(prominence_abs, 1e-9),
+            distance=max(3, n // 100),      # minimum separation between peaks
+        )
+
+        if len(peak_idx) > 0:
+            # Sort by decreasing V: n=1 (2Δ) is the rightmost peak
+            order_p = np.argsort(V_pos[peak_idx])[::-1]
+            peak_idx_sorted = peak_idx[order_p][:n_mar_peaks]
+            peaks_V    = V_pos[peak_idx_sorted]
+            peaks_dIdV = dIdV_pos[peak_idx_sorted]
+            gap_V_mV   = float(peaks_V[0])        # highest-V peak = n=1
+            Delta_meV  = gap_V_mV / 2.0           # Δ = e·V/2 for SIS
+
+    branches = ["all"] if not is_bf else list(np.unique(b_s))
+
+    return {
+        "I_sorted":        I_s,
+        "V_mV":            V_mV,
+        "dVdI_Ohm":        dVdI_mV_per_mA,   # mV/mA = Ω
+        "dIdV_mA_per_mV":  np.where(
+                               np.abs(dVdI_mV_per_mA) > 1e-6,
+                               1.0 / dVdI_mV_per_mA,
+                               np.nan
+                           ),
+        "V_res_mV":        V_res,
+        "dIdV_res":        dIdV_res,
+        "peaks_V_mV":      peaks_V,
+        "peaks_dIdV":      peaks_dIdV,
+        "gap_V_mV":        gap_V_mV,
+        "Delta_meV":       Delta_meV,
+        "smooth_window":   smooth_window,
+        "sc_threshold_mV": sc_voltage_threshold_mV,
+        "branches_processed": branches,
+    }
+
+def plot_didv(result, ax=None, show_peaks=True, xlim=None,
+               ylabel=r"d$I$/d$V$ (mA/mV)",
+               xlabel="Voltage (mV)",
+               color="tab:blue", peak_color="tab:red",
+               legend=True):
+    """Plot dI/dV vs V from the output of `analyze_didv`.
+
+    Parameters
+    ----------
+    result : dict
+        Output of `analyze_didv`.
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw on; new figure created if omitted.
+    show_peaks : bool
+        Mark the detected Riedel/MAR peaks with vertical lines.
+    xlim : (float, float), optional
+        x-axis limits in mV. Defaults to the full voltage range.
+    color : str
+        Colour for the dI/dV curve.
+    peak_color : str
+        Colour for peak markers.
+    legend : bool
+        Whether to draw a legend.
+
+    Returns
+    -------
+    ax : matplotlib.axes.Axes
+    """
+    created_fig = ax is None
+    if created_fig:
+        fig, ax = plt.subplots(constrained_layout=True)
+
+    V_plot    = result["V_res_mV"]
+    dIdV_plot = result["dIdV_res"]
+
+    # Clip extreme outliers for display only (does not affect analysis)
+    finite = np.isfinite(dIdV_plot)
+    if np.any(finite):
+        lo, hi = np.nanpercentile(dIdV_plot[finite], [1, 99])
+        margin = (hi - lo) * 0.2
+        dIdV_display = np.clip(dIdV_plot, lo - margin, hi + margin)
+    else:
+        dIdV_display = dIdV_plot
+
+    ax.plot(V_plot, dIdV_display, color=color, lw=0.8, label="d$I$/d$V$")
+    # Negative branch by symmetry
+    ax.plot(-V_plot, dIdV_display, color=color, lw=0.8, alpha=0.5)
+
+    if show_peaks and len(result["peaks_V_mV"]) > 0:
+        for n_idx, (V_pk, dIdV_pk) in enumerate(
+            zip(result["peaks_V_mV"], result["peaks_dIdV"]), start=1
+        ):
+            lbl = (rf"$2\Delta/e$ ≈ {V_pk:.3f} mV  →  $\Delta$ ≈ {V_pk/2:.3f} meV"
+                   if n_idx == 1
+                   else rf"MAR $n={n_idx}$: {V_pk:.3f} mV")
+            ax.axvline( V_pk, color=peak_color, ls="--", lw=0.9, label=lbl)
+            ax.axvline(-V_pk, color=peak_color, ls="--", lw=0.9)
+
+        ax.axvspan(
+            -result["sc_threshold_mV"], result["sc_threshold_mV"],
+            color="gray", alpha=0.12, label="SC branch (excluded)"
+        )
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+    if legend:
+        ax.legend(fontsize=7, frameon=False)
+
+    if created_fig:
         plt.tight_layout()
-        #fig.savefig(f"{base}_didv_zoom.pdf")
-        plt.close(fig)
-    
-    return results
+
+    return ax
 
 def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outlier_thresh=5.0, advanced=False, diff_threshold=0.001, figsize=None):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
@@ -947,10 +1115,31 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
                     Phi0 = 2.067833848e-15
                     C = (beta_c * Phi0) / (2 * np.pi * Ic*1e-3 * Rn**2)
                     results['C_fF'] = C * 1e15  # fF
-                    results['C_uF/cm2'] = C * 1e6 / (area_um2 * 1e-8)  # uF/cm² (area in um2 -> cm2)
-        gap_results = compute_gap_from_didv(data, advanced=True, figsize=figsize)
-        results.update(gap_results)
+                    results['C_uF/cm2'] = (C * 1e6) / (area_um2 * 1e-8)  # uF/cm² (area in um2 -> cm2)
+        set_paper_style()
 
+        result = analyze_didv(
+            data,
+            smooth_window=21,           # increase for noisier data
+            sc_voltage_threshold_mV=0.1,
+            peak_prominence_rel=0.15,
+        )
+
+        print(f"Gap voltage: {result['gap_V_mV']:.3f} mV")
+        print(f"Gap energy Δ: {result['Delta_meV']:.3f} meV")
+        print(f"All peaks (n=1,2,...): {result['peaks_V_mV']} mV")
+
+        fig, axes = plt.subplots(1, 2, figsize=(17/2.54, 6/2.54), constrained_layout=True)
+
+        # Full range
+        plot_didv(result, ax=axes[0])
+
+        # Zoomed around gap
+        if result["gap_V_mV"] is not None:
+            plot_didv(result, ax=axes[1],
+                    xlim=(-result["gap_V_mV"]*1.5, result["gap_V_mV"]*1.5))
+
+        fig.savefig("didv_gap.pdf")
     return results
 
 # ==================================================================
