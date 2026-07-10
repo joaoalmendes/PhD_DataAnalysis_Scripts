@@ -820,7 +820,7 @@ def compute_gap_from_didv(data, advanced=False, figsize=None):
     
     return results
 
-def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outlier_thresh=5.0, advanced=False, figsize=None):
+def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outlier_thresh=5.0, advanced=False, diff_threshold=0.001, figsize=None):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
     I = data['I']
     V = data['V']
@@ -835,10 +835,9 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
     
     # Signal for transition detection
     signal = dVdI if dVdI is not None and not np.all(np.isnan(dVdI)) else np.abs(V)
-    
-    def find_ic_in_direction(I_seg, signal_seg, direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh):
-        """Find Ic by largest cumulative change, ignoring outliers."""
-        signal_seg = gaussian_filter1d(signal_seg, sigma=2) #If the data is too noisy, e.g. near Tc
+    #signal_seg = gaussian_filter1d(signal_seg, sigma=2) #If the data is too noisy, e.g. near Tc
+    def find_ic_in_direction(I_seg, signal_seg, direction_sign=1, span=10, outlier_threshold=5.0, diff_threshold=0.001):
+        """Outlier removal + only sum significant differences."""
         if len(I_seg) < 2 * span:
             return abs(I_seg[-1])
         if direction_sign > 0:
@@ -854,7 +853,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
         best_idx = 0
         for i in range(len(sig_dir) - span):
             window = sig_dir[i:i+span+1]
-            # Remove outliers
+            # Outlier removal
             median = np.median(window)
             mad = np.median(np.abs(window - median))
             if mad == 0:
@@ -863,15 +862,18 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
             clean_window = window[~outliers]
             if len(clean_window) < 3:
                 continue
-            change = np.sum(np.abs(np.diff(clean_window)))
+            # Sum only significant differences
+            diffs = np.abs(np.diff(clean_window))
+            significant_diffs = diffs[diffs > diff_threshold]
+            change = np.sum(significant_diffs) if len(significant_diffs) > 0 else 0
             if change > max_change:
                 max_change = change
                 best_idx = i + span // 2
         return abs(I_dir[best_idx])
     
     # Overall Ic+ and Ic-
-    Ic_plus = find_ic_in_direction(I, signal, direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh)
-    Ic_minus = find_ic_in_direction(I, signal, direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh)
+    Ic_plus = find_ic_in_direction(I, signal, direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold)
+    Ic_minus = find_ic_in_direction(I, signal, direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold)
     
     results['Ic+_mA'] = Ic_plus * 1000
     results['Ic-_mA'] = Ic_minus * 1000
@@ -883,12 +885,12 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
         bwd = branch == "backward"
         
         # Forward branch
-        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(fwd) else np.nan
-        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(fwd) else np.nan
+        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(fwd) else np.nan
+        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(fwd) else np.nan
         
         # Backward branch
-        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(bwd) else np.nan
-        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh) if np.any(bwd) else np.nan
+        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(bwd) else np.nan
+        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(bwd) else np.nan
         
         results['Ic+_f_mA'] = Ic_plus_fwd * 1000
         results['Ic-_f_mA'] = Ic_minus_fwd * 1000
@@ -1592,6 +1594,8 @@ def _add_IV_dVdI_parser(subparsers):
                    help="Span for jump detection in Ic (default 10)")
     p.add_argument('--outlier-thresh', type=float, default=5.0,
                    help="Outlier threshold for Ic detection (default 5.0)")
+    p.add_argument('--diff-threshold', type=float, default=0.001,
+                   help="Minimum difference to consider in sum for Ic detection (default 0.001)")
     return p
 
 def _run_RT(args):
@@ -1804,7 +1808,8 @@ def _run_IV_dVdI(args):
                 params = compute_iv_parameters(data, area_um2=args.area, 
                                                rn_criterion=args.rn_criterion,
                                                ic_span=args.ic_span,
-                                               outlier_thresh=getattr(args, 'outlier_thresh', 5.0),
+                                               outlier_thresh=args.outlier_thresh,
+                                               diff_threshold=args.diff_threshold,
                                                advanced=getattr(args, 'advanced', False),
                                                figsize=args.figsize)
                 print(f"\n=== IV Analysis Results for {csv_file} ===")
