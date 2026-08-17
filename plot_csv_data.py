@@ -1709,12 +1709,12 @@ def _add_RT_parser(subparsers):
                          "in K (e.g. --rrr-temp 8 for NbSe2 with Tc≈7 K). "
                          "Rounded to the nearest integer for display. "
                          "Required when --rrr is used.")
-    p.add_argument("--rrr-window", type=float, default=0.5, metavar="DT",
+    p.add_argument("--rrr-window", type=float, default=10, metavar="DT",
                     help="Half-width in K of the averaging window around "
                          "--rrr-temp when computing R_low (default: 0.5 K). "
                          "Increase if few data points fall near that "
                          "temperature.")
-    p.add_argument("--source", choices=["ppms", "rack"], default="ppms",
+    p.add_argument("--source", choices=["ppms", "rack"], default="rack",
                     help="Instrument that produced the CSV file(s): "
                          "'ppms' for PPMS/MultiVu (default), "
                          "'rack' for the custom rack with lock-in amplifier.")
@@ -1793,7 +1793,7 @@ def _run_RT(args):
     datasets = []
     is_multi_rack = (args.source == "rack" and getattr(args, 'rack_signals', None) is not None and len(getattr(args, 'rack_signals', [])) > 0)
 
-    for csv_file in args.csv_files:
+    for i, csv_file in enumerate(args.csv_files):
         if is_multi_rack:
             signal_list = []
             for item in args.rack_signals:
@@ -1856,8 +1856,8 @@ def _run_RT(args):
                 datasets.append({"data": data, "label": label, "color": color, "fit": fit})
         else:
             # Original single-dataset per file logic
-            label = labels[csv_file]
-            color = color_cycle[csv_file % len(color_cycle)]
+            label = labels[i] if i < len(labels) else os.path.splitext(os.path.basename(csv_file))[0]
+            color = color_cycle[i % len(color_cycle)]
             data = analyze_RT(csv_file,
                                bridge=1 if args.source == "rack" else args.bridge,
                                split_branches=not args.no_split,

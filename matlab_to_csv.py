@@ -4,6 +4,32 @@ import pandas as pd
 import os
 from pathlib import Path
 
+
+def _clean_chan_name(name):
+    """Normalize MATLAB channel names like '\\theta_2', 'T_{SAMPLE}', 'T_{set}'."""
+    s = str(name)
+    s = s.replace('\\', '').replace('_{', '_').replace('}', '').strip()
+    # Also strip accidental list/array stringification leftovers
+    s = s.strip("[]'\" ")
+    return s
+
+
+def _unwrap_matlab(obj):
+    """Dig out the actual value from nested MATLAB cell/array structures."""
+    while isinstance(obj, np.ndarray) and obj.size == 1:
+        obj = obj.flat[0]
+    return obj
+
+
+def _unwrap_matlab_string(obj):
+    """Dig out the actual string from nested MATLAB cell/array structures."""
+    obj = _unwrap_matlab(obj)
+    if isinstance(obj, np.ndarray) and obj.size > 0:
+        # e.g. array(['T_{set}'])
+        obj = obj.flat[0]
+    return str(obj)
+
+
 def extract_data_v1_python(mat_path):
     """Python version of extract_data_v1.m"""
     mat = scipy.io.loadmat(mat_path)
@@ -30,8 +56,8 @@ def extract_data_v1_python(mat_path):
         if 'getchan' in loop.dtype.names:
             getchan = loop['getchan'][0]
             for ch_idx, ch_name_arr in enumerate(getchan):
-                ch_name = str(ch_name_arr[0]) if isinstance(ch_name_arr, np.ndarray) else str(ch_name_arr)
-                ch_clean = ch_name.replace('\\', '').replace('_{', '_').replace('}', '').strip()
+                ch_name = _unwrap_matlab_string(ch_name_arr)
+                ch_clean = _clean_chan_name(ch_name)
 
                 if data is not None and ch_idx < data.shape[1]:
                     val = data[0, ch_idx]
@@ -53,15 +79,21 @@ def extract_data_v1_python(mat_path):
         if 'setchan' in loop.dtype.names and 'setchanranges' in loop.dtype.names and 'npoints' in loop.dtype.names:
             setchan = loop['setchan']
             if setchan.size > 0:
-                set_name = str(setchan.flat[0])
-                set_clean = set_name.replace('\\', '').replace('_{', '_').replace('}', '').strip()
+                set_name = _unwrap_matlab_string(setchan)
+                set_clean = _clean_chan_name(set_name)
 
-                rng = loop['setchanranges'][0]
-                npts = int(loop['npoints'].flat[0])
+                rng = _unwrap_matlab(loop['setchanranges'])
+                # After unwrapping we may still have a 1×2 or 2-element array
+                if isinstance(rng, np.ndarray):
+                    rng_vals = rng.flatten()
+                else:
+                    rng_vals = np.asarray(rng).flatten()
 
-                if rng.size >= 2:
-                    start = float(rng.flat[0])
-                    stop = float(rng.flat[1])
+                npts = int(_unwrap_matlab(loop['npoints']))
+
+                if len(rng_vals) >= 2:
+                    start = float(rng_vals[0])
+                    stop = float(rng_vals[1])
                     if set_clean == 'V_s' and D['Vs'] is None:
                         D['Vs'] = np.linspace(start, stop, npts)
                     elif set_clean == 'T_set' and D['Tset'] is None:
@@ -84,7 +116,7 @@ def save_to_csv(mat_path):
 
     base_name = Path(mat_path).stem
     cwd = Path(os.getcwd())
-    
+
     csv_path = cwd / f"{base_name}.csv"
     comments_path = cwd / f"{base_name}_comments.txt"
 
@@ -99,21 +131,36 @@ def save_to_csv(mat_path):
                 f.write(str(comments))
         print(f"✓ Comments saved: {comments_path}")
 
-    # Build DataFrame (all columns, even empty)
+    # ---- Build DataFrame correctly ----
+    # 1) First pass: collect real arrays and determine max length
     data_dict = {}
     max_len = 0
-
     for key, value in D.items():
         if isinstance(value, np.ndarray) and value.size > 0:
             flat = value.flatten()
             data_dict[key] = flat
             max_len = max(max_len, len(flat))
         else:
-            data_dict[key] = [np.nan] * max(1, max_len) if max_len > 0 else [np.nan]
+            data_dict[key] = None   # placeholder
+
+    # 2) Second pass: pad missing columns to the same length
+    if max_len == 0:
+        max_len = 1
+    for key in data_dict:
+        if data_dict[key] is None:
+            data_dict[key] = np.full(max_len, np.nan)
+        elif len(data_dict[key]) != max_len:
+            # Safety: pad or truncate if lengths ever differ
+            arr = np.asarray(data_dict[key], dtype=float)
+            if len(arr) < max_len:
+                arr = np.pad(arr, (0, max_len - len(arr)), constant_values=np.nan)
+            else:
+                arr = arr[:max_len]
+            data_dict[key] = arr
 
     df = pd.DataFrame(data_dict)
 
-    # === Remove completely empty rows (all NaN) ===
+    # Remove completely empty rows (all NaN)
     df = df.dropna(how='all').reset_index(drop=True)
 
     df.to_csv(csv_path, index=False)
@@ -128,7 +175,12 @@ def save_to_csv(mat_path):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        file_path = f"/home/joaoalmendes/PhD/{sys.argv[1]}"
+        # Accept either a bare relative path or an absolute path
+        arg = sys.argv[1]
+        if os.path.isabs(arg) or os.path.exists(arg):
+            file_path = arg
+        else:
+            file_path = f"/home/joaoalmendes/PhD/{arg}"
         if os.path.exists(file_path):
             print(f"Processing: {file_path}")
             save_to_csv(file_path)

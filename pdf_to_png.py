@@ -2,7 +2,7 @@ from pdf2image import convert_from_path
 import os
 
 pdf_folder = os.getcwd() #"RSM_cuts_pdf/L_cuts/Hysteric/NewPeaks"
-output_folder = os.getcwd() #"RSM_cuts/L_cuts/Hysteric/NewPeaks"
+output_folder = os.getcwd() + "/pngs/" #"RSM_cuts/L_cuts/Hysteric/NewPeaks"
 os.makedirs(output_folder, exist_ok=True)
 
 for pdf_file in os.listdir(pdf_folder):
