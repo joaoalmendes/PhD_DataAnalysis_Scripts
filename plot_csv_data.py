@@ -34,6 +34,8 @@ import matplotlib.pyplot as plt
 import re
 import glob
 
+import warnings
+
 # ==================================================================
 # Style / display helpers
 # (the only section that should contain rcParams, default colors,
@@ -177,6 +179,169 @@ def load_csv(csv_path, source="ppms", current=None, channel=2, signal_col=None):
             signal_col = f"R{channel}"
         return _load_csv_rack(csv_path, signal_col=signal_col, current=current)
     return _load_csv_ppms(csv_path)
+
+def parse_hall_mr_comments(comments_path):
+    """Parse a Hall/MR measurement comments .txt file.
+ 
+    The comments file is produced alongside the .mat/.csv data and
+    records which LIA channel measures the Hall vs. longitudinal voltage,
+    the input resistance, AC frequency, sensitivity and time constant.
+ 
+    Parameters
+    ----------
+    comments_path : str
+        Full path to the *_comments.txt file.
+ 
+    Returns
+    -------
+    dict with keys (where parseable):
+        'hall_lia'    : int, LIA number measuring Hall (transverse) voltage
+        'mr_lia'      : int, LIA number measuring longitudinal (MR) voltage
+        'R_input_Ohm' : float, input resistance (Ω) → I = V_source / R_input
+        'freq_Hz'     : float, LIA AC excitation frequency (Hz)
+        'sensitivity_V': float, LIA voltage sensitivity (V)
+        'time_const_s' : float, LIA time constant (s)
+        'raw'         : list[str], every line verbatim (for manual inspection)
+ 
+    Notes
+    -----
+    The parser uses flexible regex matching; it does not require a fixed
+    format.  Lines it cannot parse are silently stored under 'raw'.
+    """
+    info = {'raw': []}
+    if not os.path.isfile(comments_path):
+        warnings.warn(
+            f"Comments file not found: {comments_path}. "
+            "Proceeding without metadata.", UserWarning, stacklevel=2
+        )
+        return info
+ 
+    with open(comments_path, 'r') as fh:
+        for line in fh:
+            info['raw'].append(line.rstrip())
+ 
+    for line in info['raw']:
+        lo = line.lower()
+        # Hall LIA assignment e.g. "LIA1 → Hall" or "Hall: LIA 2"
+        m = re.search(r'lia\s*(\d)\s*[\-\→:]+\s*hall', lo)
+        if m:
+            info['hall_lia'] = int(m.group(1))
+        m = re.search(r'hall\s*[\-\→:]+\s*lia\s*(\d)', lo)
+        if m:
+            info['hall_lia'] = int(m.group(1))
+        # MR / longitudinal LIA assignment
+        m = re.search(r'lia\s*(\d)\s*[\-\→:]+\s*(mr|long|magneto|xx|rxx)', lo)
+        if m:
+            info['mr_lia'] = int(m.group(1))
+        m = re.search(r'(mr|long|magneto|xx|rxx)\s*[\-\→:]+\s*lia\s*(\d)', lo)
+        if m:
+            info['mr_lia'] = int(m.group(2))
+        # Input resistance
+        m = re.search(r'input\s*resist[a-z]*\s*[:\=]\s*([\d\.eE\+\-]+)', lo)
+        if m:
+            try:
+                info['R_input_Ohm'] = float(m.group(1))
+            except ValueError:
+                pass
+        # Frequency
+        m = re.search(r'freq[a-z]*\s*[:\=]\s*([\d\.eE\+\-]+)', lo)
+        if m:
+            try:
+                info['freq_Hz'] = float(m.group(1))
+            except ValueError:
+                pass
+ 
+    return info
+ 
+def load_hall_mr_csv(csv_path, hall_n, mr_n, hall_col='X', mr_col='X'):
+    """Load one Hall/MR field-sweep CSV file from the custom rack.
+ 
+    Each file contains one complete sweep direction
+    (−Hmax→+Hmax  or  +Hmax→−Hmax).  Forward and backward sweeps are
+    stored in separate files; use two calls and pass both results to
+    ``analyze_hall_mr``.
+ 
+    Parameters
+    ----------
+    csv_path : str
+    hall_n : int
+        LIA channel number (1–3) measuring the Hall (transverse) voltage.
+    mr_n : int
+        LIA channel number measuring the longitudinal (MR) voltage.
+    hall_col : {'X', 'R'}
+        'X' → in-phase component (recommended); 'R' → magnitude.
+    mr_col : {'X', 'R'}
+ 
+    Returns
+    -------
+    dict
+        'H_Oe'         : ndarray, field in Oe (chronological)
+        'Vy_V'         : ndarray, Hall voltage (V)
+        'Vx_V'         : ndarray, longitudinal voltage (V)
+        'theta_H_deg'  : ndarray, Hall LIA phase (degrees)
+        'theta_MR_deg' : ndarray, MR LIA phase (degrees)
+        'T_K'          : ndarray, sample temperature (K)
+        'sweep_dir'    : 'forward' or 'backward'
+        'H_max_Oe'     : float, maximum |H| recorded
+        'n_pts'        : int
+        'hall_col_name', 'mr_col_name', 'csv_path'
+    """
+    df = pd.read_csv(csv_path)
+ 
+    hall_col_name = f"{hall_col}{hall_n}"
+    mr_col_name   = f"{mr_col}{mr_n}"
+    ph_hall_name  = f"theta{hall_n}"
+    ph_mr_name    = f"theta{mr_n}"
+ 
+    for col in (hall_col_name, mr_col_name, 'Tsample', 'Hsample'):
+        if col not in df.columns:
+            raise ValueError(
+                f"Column '{col}' not found in {csv_path}. "
+                f"Available columns: {df.columns.tolist()}"
+            )
+ 
+    H  = df['Hsample'].to_numpy(dtype=float)
+    Vy = df[hall_col_name].to_numpy(dtype=float)
+    Vx = df[mr_col_name].to_numpy(dtype=float)
+    T  = df['Tsample'].to_numpy(dtype=float)
+    th_H  = (df[ph_hall_name].to_numpy(dtype=float)
+             if ph_hall_name in df.columns else np.full(len(H), np.nan))
+    th_MR = (df[ph_mr_name].to_numpy(dtype=float)
+             if ph_mr_name in df.columns else np.full(len(H), np.nan))
+ 
+    sweep_dir = 'forward' if np.nanmean(np.diff(H)) > 0 else 'backward'
+ 
+    return {
+        'H_Oe':          H,
+        'Vy_V':          Vy,
+        'Vx_V':          Vx,
+        'theta_H_deg':   th_H,
+        'theta_MR_deg':  th_MR,
+        'T_K':           T,
+        'sweep_dir':     sweep_dir,
+        'H_max_Oe':      float(np.nanmax(np.abs(H))),
+        'n_pts':         len(H),
+        'hall_col_name': hall_col_name,
+        'mr_col_name':   mr_col_name,
+        'csv_path':      csv_path,
+    }
+
+# ==========================================================================
+# 1. PHYSICAL CONSTANTS — Hall / MR
+#    Add this block after the existing _LOADERS dict definition.
+# ==========================================================================
+ 
+_HALL_e        = 1.602176634e-19   # C
+_HALL_mu_B     = 9.2740100783e-24  # J/T (Bohr magneton)
+_HALL_Oe_to_T  = 1e-4              # 1 Oe = 1e-4 T (free-space convention)
+_HALL_A3_to_m3 = 1e-30             # Å³ → m³
+_HALL_Ohm_m_to_uOhm_cm = 1e8      # Ω·m → µΩ·cm (standard cuprate unit)
+ 
+# Default V_cell/Z for Bi-2201 (Bi₂Sr₂CuO₆₊δ), tetragonal subcell Z=2
+# a ≈ 3.79 Å, c ≈ 24.6 Å → V ≈ 353 Å³, V/Z ≈ 177 Å³/Cu
+# Ref: Nat. Commun. 2025, arXiv:2411.06603; pull lattice params from your
+# crystal's own characterisation for better precision (±25–30% otherwise).
+_BI2201_VCELL_PER_Z_A3 = 177.5    # Å³ per Cu
 
 # ==================================================================
 # R(T): resistance vs. temperature
@@ -1615,6 +1780,851 @@ def compute_RRR_RT(data, T_low, window=0.5):
         "n_pts_low": n_pts_low,
     }
 
+# ==========================================================================
+# 3. ANALYSIS HELPERS for Hall and MG measurement
+# ==========================================================================
+
+
+def _trim_H_plateau(H, *arrays, min_plateau_pts=3, tol_frac=0.005):
+    """Remove the constant-field plateau that the PPMS holds after reaching
+    the target field, keeping only the first point at the plateau value.
+ 
+    Strategy (from measurement notes): "when the final field value is
+    reached for more than two consecutive points, the scan should finish
+    at the first value reached."
+ 
+    Parameters
+    ----------
+    H : array-like
+        Field values in chronological order.
+    *arrays : array-like
+        Co-arrays to trim consistently with H.
+    min_plateau_pts : int
+        Minimum consecutive near-zero-ΔH points that define a plateau.
+    tol_frac : float
+        |ΔH| threshold as a fraction of the median active-sweep step.
+ 
+    Returns
+    -------
+    tuple : (H_trimmed, *arrays_trimmed)
+    """
+    H_arr = np.asarray(H, dtype=float)
+    n = len(H_arr)
+    if n < min_plateau_pts + 1:
+        return (H_arr,) + tuple(np.asarray(a) for a in arrays)
+ 
+    dH = np.abs(np.diff(H_arr))
+    active = dH[dH > dH.max() * 0.01]
+    med_dH = float(np.median(active)) if len(active) else float(dH.max())
+    if med_dH < 1e-12:
+        med_dH = 1.0
+    threshold = tol_frac * med_dH
+ 
+    # Walk backward to find where the end-plateau begins
+    plateau_start = n          # default: no plateau
+    consec = 0
+    for i in range(n - 1, 0, -1):
+        if dH[i - 1] < threshold:
+            consec += 1
+        else:
+            if consec >= min_plateau_pts:
+                plateau_start = i + 1   # first index of plateau
+            break
+    else:
+        if consec >= min_plateau_pts:
+            plateau_start = n - consec
+ 
+    if plateau_start < n:
+        print(f"  [trim] removed {n - plateau_start} plateau point(s) "
+              f"at H ≈ {H_arr[plateau_start]:.0f} Oe")
+ 
+    sl = slice(0, plateau_start)
+    return (H_arr[sl],) + tuple(np.asarray(a)[sl] for a in arrays)
+ 
+ 
+def _interp_to_grid(H_raw, vals_raw, H_grid):
+    """Sort H_raw and interpolate vals_raw onto H_grid."""
+    order = np.argsort(H_raw)
+    return np.interp(H_grid, H_raw[order], np.asarray(vals_raw)[order])
+ 
+ 
+def _antisymmetrize(H_grid, rho):
+    """Odd-in-H part: ρ^odd(H) = [ρ(+H) − ρ(−H)] / 2.
+ 
+    H_grid must span both positive and negative values.  Returns
+    (H_pos, rho_odd_pos, H_full, rho_odd_full) where H_full is the
+    full ±H grid and rho_odd_full is antisymmetric by construction.
+    """
+    pos = H_grid > 0
+    neg = H_grid < 0
+    H_pos   = H_grid[pos]
+    rho_pos = rho[pos]
+    # |H| values and ρ values on the negative branch, ascending in |H|
+    H_neg_abs = np.abs(H_grid[neg])[::-1]
+    rho_neg   = rho[neg][::-1]
+    rho_at_negH = np.interp(H_pos, H_neg_abs, rho_neg)
+    rho_odd_pos = (rho_pos - rho_at_negH) / 2.0
+    H_full       = np.concatenate([-H_pos[::-1],  H_pos])
+    rho_odd_full = np.concatenate([-rho_odd_pos[::-1], rho_odd_pos])
+    return H_pos, rho_odd_pos, H_full, rho_odd_full
+ 
+ 
+def _symmetrize(H_grid, rho):
+    """Even-in-H part: ρ^even(H) = [ρ(+H) + ρ(−H)] / 2."""
+    pos = H_grid > 0
+    neg = H_grid < 0
+    H_pos   = H_grid[pos]
+    rho_pos = rho[pos]
+    H_neg_abs = np.abs(H_grid[neg])[::-1]
+    rho_neg   = rho[neg][::-1]
+    rho_at_negH = np.interp(H_pos, H_neg_abs, rho_neg)
+    rho_even_pos = (rho_pos + rho_at_negH) / 2.0
+    H_full        = np.concatenate([-H_pos[::-1],  H_pos])
+    rho_even_full = np.concatenate([rho_even_pos[::-1], rho_even_pos])
+    return H_pos, rho_even_pos, H_full, rho_even_full
+
+# ==========================================================================
+# 4. Main analysis function Hall and MG measurement
+# ==========================================================================
+
+def analyze_hall_mr(fwd_source, bwd_source=None,
+                     hall_n=1, mr_n=2, hall_col='X', mr_col='X',
+                     current=1e-6,
+                     t=1e-9, w=None, l=None,
+                     V_cell_per_Z_A3=_BI2201_VCELL_PER_Z_A3,
+                     fit_H_range_Oe=None,
+                     rho_xx0_field_Oe=0.0,
+                     T_label=None,
+                     n_grid=500):
+    """Full Hall and magnetoresistance analysis for one temperature scan.
+ 
+    Implements: raw voltage → resistivity → antisymmetrize/symmetrize →
+    linear R_H fit → n_H, p, µ_H, cot(θ_H) → ΔR/R₀ → modified Kohler.
+ 
+    Physical note (Protocol v2, §2.2)
+    ----------------------------------
+    The antisymmetrization removes even-in-H contamination (contact
+    misalignment).  It does NOT remove the Nernst signal (odd in H,
+    like the Hall signal); verify T stability across the sweep and check
+    for non-zero ρ_yx(H→0) as a Nernst diagnostic.
+ 
+    Parameters
+    ----------
+    fwd_source : str or dict
+        Forward sweep (−Hmax→+Hmax): CSV path or dict from
+        ``load_hall_mr_csv``.
+    bwd_source : str or dict, optional
+        Backward sweep (+Hmax→−Hmax).  When provided, fwd and bwd are
+        averaged on the common H grid before symmetrization to suppress
+        time-dependent thermal drift.
+    hall_n : int
+        LIA channel number for the Hall (transverse) voltage (1–3).
+    mr_n : int
+        LIA channel number for the longitudinal (MR) voltage.
+    hall_col, mr_col : {'X', 'R'}
+        'X' = in-phase output (recommended); 'R' = magnitude.
+    current : float
+        Source current in Amperes.
+    t : float
+        Sample thickness in metres.  Required for ρ_yx = (V_y/I)·t.
+    w : float, optional
+        Sample width in metres.  Required for ρ_xx = (V_x/I)·(t·w/l).
+        If None, ρ_xx = (V_x/I)·t  (sheet resistance × t).
+    l : float, optional
+        Voltage-probe separation in metres.
+    V_cell_per_Z_A3 : float
+        Unit-cell volume per Cu atom in Å³.  Default: Bi-2201 literature
+        value (177.5 Å³).  Pull from your crystal's own characterisation
+        for <25% precision on p.
+    fit_H_range_Oe : (float, float), optional
+        Positive-H window (Oe) for the linear R_H fit: R_H = ρ_yx^odd/B.
+        Should be above H_irr(T) (determined from sweep hysteresis or
+        from the phase channel θ becoming constant).  If None, the full
+        field range is used (valid only if the sample is fully normal).
+    rho_xx0_field_Oe : float
+        Field (Oe) at which to evaluate ρ_xx for the µ_H denominator.
+        Default: 0 (zero-field limit, appropriate in the normal state).
+        If the sample is SC at H=0, set this to a field above H_irr(T).
+    T_label : str or float, optional
+        Temperature label; defaults to mean(Tsample).
+    n_grid : int
+        Points in the common H interpolation grid (default 500).
+ 
+    Returns
+    -------
+    dict — keys described inline.
+    """
+    # ── 1. Load ────────────────────────────────────────────────────────────
+    fwd = (fwd_source if isinstance(fwd_source, dict)
+           else load_hall_mr_csv(fwd_source, hall_n, mr_n, hall_col, mr_col))
+    bwd = None
+    if bwd_source is not None:
+        bwd = (bwd_source if isinstance(bwd_source, dict)
+               else load_hall_mr_csv(bwd_source, hall_n, mr_n, hall_col, mr_col))
+ 
+    # ── 2. Trim field plateaus ─────────────────────────────────────────────
+    H_f, Vy_f, Vx_f, T_f, thH_f, thMR_f = _trim_H_plateau(
+        fwd['H_Oe'], fwd['Vy_V'], fwd['Vx_V'], fwd['T_K'],
+        fwd['theta_H_deg'], fwd['theta_MR_deg']
+    )
+    if bwd is not None:
+        H_b, Vy_b, Vx_b, T_b, thH_b, thMR_b = _trim_H_plateau(
+            bwd['H_Oe'], bwd['Vy_V'], bwd['Vx_V'], bwd['T_K'],
+            bwd['theta_H_deg'], bwd['theta_MR_deg']
+        )
+ 
+    T_nominal = float(np.nanmean(T_f))
+    if T_label is None:
+        T_label = f"{T_nominal:.1f} K"
+ 
+    # ── 3. Common H grid ───────────────────────────────────────────────────
+    H_lo = float(np.nanmin(H_f))
+    H_hi = float(np.nanmax(H_f))
+    if bwd is not None:
+        H_lo = max(H_lo, float(np.nanmin(H_b)))
+        H_hi = min(H_hi, float(np.nanmax(H_b)))
+    H_grid = np.linspace(H_lo, H_hi, n_grid)
+ 
+    # ── 4. Resistivities ───────────────────────────────────────────────────
+    geom_xx = t * (w / l) if (w is not None and l is not None) else t
+    ryx_f = (Vy_f / current) * t
+    rxx_f = (Vx_f / current) * geom_xx
+ 
+    ryx_g = _interp_to_grid(H_f, ryx_f, H_grid)
+    rxx_g = _interp_to_grid(H_f, rxx_f, H_grid)
+ 
+    if bwd is not None:
+        ryx_b = (Vy_b / current) * t
+        rxx_b = (Vx_b / current) * geom_xx
+        ryx_g = (ryx_g + _interp_to_grid(H_b, ryx_b, H_grid)) / 2.0
+        rxx_g = (rxx_g + _interp_to_grid(H_b, rxx_b, H_grid)) / 2.0
+ 
+    # ── 5. Antisymmetrize Hall, symmetrize MR ─────────────────────────────
+    if np.any(H_grid < 0) and np.any(H_grid > 0):
+        H_pos, ryx_odd_pos, H_asym, ryx_odd = _antisymmetrize(H_grid, ryx_g)
+        H_pos, rxx_even_pos, H_sym,  rxx_even = _symmetrize(H_grid, rxx_g)
+    else:
+        # Sweep does not cross zero — can only return raw data
+        warnings.warn(
+            "H sweep does not cross zero; antisymmetrization not possible. "
+            "Raw ρ_yx and ρ_xx are returned without symmetrization.",
+            UserWarning, stacklevel=2
+        )
+        H_pos       = np.abs(H_grid)
+        ryx_odd_pos = ryx_g
+        H_asym      = H_grid
+        ryx_odd     = ryx_g
+        H_pos       = H_grid
+        rxx_even_pos = rxx_g
+        H_sym        = H_grid
+        rxx_even     = rxx_g
+ 
+    B_pos = H_pos * _HALL_Oe_to_T     # Tesla
+ 
+    # ── 6. R_H linear fit: ρ_yx^odd = R_H · B + offset ───────────────────
+    if fit_H_range_Oe is not None:
+        fit_mask = ((H_pos >= fit_H_range_Oe[0]) &
+                    (H_pos <= fit_H_range_Oe[1]))
+    else:
+        fit_mask = np.ones(len(H_pos), dtype=bool)
+ 
+    n_fit = int(np.sum(fit_mask))
+    if n_fit < 2:
+        raise ValueError(
+            f"fit_H_range_Oe={fit_H_range_Oe} Oe gives {n_fit} point(s). "
+            f"Data H_pos range: {H_pos.min():.0f}–{H_pos.max():.0f} Oe."
+        )
+ 
+    coeffs, cov = np.polyfit(B_pos[fit_mask], ryx_odd_pos[fit_mask],
+                              deg=1, cov=True)
+    R_H        = float(coeffs[0])
+    R_H_err    = float(np.sqrt(cov[0, 0]))
+    RH_offset  = float(coeffs[1])   # non-zero → residual even contamination
+ 
+    # ── 7. Derived Hall quantities ─────────────────────────────────────────
+    n_H_m3  = (1.0 / (_HALL_e * R_H)) if abs(R_H) > 1e-20 else np.nan
+    n_H_cm3 = n_H_m3 * 1e-6 if np.isfinite(n_H_m3) else np.nan
+ 
+    # Doping: p = n_H · V_cell/Z − 1  (hole-doped convention; R_H > 0 → holes)
+    V_cell_m3 = V_cell_per_Z_A3 * _HALL_A3_to_m3
+    p = abs(n_H_m3) * V_cell_m3 - 1.0 if np.isfinite(n_H_m3) else np.nan
+ 
+    # ρ_xx at reference field for µ_H denominator
+    rxx_ref = float(np.interp(rho_xx0_field_Oe, H_pos, rxx_even_pos))
+    if abs(rxx_ref) > 1e-20:
+        mu_H_SI   = abs(R_H) / abs(rxx_ref)    # m²/(V·s)
+        mu_H_cm2  = mu_H_SI * 1e4               # cm²/(V·s)
+    else:
+        mu_H_SI = mu_H_cm2 = np.nan
+        warnings.warn(
+            f"ρ_xx ≈ 0 at the reference field ({rho_xx0_field_Oe:.0f} Oe) — "
+            "sample is likely in the SC state. µ_H cannot be computed. "
+            "Set --rho-xx-field to a value above H_irr(T).",
+            UserWarning, stacklevel=2
+        )
+ 
+    # ── 8. cot(θ_H) = ρ_xx / |ρ_yx|  on positive-H branch ───────────────
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cot_theta = np.where(
+            np.abs(ryx_odd_pos) > 1e-20,
+            rxx_even_pos / np.abs(ryx_odd_pos),
+            np.nan
+        )
+    # Scalar for multi-T analysis: mean in the fit window
+    cot_theta_scalar = float(np.nanmean(cot_theta[fit_mask]))
+    # Reference field for cot(θ_H)(T) curve: midpoint of fit range
+    H_ref_Oe = (float(np.mean(H_pos[fit_mask]))
+                if np.any(fit_mask) else float(np.nanmax(H_pos)))
+    cot_theta_at_ref = float(np.interp(H_ref_Oe, H_pos, cot_theta))
+ 
+    # ── 9. Magnetoresistance: ΔR/R₀ = [ρ_xx^even(H) − ρ_xx(0)] / ρ_xx(0) ─
+    rxx0 = float(np.interp(0.0, H_sym, rxx_even))
+    if abs(rxx0) > 1e-20:
+        MR = (rxx_even_pos - rxx0) / abs(rxx0)
+    else:
+        MR = np.full_like(rxx_even_pos, np.nan)
+        warnings.warn(
+            "ρ_xx(H=0) ≈ 0; ΔR/R₀ cannot be computed "
+            "(sample is SC at H=0). MR will be NaN.",
+            UserWarning, stacklevel=2
+        )
+ 
+    # tan²(θ_H) for modified Kohler: ΔR/R₀ ∝ tan²(θ_H)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tan2_theta = np.where(np.abs(cot_theta) > 1e-10,
+                               1.0 / cot_theta**2, np.nan)
+ 
+    # ── 10. Console summary ────────────────────────────────────────────────
+    to_uOcm = _HALL_Ohm_m_to_uOhm_cm
+    print(
+        f"\n{'─'*62}\n"
+        f"  Hall/MR — T = {T_label}   "
+        f"({'fwd+bwd' if bwd is not None else 'fwd only'})\n"
+        f"{'─'*62}\n"
+        f"  H fit range   : {fit_H_range_Oe} Oe  ({n_fit} pts)\n"
+        f"  R_H           = {R_H:.4g} ± {R_H_err:.2g}  m³/C\n"
+        f"                  ({R_H*1e9:.4g} ± {R_H_err*1e9:.2g}  mm³/C)\n"
+        f"  Fit offset    = {RH_offset*to_uOcm:.3g}  µΩ·cm  "
+        f"(non-zero → residual even contamination)\n"
+        f"  n_H           = {n_H_cm3:.3g}  cm⁻³\n"
+        f"  p (doping)    = {p:.4f}  "
+        f"(V_cell/Z = {V_cell_per_Z_A3:.1f} Å³)\n"
+        f"  µ_H           = {mu_H_cm2:.3g}  cm²/(V·s)\n"
+        f"  ρ_xx (ref H)  = {rxx_ref*to_uOcm:.4g}  µΩ·cm  "
+        f"(ref H = {rho_xx0_field_Oe:.0f} Oe)\n"
+        f"  ⟨cot θ_H⟩    = {cot_theta_scalar:.4g}  "
+        f"(mean over fit window)\n"
+        f"  cot θ_H(Href) = {cot_theta_at_ref:.4g}  "
+        f"(at H_ref = {H_ref_Oe:.0f} Oe)\n"
+        f"{'─'*62}"
+    )
+ 
+    return {
+        # ── Common-grid arrays ────────────────────────────────────────────
+        'H_grid_Oe':       H_grid,
+        'ryx_grid_Ohm_m':  ryx_g,
+        'rxx_grid_Ohm_m':  rxx_g,
+        # ── Processed: antisymmetrized Hall ─────────────────────────────
+        'H_pos_Oe':        H_pos,
+        'H_asym_Oe':       H_asym,
+        'ryx_odd_pos':     ryx_odd_pos,    # Ω·m, positive-H half
+        'ryx_odd_full':    ryx_odd,        # Ω·m, ±H
+        'B_pos_T':         B_pos,
+        # ── Processed: symmetrized MR ────────────────────────────────────
+        'H_sym_Oe':        H_sym,
+        'rxx_even_pos':    rxx_even_pos,   # Ω·m
+        'rxx_even_full':   rxx_even,       # Ω·m
+        # ── Hall quantities ──────────────────────────────────────────────
+        'R_H_m3_C':        R_H,
+        'R_H_err_m3_C':    R_H_err,
+        'RH_offset_Ohm_m': RH_offset,
+        'n_H_m3':          n_H_m3,
+        'n_H_cm3':         n_H_cm3,
+        'p_doping':        p,
+        'mu_H_m2_Vs':      mu_H_SI,
+        'mu_H_cm2_Vs':     mu_H_cm2,
+        'cot_theta_H':     cot_theta,      # array vs H_pos
+        'cot_theta_scalar': cot_theta_scalar,
+        'cot_theta_at_Href': cot_theta_at_ref,
+        'H_ref_Oe':        H_ref_Oe,
+        # ── MR quantities ────────────────────────────────────────────────
+        'MR':              MR,             # ΔR/R₀, dimensionless
+        'tan2_theta_H':    tan2_theta,     # for modified Kohler
+        'rxx0_Ohm_m':      rxx0,
+        'rxx_ref_Ohm_m':   rxx_ref,
+        # ── Raw trimmed data (for diagnostic raw-voltage plots) ──────────
+        'fwd_H_Oe':        H_f,
+        'fwd_Vy_V':        Vy_f,
+        'fwd_Vx_V':        Vx_f,
+        'fwd_T_K':         T_f,
+        'fwd_theta_H':     thH_f,
+        'fwd_theta_MR':    thMR_f,
+        'has_bwd':         bwd is not None,
+        'bwd_H_Oe':        H_b  if bwd is not None else None,
+        'bwd_Vy_V':        Vy_b if bwd is not None else None,
+        'bwd_Vx_V':        Vx_b if bwd is not None else None,
+        'bwd_T_K':         T_b  if bwd is not None else None,
+        # ── Metadata ────────────────────────────────────────────────────
+        'T_nominal_K':     T_nominal,
+        'T_label':         str(T_label),
+        'current_A':       current,
+        't_m':             t,
+        'w_m':             w,
+        'l_m':             l,
+        'V_cell_per_Z_A3': V_cell_per_Z_A3,
+        'fit_H_range_Oe':  fit_H_range_Oe,
+        'rho_xx0_field_Oe': rho_xx0_field_Oe,
+        'geom_factor':     geom_xx,
+    }
+
+# Fitting for the costheta
+
+def fit_cot_theta_vs_T2(results_list):
+    """Fit cot(θ_H) = α·T² + β from a list of single-T analyze_hall_mr
+    output dicts.
+ 
+    This is the primary strange-metal diagnostic for cuprates
+    (Anderson two-lifetime picture; "Stranger than metals", Science 2022).
+ 
+    Parameters
+    ----------
+    results_list : list of dict
+        Each dict is the output of analyze_hall_mr at one temperature.
+ 
+    Returns
+    -------
+    dict
+        'T_K'          : ndarray, temperatures
+        'cot_theta'    : ndarray, cot(θ_H) at reference field per T
+        'T2'           : ndarray, T² values
+        'alpha'        : float, T² coefficient (K⁻²)
+        'alpha_err'    : float
+        'beta'         : float, zero-T intercept
+        'beta_err'     : float
+        'poly'         : np.poly1d, callable fit
+        'R2'           : float, coefficient of determination
+    """
+    T_arr  = np.array([r['T_nominal_K']     for r in results_list])
+    ct_arr = np.array([r['cot_theta_at_Href'] for r in results_list])
+ 
+    finite = np.isfinite(ct_arr)
+    if np.sum(finite) < 2:
+        warnings.warn("Not enough finite cot(θ_H) values to fit.", UserWarning)
+        return {'T_K': T_arr, 'cot_theta': ct_arr, 'T2': T_arr**2,
+                'alpha': np.nan, 'alpha_err': np.nan,
+                'beta': np.nan, 'beta_err': np.nan,
+                'poly': None, 'R2': np.nan}
+ 
+    T2 = T_arr[finite]**2
+    ct = ct_arr[finite]
+    coeffs, cov = np.polyfit(T2, ct, deg=1, cov=True)
+    alpha, beta = float(coeffs[0]), float(coeffs[1])
+    alpha_err = float(np.sqrt(cov[0, 0]))
+    beta_err  = float(np.sqrt(cov[1, 1]))
+ 
+    ct_fit = np.polyval(coeffs, T2)
+    ss_res = np.sum((ct - ct_fit)**2)
+    ss_tot = np.sum((ct - ct.mean())**2)
+    R2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+ 
+    print(
+        f"\n  cot(θ_H) = α·T² + β fit:\n"
+        f"  α = {alpha:.4g} ± {alpha_err:.2g}  K⁻²\n"
+        f"  β = {beta:.4g} ± {beta_err:.2g}  (dimensionless)\n"
+        f"  R² = {R2:.4f}"
+    )
+ 
+    return {
+        'T_K':       T_arr,
+        'cot_theta': ct_arr,
+        'T2':        T_arr**2,
+        'alpha':     alpha, 'alpha_err': alpha_err,
+        'beta':      beta,  'beta_err':  beta_err,
+        'poly':      np.poly1d(coeffs),
+        'R2':        R2,
+    }
+
+# ==========================================================================
+# 6. PLOTTING FUNCTIONS
+# ==========================================================================
+ 
+def _to_uOhm_cm(rho_Ohm_m):
+    """Ω·m → µΩ·cm (standard resistivity unit for cuprates in literature)."""
+    return rho_Ohm_m * _HALL_Ohm_m_to_uOhm_cm
+ 
+ 
+def plot_hall_raw(result, show_T=False, axes=None, figsize=None,
+                  colors=None):
+    """Plot raw (pre-symmetrization) Hall and MR voltages vs field.
+ 
+    Parameters
+    ----------
+    result : dict
+        Output of analyze_hall_mr.
+    show_T : bool
+        If True, add a third panel showing Tsample(H) for temperature
+        stability diagnostics.
+    axes : list of Axes, optional
+        Pre-created axes (2 or 3 elements). Created if None.
+    colors : dict, optional
+        {'fwd': color, 'bwd': color}. Defaults to blue/red.
+ 
+    Returns
+    -------
+    fig, axes
+    """
+    nc = 3 if show_T else 2
+    if axes is None:
+        w = (figsize[0] if figsize else 17.8) / 2.54 
+        h = (figsize[1] if figsize else 10)  / 2.54
+        fig, axes = plt.subplots(1, nc, figsize=(w, h), constrained_layout=True)
+    else:
+        fig = axes[0].get_figure()
+ 
+    c = colors or {'fwd': 'tab:blue', 'bwd': 'tab:red'}
+ 
+    for ax_idx, (key_H, key_V, ylabel) in enumerate([
+        ('fwd_H_Oe', 'fwd_Vy_V', r'$V_y$ (Hall, V)'),
+        ('fwd_H_Oe', 'fwd_Vx_V', r'$V_x$ (MR, V)'),
+    ]):
+        ax = axes[ax_idx]
+        ax.plot(result[key_H] * 1e-4,   # Oe → T
+                result[key_V],
+                color=c['fwd'], lw=0.8, label='Forward')
+        if result['has_bwd'] and result['bwd_H_Oe'] is not None:
+            ax.plot(result['bwd_H_Oe'] * 1e-4,
+                    result['bwd_Vy_V'] if ax_idx == 0 else result['bwd_Vx_V'],
+                    color=c['bwd'], lw=0.8, label='Backward', alpha=0.7)
+        ax.set_xlabel(r'$\mu_0 H$ (T)')
+        ax.set_ylabel(ylabel)
+        ax.legend()
+ 
+    if show_T and nc == 3:
+        ax = axes[2]
+        ax.plot(result['fwd_H_Oe'] * 1e-4, result['fwd_T_K'],
+                color=c['fwd'], lw=0.8, label='Forward')
+        if result['has_bwd'] and result['bwd_T_K'] is not None:
+            ax.plot(result['bwd_H_Oe'] * 1e-4, result['bwd_T_K'],
+                    color=c['bwd'], lw=0.8, label='Backward', alpha=0.7)
+        ax.set_xlabel(r'$\mu_0 H$ (T)')
+        ax.set_ylabel(r'$T_{\rm sample}$ (K)')
+        ax.legend()
+ 
+    return fig, axes
+ 
+ 
+def plot_hall_antisym(result, ax=None, color='tab:blue',
+                       fit_color='k', figsize=None):
+    """Plot antisymmetrized ρ_yx^odd(H) with the linear R_H fit overlay.
+ 
+    Parameters
+    ----------
+    result : dict
+        Output of analyze_hall_mr.
+    ax : Axes, optional
+    color : str
+        Colour for the data.
+    fit_color : str
+        Colour for the fit line (should differ from data for clarity).
+ 
+    Returns
+    -------
+    ax
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    # Data in µΩ·cm vs Tesla
+    H_T  = result['H_asym_Oe'] * 1e-4
+    ryx  = _to_uOhm_cm(result['ryx_odd_full'])
+    ax.plot(H_T, ryx, color=color, lw=0.9, label=r'$\rho_{yx}^{\rm odd}(H)$')
+ 
+    # R_H fit (positive half only, extended across full range for display)
+    R_H    = result['R_H_m3_C']
+    offset = result['RH_offset_Ohm_m']
+    H_fit  = result['H_asym_Oe'] * 1e-4  # same axis as plot
+    ryx_fit_uOcm = _to_uOhm_cm(R_H * H_fit + offset)
+ 
+    # Shade the fit window
+    if result['fit_H_range_Oe'] is not None:
+        lo, hi = [v * 1e-4 for v in result['fit_H_range_Oe']]
+        ax.axvspan(lo, hi, color=fit_color, alpha=0.08, lw=0)
+ 
+    ax.plot(H_fit, ryx_fit_uOcm, color=fit_color, ls='--', lw=1.0,
+            label=(rf"$R_H = {R_H*1e9:.3g}$ mm³/C"))
+ 
+    ax.axhline(0, color='gray', lw=0.5, ls=':')
+    ax.set_xlabel(r'$\mu_0 H$ (T)')
+    ax.set_ylabel(r'$\rho_{yx}^{\rm odd}$ ($\mu\Omega\cdot$cm)')
+    ax.legend()
+ 
+    if created:
+        ax.set_title(f"T = {result['T_label']}")
+    return ax
+ 
+ 
+def plot_rho_xx(result, ax=None, color='tab:blue', figsize=None):
+    """Plot symmetrized ρ_xx^even(H) vs field.
+ 
+    Returns
+    -------
+    ax
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    H_T  = result['H_sym_Oe'] * 1e-4
+    rxx  = _to_uOhm_cm(result['rxx_even_full'])
+    ax.plot(H_T, rxx, color=color, lw=0.9,
+            label=r'$\rho_{xx}^{\rm even}(H)$')
+ 
+    rxx0_display = _to_uOhm_cm(result['rxx0_Ohm_m'])
+    ax.axhline(rxx0_display, color='gray', ls=':', lw=0.7,
+               label=rf'$\rho_{{xx}}(0)={rxx0_display:.3g}\ \mu\Omega\cdot$cm')
+ 
+    ax.set_xlabel(r'$\mu_0 H$ (T)')
+    ax.set_ylabel(r'$\rho_{xx}^{\rm even}$ ($\mu\Omega\cdot$cm)')
+    ax.legend()
+ 
+    if created:
+        ax.set_title(f"T = {result['T_label']}")
+    return ax
+ 
+ 
+def plot_MR_hall(result, ax=None, color='tab:blue', figsize=None):
+    """Plot normalised magnetoresistance ΔR/R₀ vs field.
+ 
+    Named plot_MR_hall to avoid collision with any existing plot_MR.
+ 
+    Returns
+    -------
+    ax
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    H_T = result['H_pos_Oe'] * 1e-4
+    MR  = result['MR']
+    ax.plot(H_T, MR * 100, color=color, lw=0.9,
+            label=rf"$T={result['T_label']}$")
+ 
+    ax.axhline(0, color='gray', ls=':', lw=0.5)
+    ax.set_xlabel(r'$\mu_0 H$ (T)')
+    ax.set_ylabel(r'$\Delta\rho/\rho_0$ (%)')
+    ax.legend()
+ 
+    if created:
+        ax.set_title(f"T = {result['T_label']}")
+    return ax
+ 
+ 
+# ── Multi-temperature plot helpers ─────────────────────────────────────────
+ 
+def plot_RH_vs_T(results_list, ax=None, figsize=None, color='tab:blue'):
+    """R_H vs temperature from a list of single-T results.
+ 
+    Returns ax.
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    T   = np.array([r['T_nominal_K'] for r in results_list])
+    RH  = np.array([r['R_H_m3_C']   for r in results_list]) * 1e9  # → mm³/C
+    RHe = np.array([r['R_H_err_m3_C'] for r in results_list]) * 1e9
+ 
+    ax.errorbar(T, RH, yerr=RHe, fmt='o', color=color, ms=4, capsize=3)
+    ax.axhline(0, color='gray', ls=':', lw=0.5)
+    ax.set_xlabel(r'$T$ (K)')
+    ax.set_ylabel(r'$R_H$ (mm³/C)')
+    ax.set_title(r'Hall coefficient $R_H(T)$')
+    return ax
+ 
+ 
+def plot_nH_vs_T(results_list, ax=None, figsize=None, color='tab:orange'):
+    """Carrier density n_H vs T.
+ 
+    Returns ax.
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    T  = np.array([r['T_nominal_K'] for r in results_list])
+    nH = np.array([r['n_H_cm3']     for r in results_list])
+ 
+    ax.plot(T, nH, 'o', color=color, ms=4)
+    ax.set_xlabel(r'$T$ (K)')
+    ax.set_ylabel(r'$n_H$ (cm$^{-3}$)')
+    ax.set_title(r'Hall carrier density $n_H(T)$')
+    return ax
+ 
+ 
+def plot_muH_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
+    """Hall mobility µ_H vs T.
+ 
+    Returns ax.
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    T  = np.array([r['T_nominal_K']  for r in results_list])
+    mu = np.array([r['mu_H_cm2_Vs']  for r in results_list])
+ 
+    ax.plot(T, mu, 'o', color=color, ms=4)
+    ax.set_xlabel(r'$T$ (K)')
+    ax.set_ylabel(r'$\mu_H$ (cm²/V·s)')
+    ax.set_title(r'Hall mobility $\mu_H(T)$')
+    return ax
+ 
+ 
+def plot_cot_theta_vs_T2(results_list, cot_fit=None, ax=None,
+                           figsize=None, color='tab:purple'):
+    """cot(θ_H) vs T² with optional α·T² + β fit overlay.
+ 
+    Parameters
+    ----------
+    results_list : list of dict
+        Multi-T analyze_hall_mr outputs.
+    cot_fit : dict, optional
+        Output of fit_cot_theta_vs_T2.  If provided, the fit line is drawn.
+ 
+    Returns
+    -------
+    ax
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    T   = np.array([r['T_nominal_K']     for r in results_list])
+    ct  = np.array([r['cot_theta_at_Href'] for r in results_list])
+ 
+    ax.plot(T**2, ct, 'o', color=color, ms=4, label=r'$\cot\theta_H$')
+ 
+    if cot_fit is not None and cot_fit['poly'] is not None:
+        T2_fit = np.linspace(0, (T**2).max() * 1.05, 300)
+        ax.plot(T2_fit, cot_fit['poly'](T2_fit), color='k', ls='--',
+                lw=1.0,
+                label=(rf"$\alpha T^2+\beta$, $\alpha={cot_fit['alpha']:.3g}$ K⁻²,"
+                        rf" $R^2={cot_fit['R2']:.3f}$"))
+ 
+    ax.set_xlabel(r'$T^2$ (K²)')
+    ax.set_ylabel(r'$\cot\theta_H$ (dimensionless)')
+    ax.set_title(r'Strange-metal diagnostic: $\cot\theta_H\propto T^2$')
+    ax.legend()
+    return ax
+ 
+ 
+def plot_kohler(results_list, axes=None, figsize=None):
+    """Plain and modified (quadrature) Kohler plots from multi-T results.
+ 
+    Two panels:
+      Left : ΔR/R₀ vs (H/ρ_xx)²  — plain Kohler (expected to fail in cuprates)
+      Right: ΔR/R₀ vs tan²(θ_H)  — modified Kohler (tends to hold)
+ 
+    Returns
+    -------
+    fig, axes
+    """
+    if axes is None:
+        w = (figsize[0] if figsize else 17.8) / 2.54
+        h = (figsize[1] if figsize else 7)   / 2.54
+        fig, axes = plt.subplots(1, 2, figsize=(w, h), constrained_layout=True)
+    else:
+        fig = axes[0].get_figure()
+ 
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+ 
+    for i, r in enumerate(results_list):
+        c = colors[i % len(colors)]
+        lbl = r['T_label']
+        H_T  = r['H_pos_Oe'] * 1e-4
+        MR   = r['MR']
+        rxx0 = abs(_to_uOhm_cm(r['rxx0_Ohm_m'])) or np.nan
+ 
+        # Plain Kohler: x = (H / ρ_xx0)²  in units (T / µΩ·cm)²
+        x_kohler = (H_T / rxx0)**2
+        axes[0].plot(x_kohler, MR * 100, lw=0.8, color=c, label=lbl)
+ 
+        # Modified Kohler: x = tan²(θ_H)
+        tan2 = r['tan2_theta_H']
+        finite = np.isfinite(tan2) & np.isfinite(MR)
+        if np.any(finite):
+            axes[1].plot(tan2[finite], MR[finite] * 100,
+                         lw=0.8, color=c, label=lbl)
+ 
+    axes[0].set_xlabel(r'$(H/\rho_0)^2$  (T/µΩ·cm)²')
+    axes[0].set_ylabel(r'$\Delta\rho/\rho_0$ (%)')
+    axes[0].set_title('Plain Kohler')
+    axes[0].legend(fontsize=6)
+ 
+    axes[1].set_xlabel(r'$\tan^2\theta_H$')
+    axes[1].set_ylabel(r'$\Delta\rho/\rho_0$ (%)')
+    axes[1].set_title('Modified (quadrature) Kohler')
+    axes[1].legend(fontsize=6)
+ 
+    return fig, axes
+ 
+ 
+def plot_HT_scaling(results_list, ax=None, figsize=None):
+    """H/T scaling plot: ΔR/T vs H/T for each temperature.
+ 
+    Data collapse onto a single curve tests the quadrature
+    two-scattering-rate form τ⁻¹ ∝ √[(aT)² + (b·µ_B·H)²], which
+    produces H-linear MR at high field (Protocol §4.2).
+ 
+    Returns
+    -------
+    ax
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+ 
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+ 
+    for i, r in enumerate(results_list):
+        T   = r['T_nominal_K']
+        c   = colors[i % len(colors)]
+        H_T = r['H_pos_Oe'] * 1e-4    # Tesla
+        MR  = r['MR']
+        finite = np.isfinite(MR)
+        if not np.any(finite):
+            continue
+        ax.plot(H_T[finite] / T, MR[finite] * 100 / T,
+                color=c, lw=0.8, label=r['T_label'])
+ 
+    ax.set_xlabel(r'$H/T$  (T/K)')
+    ax.set_ylabel(r'$(\Delta\rho/\rho_0)/T$  (%/K)')
+    ax.set_title(r'$H/T$ scaling — quadrature MR test')
+    ax.legend(fontsize=6)
+ 
+    if created:
+        plt.tight_layout()
+    return ax
+
+
 # ==================================================================
 # Command-line interface
 #
@@ -1777,6 +2787,122 @@ def _add_IV_dVdI_parser(subparsers):
                    help="Outlier threshold for Ic detection (default 5.0)")
     p.add_argument('--diff-threshold', type=float, default=0.001,
                    help="Minimum difference to consider in sum for Ic detection (default 0.001)")
+    return p
+
+def _add_Hall_MR_parser(subparsers):
+    """Define the `Hall_MR` subcommand."""
+    p = subparsers.add_parser(
+        "Hall_MR",
+        help="Hall effect and magnetoresistance analysis"
+    )
+    # ── Input files ───────────────────────────────────────────────────────
+    p.add_argument(
+        "fwd_files", nargs="+",
+        help="Forward-sweep CSV file(s) (−Hmax→+Hmax), one per temperature. "
+             "Multiple files → multi-T analysis."
+    )
+    p.add_argument(
+        "--bwd-files", nargs="*", default=None,
+        help="Backward-sweep CSV file(s) (+Hmax→−Hmax), matched by position "
+             "to fwd_files.  When provided, fwd and bwd are averaged on the "
+             "common H grid before symmetrization to cancel thermal drift."
+    )
+    p.add_argument(
+        "--comments", nargs="*", default=None,
+        help="Comments .txt file(s), one per temperature (same order as "
+             "fwd_files).  Used for metadata display only."
+    )
+    # ── Measurement configuration ─────────────────────────────────────────
+    p.add_argument(
+        "--hall-n", type=int, default=1,
+        help="LIA channel number for the Hall (transverse) voltage (1–3). "
+             "Check the comments file for the correct assignment."
+    )
+    p.add_argument(
+        "--mr-n", type=int, default=2,
+        help="LIA channel number for the longitudinal (MR) voltage."
+    )
+    p.add_argument(
+        "--hall-col", choices=["X", "R"], default="R",
+        help="Column type for Hall voltage: 'X' (in-phase, default) "
+             "or 'R' (magnitude)."
+    )
+    p.add_argument(
+        "--mr-col", choices=["X", "R"], default="R",
+        help="Column type for MR voltage."
+    )
+    p.add_argument(
+        "--current", type=float, required=True, metavar="AMPS",
+        help="Source current in Amperes (e.g. --current 1e-6 for 1 µA)."
+    )
+    # ── Sample geometry ───────────────────────────────────────────────────
+    p.add_argument(
+        "--thickness", type=float, required=True, metavar="METRES",
+        help="Sample thickness t in metres (e.g. --thickness 1e-9 for 1 nm). "
+             "Used in ρ_yx = (V_y/I)·t."
+    )
+    p.add_argument(
+        "--width", type=float, default=None, metavar="METRES",
+        help="Sample width w in metres. With --length, enables "
+             "ρ_xx = (V_x/I)·(t·w/l). If omitted, ρ_xx = (V_x/I)·t."
+    )
+    p.add_argument(
+        "--length", type=float, default=None, metavar="METRES",
+        help="Voltage-probe separation l in metres."
+    )
+    # ── Hall analysis options ─────────────────────────────────────────────
+    p.add_argument(
+        "--fit-H-range", nargs=2, type=float, default=None,
+        metavar=("HMIN_OE", "HMAX_OE"),
+        help="Positive-field window in Oe for the linear R_H fit, e.g. "
+             "--fit-H-range 20000 50000.  Should be above H_irr(T) "
+             "(identify from sweep hysteresis or from the phase θ becoming "
+             "constant across H). If omitted, the full positive-H range is "
+             "used — valid only if the sample is fully normal everywhere."
+    )
+    p.add_argument(
+        "--rho-xx-field", type=float, default=0.0, metavar="FIELD_OE",
+        help="Field (Oe) at which to evaluate ρ_xx for the µ_H denominator. "
+             "Default: 0 (zero field, appropriate in the normal state). "
+             "If the sample is SC at H=0, set this above H_irr(T)."
+    )
+    p.add_argument(
+        "--V-cell-Z", type=float, default=_BI2201_VCELL_PER_Z_A3,
+        metavar="A3_PER_CU",
+        help=f"Unit-cell volume per Cu atom in Å³ for the doping estimate "
+             f"p = n_H·V_cell/Z − 1. Default: {_BI2201_VCELL_PER_Z_A3} Å³ "
+             f"(Bi-2201 literature value, tetragonal subcell Z=2). "
+             "Pull the actual value from your crystal's characterisation "
+             "for <25%% precision on p."
+    )
+    # ── Temperature labelling ─────────────────────────────────────────────
+    p.add_argument(
+        "--T-labels", nargs="*", default=None,
+        help="Temperature label(s) for each scan, one per fwd_file "
+             "(e.g. --T-labels 200K 150K 100K). Defaults to the mean "
+             "Tsample from each file."
+    )
+    # ── Output / display ──────────────────────────────────────────────────
+    p.add_argument(
+        "-o", "--output", default="Hall_MR.pdf",
+        help="Output PDF path (default: Hall_MR.pdf).  All figures for "
+             "a single scan are saved as 'basename_*.pdf'; multi-T figures "
+             "get an additional 'multiT_*' prefix."
+    )
+    p.add_argument(
+        "--figsize", nargs=2, type=float, default=(8.6, 7.0),
+        metavar=("WIDTH_CM", "HEIGHT_CM"),
+        help="Single-panel figure size in cm (default: 8.6 7.0)."
+    )
+    p.add_argument(
+        "--show-T", action="store_true",
+        help="Add a Tsample(H) panel to the raw-voltage figure as a "
+             "temperature-stability diagnostic."
+    )
+    p.add_argument(
+        "--n-grid", type=int, default=500,
+        help="Points in the common H interpolation grid (default: 500)."
+    )
     return p
 
 def _run_RT(args):
@@ -2014,9 +3140,144 @@ def _run_IV_dVdI(args):
                                         )
         return
 
+def _run_Hall_MR(args):
+    """Execute the Hall_MR subcommand."""
+    n_T = len(args.fwd_files)
+ 
+    bwd_files  = args.bwd_files  or [None] * n_T
+    comments   = args.comments   or [None] * n_T
+    T_labels   = args.T_labels   or [None] * n_T
+ 
+    if len(bwd_files) not in (0, n_T):
+        raise ValueError(
+            f"--bwd-files must match the number of fwd_files ({n_T}), "
+            f"got {len(bwd_files)}."
+        )
+    bwd_files = list(bwd_files) + [None] * (n_T - len(bwd_files))
+    T_labels  = list(T_labels)  + [None] * (n_T - len(T_labels))
+ 
+    fs = (args.figsize[0] / 2.54, args.figsize[1] / 2.54)
+    base, ext = os.path.splitext(args.output)
+    if not ext:
+        ext = ".pdf"
+ 
+    print(f"\nHall/MR analysis — {n_T} temperature scan(s)")
+ 
+    results = []
+ 
+    for i, (fwd, bwd, cmt, lbl) in enumerate(
+        zip(args.fwd_files, bwd_files, comments, T_labels)
+    ):
+        if cmt is not None:
+            meta = parse_hall_mr_comments(cmt)
+            print(f"\n  Comments ({os.path.basename(cmt)}):")
+            for line in meta['raw']:
+                print(f"    {line}")
+ 
+        result = analyze_hall_mr(
+            fwd_source       = fwd,
+            bwd_source       = bwd,
+            hall_n           = args.hall_n,
+            mr_n             = args.mr_n,
+            hall_col         = args.hall_col,
+            mr_col           = args.mr_col,
+            current          = args.current,
+            t                = args.thickness,
+            w                = args.width,
+            l                = args.length,
+            V_cell_per_Z_A3  = args.V_cell_Z,
+            fit_H_range_Oe   = (tuple(args.fit_H_range)
+                                 if args.fit_H_range else None),
+            rho_xx0_field_Oe = args.rho_xx_field,
+            T_label          = lbl,
+            n_grid           = args.n_grid,
+        )
+        results.append(result)
+        T_str = result['T_label'].replace(' ', '').replace('/', '-')
+ 
+        # ── Per-temperature figures ───────────────────────────────────────
+        set_paper_style()
+ 
+        # Raw voltages
+        fig_raw, _ = plot_hall_raw(result, show_T=args.show_T,
+                                    figsize=args.figsize)
+        path = f"{base}_raw_{T_str}{ext}"
+        fig_raw.savefig(path, dpi=300)
+        plt.close(fig_raw)
+        print(f"  Saved {path}")
+ 
+        # Antisymmetrized Hall
+        fig_ah, ax_ah = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_hall_antisym(result, ax=ax_ah)
+        path = f"{base}_ryx_{T_str}{ext}"
+        fig_ah.savefig(path, dpi=300)
+        plt.close(fig_ah)
+        print(f"  Saved {path}")
+ 
+        # Symmetrized MR
+        fig_rx, ax_rx = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_rho_xx(result, ax=ax_rx)
+        path = f"{base}_rxx_{T_str}{ext}"
+        fig_rx.savefig(path, dpi=300)
+        plt.close(fig_rx)
+        print(f"  Saved {path}")
+ 
+        # Normalised MR
+        if np.any(np.isfinite(result['MR'])):
+            fig_mr, ax_mr = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_MR_hall(result, ax=ax_mr)
+            path = f"{base}_MR_{T_str}{ext}"
+            fig_mr.savefig(path, dpi=300)
+            plt.close(fig_mr)
+            print(f"  Saved {path}")
+ 
+    # ── Multi-temperature figures (only if >1 temperature) ────────────────
+    if n_T > 1:
+        set_paper_style()
+ 
+        for plot_fn, fname_suffix in [
+            (plot_RH_vs_T,   'multiT_RH'),
+            (plot_nH_vs_T,   'multiT_nH'),
+            (plot_muH_vs_T,  'multiT_muH'),
+        ]:
+            fig, ax = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_fn(results, ax=ax)
+            path = f"{base}_{fname_suffix}{ext}"
+            fig.savefig(path, dpi=300)
+            plt.close(fig)
+            print(f"  Saved {path}")
+ 
+        # cot(θ_H) vs T²
+        cot_fit = fit_cot_theta_vs_T2(results)
+        fig, ax = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_cot_theta_vs_T2(results, cot_fit=cot_fit, ax=ax)
+        path = f"{base}_multiT_cotTheta{ext}"
+        fig.savefig(path, dpi=300)
+        plt.close(fig)
+        print(f"  Saved {path}")
+ 
+        # Kohler
+        w2 = (args.figsize[0] * 2 / 2.54, args.figsize[1] / 2.54)
+        fig_k, axes_k = plt.subplots(1, 2, figsize=w2, constrained_layout=True)
+        plot_kohler(results, axes=axes_k)
+        path = f"{base}_multiT_Kohler{ext}"
+        fig_k.savefig(path, dpi=300)
+        plt.close(fig_k)
+        print(f"  Saved {path}")
+ 
+        # H/T scaling
+        fig_ht, ax_ht = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_HT_scaling(results, ax=ax_ht)
+        path = f"{base}_multiT_HT_scaling{ext}"
+        fig_ht.savefig(path, dpi=300)
+        plt.close(fig_ht)
+        print(f"  Saved {path}")
+
+
 PLOT_TYPES = {
     "RT": (_add_RT_parser, _run_RT),
     "IV": (_add_IV_dVdI_parser, _run_IV_dVdI),
+    "Hall_MR": (_add_Hall_MR_parser, _run_Hall_MR),
 }
 
 def main():
