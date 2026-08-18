@@ -252,6 +252,94 @@ def parse_hall_mr_comments(comments_path):
                 pass
  
     return info
+
+def _remove_channel_spikes(df, sigma_thresh=5.0, min_channels=3):
+    """Detect and remove isolated spikes common to multiple lock-in channels.
+
+    A "circuit spike" appears as a single-point outlier that is anomalously
+    far from its two immediate neighbours compared with the typical step size,
+    AND this anomaly is consistent across at least `min_channels` of the R,
+    X, and theta columns. Detected spike values are replaced by linear
+    interpolation from the neighbouring points.
+
+    Detection metric for channel array x at index i:
+        spike_score[i] = |x[i] − (x[i−1] + x[i+1])/2| / median(|Δx|)
+
+    Cross-channel consistency ensures instrument noise in one channel is not
+    mistaken for a real spike; genuine circuit artefacts affect every channel
+    simultaneously at the same field value.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Raw rack CSV (from pd.read_csv), before column extraction.
+    sigma_thresh : float
+        spike_score threshold (default 5). Lower → more aggressive removal.
+    min_channels : int
+        Minimum number of channels that must flag the same index for it to
+        be classified as a spike (default 2).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Cleaned copy of df with spike indices linearly interpolated.
+    """
+    df = df.copy()
+    n = len(df)
+    if n < 3:
+        return df
+
+    probe_cols = [c for c in
+                  ['X1', 'R1', 'theta1', 'X2', 'R2', 'theta2',
+                   'X3', 'R3', 'theta3']
+                  if c in df.columns]
+    if not probe_cols:
+        return df
+
+    spike_votes = np.zeros(n, dtype=int)
+
+    for col in probe_cols:
+        x = df[col].to_numpy(dtype=float)
+        if np.all(np.isnan(x)) or np.all(x == x[0]):
+            continue                        # constant / all-NaN: skip
+
+        # Expected value at each interior point = midpoint of its neighbours
+        mid = np.empty(n)
+        mid[:] = np.nan
+        mid[1:-1] = (x[:-2] + x[2:]) / 2.0
+
+        deviation = np.abs(x - mid)
+        deviation[0] = 0.0                 # endpoints cannot be assessed
+        deviation[-1] = 0.0
+
+        # Robust scale: median of |first differences| (ignores NaN)
+        diffs = np.abs(np.diff(x[np.isfinite(x)]))
+        if len(diffs) == 0:
+            continue
+        scale = float(np.median(diffs[diffs > 0])) if np.any(diffs > 0) else 0.0
+        if scale < 1e-30:
+            continue
+
+        spike_votes += (deviation / scale > sigma_thresh).astype(int)
+
+    spike_idx = np.where(spike_votes >= min_channels)[0]
+    # Exclude endpoints (cannot interpolate them)
+    spike_idx = spike_idx[(spike_idx > 0) & (spike_idx < n - 1)]
+
+    if len(spike_idx) > 0:
+        H_col = 'Hsample' if 'Hsample' in df.columns else None
+        H_vals = (df[H_col].to_numpy()[spike_idx] if H_col else spike_idx)
+        print(f"  [spikes] {len(spike_idx)} spike(s) detected and removed "
+              f"at H ≈ {H_vals.tolist()} "
+              f"({'Oe' if H_col else 'index'})")
+        # Interpolate ALL columns at spike positions (not just probe channels)
+        for col in df.columns:
+            x = df[col].to_numpy(dtype=float)
+            for idx in spike_idx:
+                x[idx] = (x[idx - 1] + x[idx + 1]) / 2.0
+            df[col] = x
+
+    return df
  
 def load_hall_mr_csv(csv_path, hall_n, mr_n, hall_col='X', mr_col='X'):
     """Load one Hall/MR field-sweep CSV file from the custom rack.
@@ -287,6 +375,7 @@ def load_hall_mr_csv(csv_path, hall_n, mr_n, hall_col='X', mr_col='X'):
         'hall_col_name', 'mr_col_name', 'csv_path'
     """
     df = pd.read_csv(csv_path)
+    df = _remove_channel_spikes(df)
  
     hall_col_name = f"{hall_col}{hall_n}"
     mr_col_name   = f"{mr_col}{mr_n}"
@@ -1784,7 +1873,6 @@ def compute_RRR_RT(data, T_low, window=0.5):
 # 3. ANALYSIS HELPERS for Hall and MG measurement
 # ==========================================================================
 
-
 def _trim_H_plateau(H, *arrays, min_plateau_pts=3, tol_frac=0.005):
     """Remove the constant-field plateau that the PPMS holds after reaching
     the target field, keeping only the first point at the plateau value.
@@ -1841,12 +1929,10 @@ def _trim_H_plateau(H, *arrays, min_plateau_pts=3, tol_frac=0.005):
     sl = slice(0, plateau_start)
     return (H_arr[sl],) + tuple(np.asarray(a)[sl] for a in arrays)
  
- 
 def _interp_to_grid(H_raw, vals_raw, H_grid):
     """Sort H_raw and interpolate vals_raw onto H_grid."""
     order = np.argsort(H_raw)
     return np.interp(H_grid, H_raw[order], np.asarray(vals_raw)[order])
- 
  
 def _antisymmetrize(H_grid, rho):
     """Odd-in-H part: ρ^odd(H) = [ρ(+H) − ρ(−H)] / 2.
@@ -1868,7 +1954,6 @@ def _antisymmetrize(H_grid, rho):
     rho_odd_full = np.concatenate([-rho_odd_pos[::-1], rho_odd_pos])
     return H_pos, rho_odd_pos, H_full, rho_odd_full
  
- 
 def _symmetrize(H_grid, rho):
     """Even-in-H part: ρ^even(H) = [ρ(+H) + ρ(−H)] / 2."""
     pos = H_grid > 0
@@ -1886,6 +1971,69 @@ def _symmetrize(H_grid, rho):
 # ==========================================================================
 # 4. Main analysis function Hall and MG measurement
 # ==========================================================================
+def _detect_H_irr_from_phase(H_sorted, theta_sorted,
+                               window=7, std_threshold=10.0,
+                               min_normal_frac=0.9):
+    """Detect the irreversibility field H_irr from lock-in phase stability.
+
+    In the SC state the measured voltage → 0 and the lock-in phase becomes
+    random (large local variance). In the normal state the phase is stable.
+    H_irr is the lowest field at which the phase becomes stable and stays
+    stable for the remainder of the sweep.
+
+    Parameters
+    ----------
+    H_sorted : ndarray
+        Positive field values, sorted ascending (Oe).
+    theta_sorted : ndarray
+        Phase values (degrees) at the corresponding H points.
+    window : int
+        Half-width (in data points) of the rolling-std window.
+    std_threshold : float
+        Std (degrees) below which the phase is considered 'stable'
+        (normal state). Default 20° is conservative — a random signal
+        has std ≈ 104°.
+    min_normal_frac : float
+        Fraction of remaining points (from candidate H_irr onward) that
+        must also be stable to confirm the transition. Prevents early
+        false positives from a momentarily quiet SC phase.
+
+    Returns
+    -------
+    float or None
+        H_irr in Oe, or None if no stable (normal-state) region is found
+        (sample remains SC throughout the measured field range).
+    """
+    n = len(H_sorted)
+    if n < 2 * window + 2:
+        return None
+
+    # Only use finite theta values
+    valid = np.isfinite(theta_sorted)
+    if not np.any(valid):
+        return None
+
+    # Rolling std of phase over sliding window
+    local_std = np.full(n, np.inf)
+    for i in range(n):
+        lo = max(0, i - window)
+        hi = min(n, i + window + 1)
+        vals = theta_sorted[lo:hi]
+        finite_vals = vals[np.isfinite(vals)]
+        if len(finite_vals) >= 3:
+            local_std[i] = float(np.std(finite_vals))
+
+    is_stable = local_std < std_threshold
+
+    # Find the lowest H where is_stable, AND at least min_normal_frac of
+    # all subsequent points are also stable → confirms entry into normal state.
+    for i in range(n):
+        if is_stable[i]:
+            remaining = is_stable[i:]
+            if np.mean(remaining) >= min_normal_frac:
+                return float(H_sorted[i])
+
+    return None
 
 def analyze_hall_mr(fwd_source, bwd_source=None,
                      hall_n=1, mr_n=2, hall_col='X', mr_col='X',
@@ -1893,7 +2041,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                      t=1e-9, w=None, l=None,
                      V_cell_per_Z_A3=_BI2201_VCELL_PER_Z_A3,
                      fit_H_range_Oe=None,
-                     rho_xx0_field_Oe=0.0,
+                     rho_xx0_field_Oe=None,
                      T_label=None,
                      n_grid=500):
     """Full Hall and magnetoresistance analysis for one temperature scan.
@@ -2020,26 +2168,136 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         rxx_even     = rxx_g
  
     B_pos = H_pos * _HALL_Oe_to_T     # Tesla
- 
-    # ── 6. R_H linear fit: ρ_yx^odd = R_H · B + offset ───────────────────
-    if fit_H_range_Oe is not None:
-        fit_mask = ((H_pos >= fit_H_range_Oe[0]) &
-                    (H_pos <= fit_H_range_Oe[1]))
+
+    # ── 5b. Auto-detect H_irr from MR phase (if fit range not user-supplied) ──
+    # Use the positive H branch of the forward sweep's MR phase channel.
+    _user_supplied_fit_range  = fit_H_range_Oe is not None
+    _user_supplied_rho_ref    = rho_xx0_field_Oe is not None and rho_xx0_field_Oe > 0
+
+    always_sc = False   # assume normal state accessible until proven otherwise
+
+    pos_mask_f = H_f > 0
+    if np.any(pos_mask_f) and not np.all(np.isnan(thMR_f)):
+        _H_det   = H_f[pos_mask_f]
+        _th_det  = thMR_f[pos_mask_f]
+        _ord_det = np.argsort(_H_det)
+        _H_det_s = _H_det[_ord_det]
+        _th_det_s = _th_det[_ord_det]
+
+        H_irr_detected = _detect_H_irr_from_phase(_H_det_s, _th_det_s)
     else:
-        fit_mask = np.ones(len(H_pos), dtype=bool)
- 
-    n_fit = int(np.sum(fit_mask))
-    if n_fit < 2:
-        raise ValueError(
-            f"fit_H_range_Oe={fit_H_range_Oe} Oe gives {n_fit} point(s). "
-            f"Data H_pos range: {H_pos.min():.0f}–{H_pos.max():.0f} Oe."
+        H_irr_detected = None
+        warnings.warn(
+            "MR phase channel (theta_MR) is all-NaN; cannot auto-detect H_irr. "
+            "Pass --fit-H-range manually.",
+            UserWarning, stacklevel=2
         )
+
+    if not _user_supplied_fit_range:
+        if H_irr_detected is not None:
+            H_max_pos = float(H_pos.max()) if len(H_pos) > 0 else 0.0
+            fit_H_range_Oe = (H_irr_detected, H_max_pos)
+            print(f"  [auto] H_irr ≈ {H_irr_detected:.0f} Oe from MR phase; "
+                  f"fit range set to [{H_irr_detected:.0f}, {H_max_pos:.0f}] Oe")
+        else:
+            always_sc = True
+            print(
+                f"\n  ⚠  No normal state detected in θ_MR across the entire "
+                f"measured field range — sample appears SC at all measured fields. "
+                f"R_H, n_H, p, µ_H cannot be extracted at T = {T_label}.\n"
+                f"  Raw ρ_yx and ρ_xx are still computed and returned for plotting."
+            )
+
+    if not _user_supplied_rho_ref:
+        if H_irr_detected is not None:
+            rho_xx0_field_Oe = H_irr_detected
+            print(f"  [auto] ρ_xx reference field set to H_irr = "
+                  f"{H_irr_detected:.0f} Oe")
+        elif not always_sc:
+            rho_xx0_field_Oe = 0.0   # phase suggests normal at H=0
  
-    coeffs, cov = np.polyfit(B_pos[fit_mask], ryx_odd_pos[fit_mask],
-                              deg=1, cov=True)
-    R_H        = float(coeffs[0])
-    R_H_err    = float(np.sqrt(cov[0, 0]))
-    RH_offset  = float(coeffs[1])   # non-zero → residual even contamination
+    # ── 6. R_H linear fit ─────────────────────────────────────────────────
+    R_H = R_H_err = RH_offset = np.nan
+    n_H_m3 = n_H_cm3 = p = mu_H_SI = mu_H_cm2 = np.nan
+    cot_theta_scalar = cot_theta_at_ref = np.nan
+    H_ref_Oe = np.nan
+
+    if not always_sc:
+        if fit_H_range_Oe is not None:
+            fit_mask = ((H_pos >= fit_H_range_Oe[0]) &
+                        (H_pos <= fit_H_range_Oe[1]))
+        else:
+            fit_mask = np.ones(len(H_pos), dtype=bool)
+
+        n_fit = int(np.sum(fit_mask))
+        if n_fit < 2:
+            print(
+                f"  ⚠  fit_H_range_Oe={fit_H_range_Oe} gives only {n_fit} "
+                f"point(s) — skipping R_H fit."
+            )
+            always_sc = True   # treat as if no normal state for derived quantities
+
+        if not always_sc:
+            B_fit = B_pos[fit_mask]
+            ryx_fit = ryx_odd_pos[fit_mask]
+            coeffs, cov = np.polyfit(B_fit, ryx_fit, deg=1, cov=True)
+            R_H       = float(coeffs[0])
+            R_H_err   = float(np.sqrt(cov[0, 0]))
+            RH_offset = float(coeffs[1])
+
+            # Carrier density, doping
+            n_H_m3  = (1.0 / (_HALL_e * R_H)) if abs(R_H) > 1e-20 else np.nan
+            n_H_cm3 = n_H_m3 * 1e-6 if np.isfinite(n_H_m3) else np.nan
+            V_cell_m3 = V_cell_per_Z_A3 * _HALL_A3_to_m3
+            p = abs(n_H_m3) * V_cell_m3 - 1.0 if np.isfinite(n_H_m3) else np.nan
+
+            # ρ_xx reference and µ_H
+            rxx_ref = float(np.interp(rho_xx0_field_Oe, H_pos, rxx_even_pos))
+            if abs(rxx_ref) > 1e-20:
+                mu_H_SI  = abs(R_H) / abs(rxx_ref)
+                mu_H_cm2 = mu_H_SI * 1e4
+            else:
+                warnings.warn(
+                    f"ρ_xx ≈ 0 at the reference field "
+                    f"({rho_xx0_field_Oe:.0f} Oe) — µ_H cannot be computed.",
+                    UserWarning, stacklevel=2
+                )
+
+            # cot(θ_H)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                cot_theta = np.where(
+                    np.abs(ryx_odd_pos) > 1e-20,
+                    rxx_even_pos / np.abs(ryx_odd_pos),
+                    np.nan
+                )
+            cot_theta_scalar = float(np.nanmean(cot_theta[fit_mask]))
+            H_ref_Oe = float(np.mean(H_pos[fit_mask]))
+            cot_theta_at_ref = float(np.interp(H_ref_Oe, H_pos, cot_theta))
+
+    else:
+        # always_sc branch: still compute cot_theta arrays for plotting
+        # but they will be NaN-dominated
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cot_theta = np.where(
+                np.abs(ryx_odd_pos) > 1e-20,
+                rxx_even_pos / np.abs(ryx_odd_pos),
+                np.nan
+            )
+        fit_mask = np.zeros(len(H_pos), dtype=bool)
+        rxx_ref  = np.nan
+
+    # ── 7. MR and Kohler quantities ────────────────────────────────────────
+    rxx0 = float(np.interp(0.0, H_sym, rxx_even))
+    if abs(rxx0) > 1e-20 and not always_sc:
+        MR = (rxx_even_pos - rxx0) / abs(rxx0)
+    else:
+        MR = np.full_like(rxx_even_pos, np.nan)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tan2_theta = np.where(
+            np.abs(cot_theta) > 1e-10,
+            1.0 / cot_theta**2, np.nan
+        )
  
     # ── 7. Derived Hall quantities ─────────────────────────────────────────
     n_H_m3  = (1.0 / (_HALL_e * R_H)) if abs(R_H) > 1e-20 else np.nan
@@ -2077,45 +2335,27 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                 if np.any(fit_mask) else float(np.nanmax(H_pos)))
     cot_theta_at_ref = float(np.interp(H_ref_Oe, H_pos, cot_theta))
  
-    # ── 9. Magnetoresistance: ΔR/R₀ = [ρ_xx^even(H) − ρ_xx(0)] / ρ_xx(0) ─
-    rxx0 = float(np.interp(0.0, H_sym, rxx_even))
-    if abs(rxx0) > 1e-20:
-        MR = (rxx_even_pos - rxx0) / abs(rxx0)
-    else:
-        MR = np.full_like(rxx_even_pos, np.nan)
-        warnings.warn(
-            "ρ_xx(H=0) ≈ 0; ΔR/R₀ cannot be computed "
-            "(sample is SC at H=0). MR will be NaN.",
-            UserWarning, stacklevel=2
-        )
- 
-    # tan²(θ_H) for modified Kohler: ΔR/R₀ ∝ tan²(θ_H)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        tan2_theta = np.where(np.abs(cot_theta) > 1e-10,
-                               1.0 / cot_theta**2, np.nan)
- 
     # ── 10. Console summary ────────────────────────────────────────────────
     to_uOcm = _HALL_Ohm_m_to_uOhm_cm
+    _fmt = lambda v, fmt='.4g': (f'{v:{fmt}}' if np.isfinite(v) else 'N/A (SC)')
+
     print(
         f"\n{'─'*62}\n"
         f"  Hall/MR — T = {T_label}   "
         f"({'fwd+bwd' if bwd is not None else 'fwd only'})\n"
         f"{'─'*62}\n"
-        f"  H fit range   : {fit_H_range_Oe} Oe  ({n_fit} pts)\n"
-        f"  R_H           = {R_H:.4g} ± {R_H_err:.2g}  m³/C\n"
-        f"                  ({R_H*1e9:.4g} ± {R_H_err*1e9:.2g}  mm³/C)\n"
-        f"  Fit offset    = {RH_offset*to_uOcm:.3g}  µΩ·cm  "
-        f"(non-zero → residual even contamination)\n"
-        f"  n_H           = {n_H_cm3:.3g}  cm⁻³\n"
-        f"  p (doping)    = {p:.4f}  "
-        f"(V_cell/Z = {V_cell_per_Z_A3:.1f} Å³)\n"
-        f"  µ_H           = {mu_H_cm2:.3g}  cm²/(V·s)\n"
-        f"  ρ_xx (ref H)  = {rxx_ref*to_uOcm:.4g}  µΩ·cm  "
+        f"  H_irr (phase)  : "
+        f"{f'{H_irr_detected:.0f} Oe' if H_irr_detected is not None else 'not detected (always SC)'}\n"
+        f"  H fit range    : {fit_H_range_Oe}\n"
+        f"  R_H            = {_fmt(R_H)} m³/C\n"
+        f"  Fit offset     = {_fmt(RH_offset * to_uOcm)} µΩ·cm\n"
+        f"  n_H            = {_fmt(n_H_cm3)} cm⁻³\n"
+        f"  p (doping)     = {_fmt(p)}\n"
+        f"  µ_H            = {_fmt(mu_H_cm2)} cm²/(V·s)\n"
+        f"  ρ_xx (ref H)   = "
+        f"{_fmt(rxx_ref * to_uOcm) if np.isfinite(rxx_ref) else 'N/A'} µΩ·cm  "
         f"(ref H = {rho_xx0_field_Oe:.0f} Oe)\n"
-        f"  ⟨cot θ_H⟩    = {cot_theta_scalar:.4g}  "
-        f"(mean over fit window)\n"
-        f"  cot θ_H(Href) = {cot_theta_at_ref:.4g}  "
-        f"(at H_ref = {H_ref_Oe:.0f} Oe)\n"
+        f"  ⟨cot θ_H⟩     = {_fmt(cot_theta_scalar)}\n"
         f"{'─'*62}"
     )
  
@@ -2147,6 +2387,9 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'cot_theta_scalar': cot_theta_scalar,
         'cot_theta_at_Href': cot_theta_at_ref,
         'H_ref_Oe':        H_ref_Oe,
+        'H_irr_Oe':       H_irr_detected,   # auto-detected or None
+        'always_sc':      always_sc,         # True if no normal state found
+        'fit_mask':       fit_mask,
         # ── MR quantities ────────────────────────────────────────────────
         'MR':              MR,             # ΔR/R₀, dimensionless
         'tan2_theta_H':    tan2_theta,     # for modified Kohler
@@ -2253,10 +2496,12 @@ def _to_uOhm_cm(rho_Ohm_m):
     return rho_Ohm_m * _HALL_Ohm_m_to_uOhm_cm
  
  
-def plot_hall_raw(result, show_T=False, axes=None, figsize=None,
-                  colors=None):
-    """Plot raw (pre-symmetrization) Hall and MR voltages vs field.
- 
+def plot_hall_raw(result, show_T=False, axes=None, figsize=None, colors=None):
+    """Plot raw Hall (V_y) and MR (V_x) voltages vs field, stacked vertically.
+
+    Panels are stacked top-to-bottom (Vy, Vx, optionally Tsample) and share
+    the x-axis, so each panel spans the full figure width.
+
     Parameters
     ----------
     result : dict
@@ -2266,50 +2511,50 @@ def plot_hall_raw(result, show_T=False, axes=None, figsize=None,
         stability diagnostics.
     axes : list of Axes, optional
         Pre-created axes (2 or 3 elements). Created if None.
+    figsize : (float, float), optional
+        (width_cm, height_per_panel_cm). Total height = n_panels × height_per_panel.
     colors : dict, optional
         {'fwd': color, 'bwd': color}. Defaults to blue/red.
- 
+
     Returns
     -------
     fig, axes
     """
     nc = 3 if show_T else 2
+    c  = colors or {'fwd': 'tab:blue', 'bwd': 'tab:red'}
+
     if axes is None:
-        w = (figsize[0] if figsize else 17.8) / 2.54 
-        h = (figsize[1] if figsize else 10)  / 2.54
-        fig, axes = plt.subplots(1, nc, figsize=(w, h), constrained_layout=True)
+        w    = (figsize[0] if figsize else 8.6)  / 2.54
+        h_pp = (figsize[1] if figsize else 5.0)  / 2.54   # height per panel
+        fig, axes = plt.subplots(nc, 1, figsize=(w, h_pp * nc),
+                                  sharex=True, constrained_layout=True)
     else:
         fig = axes[0].get_figure()
- 
-    c = colors or {'fwd': 'tab:blue', 'bwd': 'tab:red'}
- 
-    for ax_idx, (key_H, key_V, ylabel) in enumerate([
-        ('fwd_H_Oe', 'fwd_Vy_V', r'$V_y$ (Hall, V)'),
-        ('fwd_H_Oe', 'fwd_Vx_V', r'$V_x$ (MR, V)'),
-    ]):
-        ax = axes[ax_idx]
-        ax.plot(result[key_H] * 1e-4,   # Oe → T
-                result[key_V],
-                color=c['fwd'], lw=0.8, label='Forward')
-        if result['has_bwd'] and result['bwd_H_Oe'] is not None:
-            ax.plot(result['bwd_H_Oe'] * 1e-4,
-                    result['bwd_Vy_V'] if ax_idx == 0 else result['bwd_Vx_V'],
-                    color=c['bwd'], lw=0.8, label='Backward', alpha=0.7)
-        ax.set_xlabel(r'$\mu_0 H$ (T)')
+
+    # (fwd_key, bwd_key, y-axis label)
+    panels = [
+        ('fwd_Vy_V',  'bwd_Vy_V',  r'$V_y$  (Hall, V)'),
+        ('fwd_Vx_V',  'bwd_Vx_V',  r'$V_x$  (MR, V)'),
+    ]
+    if show_T:
+        panels.append(('fwd_T_K', 'bwd_T_K', r'$T_{\rm sample}$  (K)'))
+
+    for k, (fwd_key, bwd_key, ylabel) in enumerate(panels):
+        ax = axes[k]
+        H_fwd = result['fwd_H_Oe'] * 1e-4   # Oe → T
+        ax.plot(H_fwd, result[fwd_key], color=c['fwd'], lw=0.8, label='Forward')
+
+        if result['has_bwd'] and result.get(bwd_key) is not None:
+            H_bwd = result['bwd_H_Oe'] * 1e-4
+            ax.plot(H_bwd, result[bwd_key], color=c['bwd'],
+                    lw=0.8, label='Backward', alpha=0.7)
+
         ax.set_ylabel(ylabel)
-        ax.legend()
- 
-    if show_T and nc == 3:
-        ax = axes[2]
-        ax.plot(result['fwd_H_Oe'] * 1e-4, result['fwd_T_K'],
-                color=c['fwd'], lw=0.8, label='Forward')
-        if result['has_bwd'] and result['bwd_T_K'] is not None:
-            ax.plot(result['bwd_H_Oe'] * 1e-4, result['bwd_T_K'],
-                    color=c['bwd'], lw=0.8, label='Backward', alpha=0.7)
-        ax.set_xlabel(r'$\mu_0 H$ (T)')
-        ax.set_ylabel(r'$T_{\rm sample}$ (K)')
-        ax.legend()
- 
+        ax.legend(fontsize=7, loc='best')
+        # x-label only on bottom panel (shared x suppresses the others)
+        if k == nc - 1:
+            ax.set_xlabel(r'$\mu_0 H$  (T)')
+
     return fig, axes
  
  
@@ -3193,7 +3438,7 @@ def _run_Hall_MR(args):
             n_grid           = args.n_grid,
         )
         results.append(result)
-        T_str = result['T_label'].replace(' ', '').replace('/', '-')
+        T_str = f"{int(round(result['T_nominal_K']))}K"
  
         # ── Per-temperature figures ───────────────────────────────────────
         set_paper_style()
