@@ -115,10 +115,11 @@ def save_to_csv(mat_path):
         return False
 
     base_name = Path(mat_path).stem
-    cwd = Path(os.getcwd())
+    # Write CSV + comments in the current working directory
+    out_dir = Path(os.getcwd())
 
-    csv_path = cwd / f"{base_name}.csv"
-    comments_path = cwd / f"{base_name}_comments.txt"
+    csv_path = out_dir / f"{base_name}.csv"
+    comments_path = out_dir / f"{base_name}_comments.txt"
 
     # Save comments
     comments = D.pop('comments', None)
@@ -174,23 +175,48 @@ def save_to_csv(mat_path):
 # ====================== USAGE ======================
 if __name__ == "__main__":
     import sys
+    import glob
+
+    def _collect_mat_files(path):
+        """Return a sorted list of .mat files from a file or directory path."""
+        path = os.path.abspath(path)
+        if os.path.isfile(path):
+            if path.lower().endswith(".mat"):
+                return [path]
+            print(f"Not a .mat file: {path}")
+            return []
+        if os.path.isdir(path):
+            mats = sorted(glob.glob(os.path.join(path, "*.mat")))
+            # also pick up .MAT (case variants) without double-counting
+            mats_upper = sorted(glob.glob(os.path.join(path, "*.MAT")))
+            mats = sorted(set(mats + mats_upper))
+            # skip helper/script mat files if any
+            mats = [f for f in mats if "extract_data_v1" not in os.path.basename(f).lower()]
+            if not mats:
+                print(f"No .mat files found in: {path}")
+            return mats
+        print(f"Path not found: {path}")
+        return []
+
     if len(sys.argv) > 1:
-        # Accept either a bare relative path or an absolute path
         arg = sys.argv[1]
-        if os.path.isabs(arg) or os.path.exists(arg):
-            file_path = arg
-        else:
-            file_path = f"/home/joaoalmendes/PhD/{arg}"
-        if os.path.exists(file_path):
-            print(f"Processing: {file_path}")
-            save_to_csv(file_path)
-        else:
-            print(f"File not found: {file_path}")
-    else:
-        attachments_dir = "/home/joaoalmendes/PhD/"
-        import glob
-        mat_files = glob.glob(os.path.join(attachments_dir, "*.mat"))
+        # Resolve relative paths against the usual PhD root if needed
+        if not os.path.isabs(arg) and not os.path.exists(arg):
+            candidate = f"/home/joaoalmendes/PhD/{arg}"
+            if os.path.exists(candidate):
+                arg = candidate
+        mat_files = _collect_mat_files(arg)
+        if not mat_files:
+            sys.exit(1)
+        print(f"Found {len(mat_files)} .mat file(s) to process\n")
         for f in mat_files:
-            if "extract_data_v1" not in f.lower():
-                print(f"\n--- Processing {os.path.basename(f)} ---")
-                save_to_csv(f)
+            print(f"--- Processing {os.path.basename(f)} ---")
+            save_to_csv(f)
+            print()
+    else:
+        # No argument: process all .mat files under the default PhD folder
+        attachments_dir = "/home/joaoalmendes/PhD/"
+        mat_files = _collect_mat_files(attachments_dir)
+        for f in mat_files:
+            print(f"\n--- Processing {os.path.basename(f)} ---")
+            save_to_csv(f)

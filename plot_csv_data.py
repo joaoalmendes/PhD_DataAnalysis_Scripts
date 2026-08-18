@@ -1972,7 +1972,7 @@ def _symmetrize(H_grid, rho):
 # 4. Main analysis function Hall and MG measurement
 # ==========================================================================
 def _detect_H_irr_from_phase(H_sorted, theta_sorted,
-                               window=7, std_threshold=10.0,
+                               window=7, std_threshold=5.0,
                                min_normal_frac=0.9):
     """Detect the irreversibility field H_irr from lock-in phase stability.
 
@@ -2762,7 +2762,7 @@ def plot_cot_theta_vs_T2(results_list, cot_fit=None, ax=None,
  
     T   = np.array([r['T_nominal_K']     for r in results_list])
     ct  = np.array([r['cot_theta_at_Href'] for r in results_list])
- 
+
     ax.plot(T**2, ct, 'o', color=color, ms=4, label=r'$\cot\theta_H$')
  
     if cot_fit is not None and cot_fit['poly'] is not None:
