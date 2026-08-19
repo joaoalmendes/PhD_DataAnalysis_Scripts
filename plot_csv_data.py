@@ -2216,13 +2216,25 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         elif not always_sc:
             rho_xx0_field_Oe = 0.0   # phase suggests normal at H=0
  
-    # ── 6. R_H linear fit ─────────────────────────────────────────────────
+  # ── 6–8. Derived quantities, fit, and summary ──────────────────────────
+    # Initialise ALL derived scalars to NaN so the always-SC branch never
+    # hits an undefined variable or a None format string.
     R_H = R_H_err = RH_offset = np.nan
     n_H_m3 = n_H_cm3 = p = mu_H_SI = mu_H_cm2 = np.nan
-    cot_theta_scalar = cot_theta_at_ref = np.nan
-    H_ref_Oe = np.nan
+    cot_theta_scalar = cot_theta_at_ref = H_ref_Oe = np.nan
+    rxx_ref = np.nan
+    fit_mask = np.zeros(len(H_pos), dtype=bool)
+
+    # cot(θ_H) array — computed regardless of SC state (used for plotting)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cot_theta = np.where(
+            np.abs(ryx_odd_pos) > 1e-20,
+            rxx_even_pos / np.abs(ryx_odd_pos),
+            np.nan
+        )
 
     if not always_sc:
+        # ── 6. R_H linear fit ─────────────────────────────────────────────
         if fit_H_range_Oe is not None:
             fit_mask = ((H_pos >= fit_H_range_Oe[0]) &
                         (H_pos <= fit_H_range_Oe[1]))
@@ -2235,58 +2247,50 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                 f"  ⚠  fit_H_range_Oe={fit_H_range_Oe} gives only {n_fit} "
                 f"point(s) — skipping R_H fit."
             )
-            always_sc = True   # treat as if no normal state for derived quantities
-
-        if not always_sc:
-            B_fit = B_pos[fit_mask]
-            ryx_fit = ryx_odd_pos[fit_mask]
-            coeffs, cov = np.polyfit(B_fit, ryx_fit, deg=1, cov=True)
+        else:
+            coeffs, cov = np.polyfit(
+                B_pos[fit_mask], ryx_odd_pos[fit_mask], deg=1, cov=True
+            )
             R_H       = float(coeffs[0])
             R_H_err   = float(np.sqrt(cov[0, 0]))
             RH_offset = float(coeffs[1])
 
             # Carrier density, doping
-            n_H_m3  = (1.0 / (_HALL_e * R_H)) if abs(R_H) > 1e-20 else np.nan
-            n_H_cm3 = n_H_m3 * 1e-6 if np.isfinite(n_H_m3) else np.nan
-            V_cell_m3 = V_cell_per_Z_A3 * _HALL_A3_to_m3
-            p = abs(n_H_m3) * V_cell_m3 - 1.0 if np.isfinite(n_H_m3) else np.nan
+            if abs(R_H) > 1e-20:
+                n_H_m3  = 1.0 / (_HALL_e * R_H)
+                n_H_cm3 = n_H_m3 * 1e-6
+                V_cell_m3 = V_cell_per_Z_A3 * _HALL_A3_to_m3
+                p = abs(n_H_m3) * V_cell_m3 - 1.0
 
-            # ρ_xx reference and µ_H
-            rxx_ref = float(np.interp(rho_xx0_field_Oe, H_pos, rxx_even_pos))
+            # ρ_xx at reference field
+            _ref_H = rho_xx0_field_Oe if rho_xx0_field_Oe is not None else 0.0
+            rxx_ref = float(np.interp(_ref_H, H_pos, rxx_even_pos))
             if abs(rxx_ref) > 1e-20:
                 mu_H_SI  = abs(R_H) / abs(rxx_ref)
                 mu_H_cm2 = mu_H_SI * 1e4
             else:
+                _ref_str = (f"{_ref_H:.0f} Oe"
+                            if rho_xx0_field_Oe is not None else "auto")
                 warnings.warn(
-                    f"ρ_xx ≈ 0 at the reference field "
-                    f"({rho_xx0_field_Oe:.0f} Oe) — µ_H cannot be computed.",
+                    f"ρ_xx ≈ 0 at the reference field ({_ref_str}) — "
+                    "µ_H cannot be computed.",
                     UserWarning, stacklevel=2
                 )
 
-            # cot(θ_H)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                cot_theta = np.where(
-                    np.abs(ryx_odd_pos) > 1e-20,
-                    rxx_even_pos / np.abs(ryx_odd_pos),
-                    np.nan
+            # cot(θ_H) scalars — guarded against empty/all-NaN fit window
+            if np.any(fit_mask):
+                cot_in_window = cot_theta[fit_mask]
+                cot_finite    = cot_in_window[np.isfinite(cot_in_window)]
+                cot_theta_scalar = (float(np.mean(cot_finite))
+                                    if len(cot_finite) > 0 else np.nan)
+                H_ref_Oe = float(np.mean(H_pos[fit_mask]))
+                cot_theta_at_ref = float(
+                    np.interp(H_ref_Oe, H_pos[np.isfinite(cot_theta)],
+                               cot_theta[np.isfinite(cot_theta)])
+                    if np.any(np.isfinite(cot_theta)) else np.nan
                 )
-            cot_theta_scalar = float(np.nanmean(cot_theta[fit_mask]))
-            H_ref_Oe = float(np.mean(H_pos[fit_mask]))
-            cot_theta_at_ref = float(np.interp(H_ref_Oe, H_pos, cot_theta))
 
-    else:
-        # always_sc branch: still compute cot_theta arrays for plotting
-        # but they will be NaN-dominated
-        with np.errstate(divide='ignore', invalid='ignore'):
-            cot_theta = np.where(
-                np.abs(ryx_odd_pos) > 1e-20,
-                rxx_even_pos / np.abs(ryx_odd_pos),
-                np.nan
-            )
-        fit_mask = np.zeros(len(H_pos), dtype=bool)
-        rxx_ref  = np.nan
-
-    # ── 7. MR and Kohler quantities ────────────────────────────────────────
+    # ── 7. MR quantities ──────────────────────────────────────────────────
     rxx0 = float(np.interp(0.0, H_sym, rxx_even))
     if abs(rxx0) > 1e-20 and not always_sc:
         MR = (rxx_even_pos - rxx0) / abs(rxx0)
@@ -2295,8 +2299,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
 
     with np.errstate(divide='ignore', invalid='ignore'):
         tan2_theta = np.where(
-            np.abs(cot_theta) > 1e-10,
-            1.0 / cot_theta**2, np.nan
+            np.abs(cot_theta) > 1e-10, 1.0 / cot_theta**2, np.nan
         )
  
     # ── 7. Derived Hall quantities ─────────────────────────────────────────
@@ -2315,46 +2318,43 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
     else:
         mu_H_SI = mu_H_cm2 = np.nan
         warnings.warn(
-            f"ρ_xx ≈ 0 at the reference field ({rho_xx0_field_Oe:.0f} Oe) — "
-            "sample is likely in the SC state. µ_H cannot be computed. "
-            "Set --rho-xx-field to a value above H_irr(T).",
+            f"  ρ_xx (ref H)   = "
+            f"{_fmt(rxx_ref * to_uOcm) if np.isfinite(rxx_ref) else 'N/A'} µΩ·cm  "
+            f"(ref H = {f'{rho_xx0_field_Oe:.0f} Oe' if rho_xx0_field_Oe is not None else 'N/A (always SC)'})\n",
             UserWarning, stacklevel=2
         )
  
-    # ── 8. cot(θ_H) = ρ_xx / |ρ_yx|  on positive-H branch ───────────────
-    with np.errstate(divide='ignore', invalid='ignore'):
-        cot_theta = np.where(
-            np.abs(ryx_odd_pos) > 1e-20,
-            rxx_even_pos / np.abs(ryx_odd_pos),
-            np.nan
-        )
-    # Scalar for multi-T analysis: mean in the fit window
-    cot_theta_scalar = float(np.nanmean(cot_theta[fit_mask]))
-    # Reference field for cot(θ_H)(T) curve: midpoint of fit range
-    H_ref_Oe = (float(np.mean(H_pos[fit_mask]))
-                if np.any(fit_mask) else float(np.nanmax(H_pos)))
-    cot_theta_at_ref = float(np.interp(H_ref_Oe, H_pos, cot_theta))
- 
-    # ── 10. Console summary ────────────────────────────────────────────────
+    # ── 8. Console summary ────────────────────────────────────────────────
     to_uOcm = _HALL_Ohm_m_to_uOhm_cm
-    _fmt = lambda v, fmt='.4g': (f'{v:{fmt}}' if np.isfinite(v) else 'N/A (SC)')
+
+    def _fmt(v, spec='.4g'):
+        """Format a scalar; return 'N/A' for NaN/inf/None."""
+        if v is None:
+            return 'N/A'
+        try:
+            return f'{v:{spec}}' if np.isfinite(float(v)) else 'N/A'
+        except (TypeError, ValueError):
+            return 'N/A'
+
+    _ref_H_display = (f"{rho_xx0_field_Oe:.0f} Oe"
+                      if rho_xx0_field_Oe is not None else "N/A (always SC)")
+    _hirr_display  = (f"{H_irr_detected:.0f} Oe"
+                      if H_irr_detected is not None else "not detected (always SC)")
 
     print(
         f"\n{'─'*62}\n"
         f"  Hall/MR — T = {T_label}   "
         f"({'fwd+bwd' if bwd is not None else 'fwd only'})\n"
         f"{'─'*62}\n"
-        f"  H_irr (phase)  : "
-        f"{f'{H_irr_detected:.0f} Oe' if H_irr_detected is not None else 'not detected (always SC)'}\n"
+        f"  H_irr (phase)  : {_hirr_display}\n"
         f"  H fit range    : {fit_H_range_Oe}\n"
         f"  R_H            = {_fmt(R_H)} m³/C\n"
-        f"  Fit offset     = {_fmt(RH_offset * to_uOcm)} µΩ·cm\n"
+        f"  Fit offset     = {_fmt(RH_offset * to_uOcm if np.isfinite(RH_offset) else np.nan)} µΩ·cm\n"
         f"  n_H            = {_fmt(n_H_cm3)} cm⁻³\n"
         f"  p (doping)     = {_fmt(p)}\n"
         f"  µ_H            = {_fmt(mu_H_cm2)} cm²/(V·s)\n"
-        f"  ρ_xx (ref H)   = "
-        f"{_fmt(rxx_ref * to_uOcm) if np.isfinite(rxx_ref) else 'N/A'} µΩ·cm  "
-        f"(ref H = {rho_xx0_field_Oe:.0f} Oe)\n"
+        f"  ρ_xx (ref H)   = {_fmt(rxx_ref * to_uOcm if np.isfinite(rxx_ref) else np.nan)} µΩ·cm"
+        f"  (ref H = {_ref_H_display})\n"
         f"  ⟨cot θ_H⟩     = {_fmt(cot_theta_scalar)}\n"
         f"{'─'*62}"
     )
@@ -2423,68 +2423,58 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
 # Fitting for the costheta
 
 def fit_cot_theta_vs_T2(results_list):
-    """Fit cot(θ_H) = α·T² + β from a list of single-T analyze_hall_mr
-    output dicts.
- 
-    This is the primary strange-metal diagnostic for cuprates
-    (Anderson two-lifetime picture; "Stranger than metals", Science 2022).
- 
-    Parameters
-    ----------
-    results_list : list of dict
-        Each dict is the output of analyze_hall_mr at one temperature.
- 
-    Returns
-    -------
-    dict
-        'T_K'          : ndarray, temperatures
-        'cot_theta'    : ndarray, cot(θ_H) at reference field per T
-        'T2'           : ndarray, T² values
-        'alpha'        : float, T² coefficient (K⁻²)
-        'alpha_err'    : float
-        'beta'         : float, zero-T intercept
-        'beta_err'     : float
-        'poly'         : np.poly1d, callable fit
-        'R2'           : float, coefficient of determination
+    """Fit cot(θ_H) = α·T² + β.  Uses cot_theta_scalar (mean over the fit
+    window) — the same quantity printed in the terminal analysis — so the
+    fit and the plot are always consistent with the reported values.
+    NaN entries (always-SC temperatures) are silently excluded.
     """
-    T_arr  = np.array([r['T_nominal_K']     for r in results_list])
-    ct_arr = np.array([r['cot_theta_at_Href'] for r in results_list])
- 
-    finite = np.isfinite(ct_arr)
-    if np.sum(finite) < 2:
-        warnings.warn("Not enough finite cot(θ_H) values to fit.", UserWarning)
-        return {'T_K': T_arr, 'cot_theta': ct_arr, 'T2': T_arr**2,
-                'alpha': np.nan, 'alpha_err': np.nan,
-                'beta': np.nan, 'beta_err': np.nan,
-                'poly': None, 'R2': np.nan}
- 
+    T_arr  = np.array([r['T_nominal_K']    for r in results_list])
+    ct_arr = np.array([r['cot_theta_scalar'] for r in results_list])
+
+    finite = np.isfinite(ct_arr) & np.isfinite(T_arr)
+    n_valid = int(np.sum(finite))
+
+    if n_valid < 2:
+        warnings.warn(
+            f"Only {n_valid} temperature(s) with finite cot(θ_H) — "
+            "cannot fit α·T² + β.", UserWarning
+        )
+        return {
+            'T_K': T_arr, 'cot_theta': ct_arr, 'T2': T_arr**2,
+            'alpha': np.nan, 'alpha_err': np.nan,
+            'beta':  np.nan, 'beta_err':  np.nan,
+            'poly':  None,   'R2':        np.nan,
+            'n_valid': n_valid,
+        }
+
     T2 = T_arr[finite]**2
     ct = ct_arr[finite]
     coeffs, cov = np.polyfit(T2, ct, deg=1, cov=True)
-    alpha, beta = float(coeffs[0]), float(coeffs[1])
-    alpha_err = float(np.sqrt(cov[0, 0]))
-    beta_err  = float(np.sqrt(cov[1, 1]))
- 
-    ct_fit = np.polyval(coeffs, T2)
-    ss_res = np.sum((ct - ct_fit)**2)
-    ss_tot = np.sum((ct - ct.mean())**2)
-    R2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
- 
+    alpha, beta   = float(coeffs[0]), float(coeffs[1])
+    alpha_err     = float(np.sqrt(cov[0, 0]))
+    beta_err      = float(np.sqrt(cov[1, 1]))
+    ct_fit        = np.polyval(coeffs, T2)
+    ss_res        = np.sum((ct - ct_fit)**2)
+    ss_tot        = np.sum((ct - ct.mean())**2)
+    R2            = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+    # Report excluded temperatures
+    excluded = T_arr[~finite]
+    excl_str = (f"  Excluded (NaN / always-SC): T = {excluded.tolist()} K\n"
+                if len(excluded) > 0 else "")
     print(
-        f"\n  cot(θ_H) = α·T² + β fit:\n"
+        f"\n  cot(θ_H) = α·T² + β  [{n_valid} temperatures used]\n"
+        f"{excl_str}"
         f"  α = {alpha:.4g} ± {alpha_err:.2g}  K⁻²\n"
-        f"  β = {beta:.4g} ± {beta_err:.2g}  (dimensionless)\n"
+        f"  β = {beta:.4g}  ± {beta_err:.2g}\n"
         f"  R² = {R2:.4f}"
     )
- 
     return {
-        'T_K':       T_arr,
-        'cot_theta': ct_arr,
-        'T2':        T_arr**2,
-        'alpha':     alpha, 'alpha_err': alpha_err,
-        'beta':      beta,  'beta_err':  beta_err,
-        'poly':      np.poly1d(coeffs),
-        'R2':        R2,
+        'T_K':       T_arr,    'cot_theta':  ct_arr,
+        'T2':        T_arr**2, 'alpha':      alpha,
+        'alpha_err': alpha_err,'beta':       beta,
+        'beta_err':  beta_err, 'poly':       np.poly1d(coeffs),
+        'R2':        R2,       'n_valid':    n_valid,
     }
 
 # ==========================================================================
@@ -2497,63 +2487,95 @@ def _to_uOhm_cm(rho_Ohm_m):
  
  
 def plot_hall_raw(result, show_T=False, axes=None, figsize=None, colors=None):
-    """Plot raw Hall (V_y) and MR (V_x) voltages vs field, stacked vertically.
+    """Plot raw Hall (V_y), MR (V_x), phase (θ_H and θ_MR), and optionally
+    Tsample, all stacked vertically and sharing the x-axis.
 
-    Panels are stacked top-to-bottom (Vy, Vx, optionally Tsample) and share
-    the x-axis, so each panel spans the full figure width.
-
-    Parameters
-    ----------
-    result : dict
-        Output of analyze_hall_mr.
-    show_T : bool
-        If True, add a third panel showing Tsample(H) for temperature
-        stability diagnostics.
-    axes : list of Axes, optional
-        Pre-created axes (2 or 3 elements). Created if None.
-    figsize : (float, float), optional
-        (width_cm, height_per_panel_cm). Total height = n_panels × height_per_panel.
-    colors : dict, optional
-        {'fwd': color, 'bwd': color}. Defaults to blue/red.
-
-    Returns
-    -------
-    fig, axes
+    Panel order (top to bottom):
+      0 — V_y (Hall voltage)
+      1 — V_x (MR / longitudinal voltage)
+      2 — Phase: θ_Hall (solid) and θ_MR (dashed) in the same panel
+      3 — T_sample  (only when show_T=True)
     """
-    nc = 3 if show_T else 2
+    nc = 4 if show_T else 3
     c  = colors or {'fwd': 'tab:blue', 'bwd': 'tab:red'}
 
     if axes is None:
-        w    = (figsize[0] if figsize else 8.6)  / 2.54
-        h_pp = (figsize[1] if figsize else 5.0)  / 2.54   # height per panel
+        w    = (figsize[0] if figsize else 8.6) / 2.54
+        h_pp = (figsize[1] if figsize else 4.5) / 2.54   # height per panel
         fig, axes = plt.subplots(nc, 1, figsize=(w, h_pp * nc),
                                   sharex=True, constrained_layout=True)
     else:
         fig = axes[0].get_figure()
 
-    # (fwd_key, bwd_key, y-axis label)
-    panels = [
-        ('fwd_Vy_V',  'bwd_Vy_V',  r'$V_y$  (Hall, V)'),
-        ('fwd_Vx_V',  'bwd_Vx_V',  r'$V_x$  (MR, V)'),
-    ]
-    if show_T:
-        panels.append(('fwd_T_K', 'bwd_T_K', r'$T_{\rm sample}$  (K)'))
-
-    for k, (fwd_key, bwd_key, ylabel) in enumerate(panels):
-        ax = axes[k]
-        H_fwd = result['fwd_H_Oe'] * 1e-4   # Oe → T
-        ax.plot(H_fwd, result[fwd_key], color=c['fwd'], lw=0.8, label='Forward')
-
-        if result['has_bwd'] and result.get(bwd_key) is not None:
-            H_bwd = result['bwd_H_Oe'] * 1e-4
-            ax.plot(H_bwd, result[bwd_key], color=c['bwd'],
-                    lw=0.8, label='Backward', alpha=0.7)
-
+    def _plot_pair(ax, H_fwd, y_fwd, H_bwd, y_bwd, ylabel,
+                    fwd_label='Forward', bwd_label='Backward',
+                    fwd_ls='-', bwd_ls='-', fwd_alpha=1.0, bwd_alpha=0.7):
+        ax.plot(H_fwd, y_fwd, color=c['fwd'], lw=0.8,
+                ls=fwd_ls, label=fwd_label, alpha=fwd_alpha)
+        if H_bwd is not None and y_bwd is not None:
+            ax.plot(H_bwd, y_bwd, color=c['bwd'], lw=0.8,
+                    ls=bwd_ls, label=bwd_label, alpha=bwd_alpha)
         ax.set_ylabel(ylabel)
-        ax.legend(fontsize=7, loc='best')
-        # x-label only on bottom panel (shared x suppresses the others)
-        if k == nc - 1:
-            ax.set_xlabel(r'$\mu_0 H$  (T)')
+        ax.legend(fontsize=6, loc='best')
+
+    H_fwd_T = result['fwd_H_Oe'] * 1e-4
+    H_bwd_T = (result['bwd_H_Oe'] * 1e-4
+               if result['has_bwd'] and result.get('bwd_H_Oe') is not None
+               else None)
+
+    # Panel 0 — V_y
+    _plot_pair(axes[0], H_fwd_T, result['fwd_Vy_V'],
+               H_bwd_T, result.get('bwd_Vy_V'),
+               r'$V_y$ (Hall, V)')
+
+    # Panel 1 — V_x
+    _plot_pair(axes[1], H_fwd_T, result['fwd_Vx_V'],
+               H_bwd_T, result.get('bwd_Vx_V'),
+               r'$V_x$ (MR, V)')
+
+    # Panel 2 — Phase (both Hall and MR channels on the same panel)
+    ax_ph = axes[2]
+    th_H_fwd  = result.get('fwd_theta_H')
+    th_MR_fwd = result.get('fwd_theta_MR')
+    th_H_bwd  = result.get('bwd_theta_H')
+    th_MR_bwd = result.get('bwd_theta_MR')
+
+    if th_H_fwd is not None and np.any(np.isfinite(th_H_fwd)):
+        ax_ph.plot(H_fwd_T, th_H_fwd, color=c['fwd'], lw=0.8, ls='-',
+                   label=r'$\theta_H$ fwd')
+        if H_bwd_T is not None and th_H_bwd is not None:
+            ax_ph.plot(H_bwd_T, th_H_bwd, color=c['bwd'], lw=0.8, ls='-',
+                       label=r'$\theta_H$ bwd', alpha=0.7)
+    if th_MR_fwd is not None and np.any(np.isfinite(th_MR_fwd)):
+        ax_ph.plot(H_fwd_T, th_MR_fwd, color=c['fwd'], lw=0.8, ls='--',
+                   label=r'$\theta_{MR}$ fwd', alpha=0.8)
+        if H_bwd_T is not None and th_MR_bwd is not None:
+            ax_ph.plot(H_bwd_T, th_MR_bwd, color=c['bwd'], lw=0.8, ls='--',
+                       label=r'$\theta_{MR}$ bwd', alpha=0.6)
+    ax_ph.set_ylabel(r'Phase (deg)')
+    ax_ph.legend(fontsize=6, loc='best', ncol=2)
+    # Shade where phase is random → SC state (std > 20°) on fwd branch
+    if th_MR_fwd is not None and np.any(np.isfinite(th_MR_fwd)):
+        window = 7
+        n = len(th_MR_fwd)
+        local_std = np.array([
+            np.std(th_MR_fwd[max(0, i-window):min(n, i+window+1)])
+            for i in range(n)
+        ])
+        sc_mask = local_std > 20.0   # same threshold as _detect_H_irr_from_phase
+        if np.any(sc_mask):
+            ax_ph.fill_between(H_fwd_T, ax_ph.get_ylim()[0], ax_ph.get_ylim()[1],
+                                where=sc_mask, color='gray', alpha=0.15,
+                                label='SC (unstable phase)')
+
+    # Panel 3 — T_sample (optional)
+    if show_T:
+        _plot_pair(axes[3], H_fwd_T, result['fwd_T_K'],
+                   H_bwd_T, result.get('bwd_T_K'),
+                   r'$T_{\rm sample}$ (K)')
+
+    # x-axis label on bottom panel only
+    axes[nc - 1].set_xlabel(r'$\mu_0 H$ (T)')
 
     return fig, axes
  
@@ -2741,39 +2763,50 @@ def plot_muH_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
  
 def plot_cot_theta_vs_T2(results_list, cot_fit=None, ax=None,
                            figsize=None, color='tab:purple'):
-    """cot(θ_H) vs T² with optional α·T² + β fit overlay.
- 
-    Parameters
-    ----------
-    results_list : list of dict
-        Multi-T analyze_hall_mr outputs.
-    cot_fit : dict, optional
-        Output of fit_cot_theta_vs_T2.  If provided, the fit line is drawn.
- 
-    Returns
-    -------
-    ax
+    """cot(θ_H) vs T² — uses cot_theta_scalar (mean over fit window),
+    matching the printed terminal values exactly.
+    NaN entries (always-SC, no normal state) are excluded from the plot.
     """
     created = ax is None
     if created:
         w = (figsize[0] if figsize else 8.6) / 2.54
-        h = (figsize[1] if figsize else 7)  / 2.54
+        h = (figsize[1] if figsize else 7.0) / 2.54
         fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
- 
-    T   = np.array([r['T_nominal_K']     for r in results_list])
-    ct  = np.array([r['cot_theta_at_Href'] for r in results_list])
 
-    ax.plot(T**2, ct, 'o', color=color, ms=4, label=r'$\cot\theta_H$')
- 
+    T   = np.array([r['T_nominal_K']     for r in results_list])
+    ct  = np.array([r['cot_theta_scalar'] for r in results_list])
+
+    # Explicit NaN filter — do NOT rely on matplotlib to hide NaN markers
+    finite = np.isfinite(ct) & np.isfinite(T)
+    if not np.any(finite):
+        ax.set_xlabel(r'$T^2$ (K²)')
+        ax.set_ylabel(r'$\cot\theta_H$')
+        ax.set_title(r'$\cot\theta_H$ vs $T^2$  (no valid data)')
+        return ax
+
+    ax.plot(T[finite]**2, ct[finite], 'o', color=color, ms=4,
+            label=r'$\cot\theta_H$ (mean over fit window)')
+
     if cot_fit is not None and cot_fit['poly'] is not None:
-        T2_fit = np.linspace(0, (T**2).max() * 1.05, 300)
-        ax.plot(T2_fit, cot_fit['poly'](T2_fit), color='k', ls='--',
-                lw=1.0,
-                label=(rf"$\alpha T^2+\beta$, $\alpha={cot_fit['alpha']:.3g}$ K⁻²,"
-                        rf" $R^2={cot_fit['R2']:.3f}$"))
- 
+        T2_plot = np.linspace(0, (T[finite]**2).max() * 1.05, 300)
+        ax.plot(T2_plot, cot_fit['poly'](T2_plot), color='k', ls='--', lw=1.0,
+                label=(rf"$\alpha T^2+\beta$,  "
+                        rf"$\alpha={cot_fit['alpha']:.3g}$ K$^{{-2}}$,  "
+                        rf"$R^2={cot_fit['R2']:.3f}$"))
+
+    # Mark excluded (NaN/SC) temperatures if any
+    n_excl = int(np.sum(~finite))
+    if n_excl > 0:
+        excl_T = T[~finite]
+        ax.annotate(
+            f"{n_excl} T excluded (always SC): "
+            f"{[f'{v:.0f} K' for v in excl_T]}",
+            xy=(0.02, 0.97), xycoords='axes fraction',
+            va='top', fontsize=6, color='gray'
+        )
+
     ax.set_xlabel(r'$T^2$ (K²)')
-    ax.set_ylabel(r'$\cot\theta_H$ (dimensionless)')
+    ax.set_ylabel(r'$\cot\theta_H$  (dimensionless)')
     ax.set_title(r'Strange-metal diagnostic: $\cot\theta_H\propto T^2$')
     ax.legend()
     return ax
@@ -3413,12 +3446,27 @@ def _run_Hall_MR(args):
     for i, (fwd, bwd, cmt, lbl) in enumerate(
         zip(args.fwd_files, bwd_files, comments, T_labels)
     ):
-        if cmt is not None:
-            meta = parse_hall_mr_comments(cmt)
-            print(f"\n  Comments ({os.path.basename(cmt)}):")
-            for line in meta['raw']:
-                print(f"    {line}")
- 
+        # ── Banner — printed BEFORE anything else for this temperature ──────
+        T_display = lbl if lbl else "auto"
+        print(f"\n{'═'*62}")
+        print(f"  Scan {i+1}/{n_T}   T = {T_display}")
+        print(f"  fwd : {os.path.basename(fwd)}")
+        if bwd:
+            print(f"  bwd : {os.path.basename(bwd)}")
+        print(f"{'─'*62}")
+
+        # ── Comments — immediately after banner, before any analysis ────────
+        for cmt_path, label in [(cmt, 'comments')]:
+            if cmt_path is not None and os.path.isfile(cmt_path):
+                meta = parse_hall_mr_comments(cmt_path)
+                print(f"  [{label}]")
+                for line in meta['raw']:
+                    if line.strip():
+                        print(f"    {line}")
+                print(f"  {'─'*56}")
+
+        # ── Analysis (prints spikes / trim / H_irr / results internally) ────
+        #    All internal messages now come after the banner and comments.
         result = analyze_hall_mr(
             fwd_source       = fwd,
             bwd_source       = bwd,
@@ -3433,41 +3481,38 @@ def _run_Hall_MR(args):
             V_cell_per_Z_A3  = args.V_cell_Z,
             fit_H_range_Oe   = (tuple(args.fit_H_range)
                                  if args.fit_H_range else None),
-            rho_xx0_field_Oe = args.rho_xx_field,
+            rho_xx0_field_Oe = (args.rho_xx_field
+                                 if args.rho_xx_field else None),
             T_label          = lbl,
             n_grid           = args.n_grid,
         )
         results.append(result)
+
+        # ── Per-temperature figures ─────────────────────────────────────────
         T_str = f"{int(round(result['T_nominal_K']))}K"
- 
-        # ── Per-temperature figures ───────────────────────────────────────
         set_paper_style()
- 
-        # Raw voltages
+
         fig_raw, _ = plot_hall_raw(result, show_T=args.show_T,
                                     figsize=args.figsize)
         path = f"{base}_raw_{T_str}{ext}"
         fig_raw.savefig(path, dpi=300)
         plt.close(fig_raw)
         print(f"  Saved {path}")
- 
-        # Antisymmetrized Hall
+
         fig_ah, ax_ah = plt.subplots(figsize=fs, constrained_layout=True)
         plot_hall_antisym(result, ax=ax_ah)
         path = f"{base}_ryx_{T_str}{ext}"
         fig_ah.savefig(path, dpi=300)
         plt.close(fig_ah)
         print(f"  Saved {path}")
- 
-        # Symmetrized MR
+
         fig_rx, ax_rx = plt.subplots(figsize=fs, constrained_layout=True)
         plot_rho_xx(result, ax=ax_rx)
         path = f"{base}_rxx_{T_str}{ext}"
         fig_rx.savefig(path, dpi=300)
         plt.close(fig_rx)
         print(f"  Saved {path}")
- 
-        # Normalised MR
+
         if np.any(np.isfinite(result['MR'])):
             fig_mr, ax_mr = plt.subplots(figsize=fs, constrained_layout=True)
             plot_MR_hall(result, ax=ax_mr)
@@ -3475,6 +3520,9 @@ def _run_Hall_MR(args):
             fig_mr.savefig(path, dpi=300)
             plt.close(fig_mr)
             print(f"  Saved {path}")
+
+        # ── Closing divider ─────────────────────────────────────────────────
+        print(f"{'═'*62}")
  
     # ── Multi-temperature figures (only if >1 temperature) ────────────────
     if n_T > 1:
