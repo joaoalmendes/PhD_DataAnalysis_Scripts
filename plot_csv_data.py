@@ -2223,6 +2223,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
     n_H_m3 = n_H_cm3 = p = mu_H_SI = mu_H_cm2 = np.nan
     cot_theta_scalar = cot_theta_at_ref = H_ref_Oe = np.nan
     rxx_ref = np.nan
+    ryx_at_ref_Ohm_m = np.nan
     fit_mask = np.zeros(len(H_pos), dtype=bool)
 
     # cot(θ_H) array — computed regardless of SC state (used for plotting)
@@ -2277,18 +2278,27 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                     UserWarning, stacklevel=2
                 )
 
-            # cot(θ_H) scalars — guarded against empty/all-NaN fit window
-            if np.any(fit_mask):
-                cot_in_window = cot_theta[fit_mask]
-                cot_finite    = cot_in_window[np.isfinite(cot_in_window)]
-                cot_theta_scalar = (float(np.mean(cot_finite))
-                                    if len(cot_finite) > 0 else np.nan)
-                H_ref_Oe = float(np.mean(H_pos[fit_mask]))
-                cot_theta_at_ref = float(
-                    np.interp(H_ref_Oe, H_pos[np.isfinite(cot_theta)],
-                               cot_theta[np.isfinite(cot_theta)])
-                    if np.any(np.isfinite(cot_theta)) else np.nan
-                )
+                        # ── cot(θ_H) from fitted ρ_yx (immune to low-field noise) ──────
+            # Using the raw antisymmetrised ryx_odd to compute cot_theta is
+            # unreliable when the Hall signal is a tiny fraction of the total
+            # measured voltage (e.g. <1% at 200K in Bi-2201). Interpolation
+            # offsets between the fwd/bwd H grids introduce noise at low H that
+            # dominates ryx_odd there, driving cot_theta → ∞ at sign crossings
+            # and wildly inflating any mean.
+            # Fix: use the fitted ryx = R_H × B + offset (smooth, high-field
+            # constrained) evaluated at H_ref = the maximum field in the fit
+            # window, where the Hall SNR is largest.
+            H_ref_Oe = float(H_pos[fit_mask].max())
+            B_ref    = H_ref_Oe * _HALL_Oe_to_T
+            ryx_fit_at_ref = R_H * B_ref + RH_offset
+            rxx_at_ref     = float(np.interp(H_ref_Oe, H_pos, rxx_even_pos))
+
+            if abs(ryx_fit_at_ref) > 1e-20:
+                cot_theta_scalar  = rxx_at_ref / abs(ryx_fit_at_ref)
+                cot_theta_at_ref  = cot_theta_scalar   # same quantity, consistent
+            else:
+                cot_theta_scalar = cot_theta_at_ref = np.nan
+            ryx_at_ref_Ohm_m = ryx_fit_at_ref   # store for multi-T plot
 
     # ── 7. MR quantities ──────────────────────────────────────────────────
     rxx0 = float(np.interp(0.0, H_sym, rxx_even))
@@ -2369,6 +2379,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'H_asym_Oe':       H_asym,
         'ryx_odd_pos':     ryx_odd_pos,    # Ω·m, positive-H half
         'ryx_odd_full':    ryx_odd,        # Ω·m, ±H
+        'ryx_at_ref_Ohm_m':   ryx_at_ref_Ohm_m,
         'B_pos_T':         B_pos,
         # ── Processed: symmetrized MR ────────────────────────────────────
         'H_sym_Oe':        H_sym,
@@ -2902,6 +2913,94 @@ def plot_HT_scaling(results_list, ax=None, figsize=None):
         plt.tight_layout()
     return ax
 
+def plot_rxx_vs_T(results_list, ax=None, figsize=None, color='tab:blue'):
+    """ρ_xx(H_ref) vs T with a linear fit (expected for strange-metal cuprates).
+
+    ρ_xx is taken at the reference field used for each temperature's analysis
+    (H_irr for SC-at-low-H temperatures, H→0 for fully-normal temperatures),
+    so it represents the normal-state longitudinal resistivity.
+
+    Parameters
+    ----------
+    results_list : list of dict
+        Multi-T outputs of analyze_hall_mr.
+
+    Returns
+    -------
+    ax
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7.0) / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    T    = np.array([r['T_nominal_K']    for r in results_list])
+    rxx  = np.array([r['rxx_ref_Ohm_m']  for r in results_list])
+
+    finite = np.isfinite(rxx) & np.isfinite(T)
+    rxx_uOcm = _to_uOhm_cm(rxx)
+
+    ax.plot(T[finite], rxx_uOcm[finite], 'o', color=color, ms=4, zorder=3,
+            label=r'$\rho_{xx}(H_{\rm ref})$')
+
+    # Linear fit: ρ_xx = A·T + B  (strange-metal / bad-metal T-linear scattering)
+    if np.sum(finite) >= 2:
+        coeffs, cov = np.polyfit(T[finite], rxx_uOcm[finite], deg=1, cov=True)
+        A, B     = float(coeffs[0]), float(coeffs[1])
+        A_err    = float(np.sqrt(cov[0, 0]))
+        T_fit    = np.linspace(T[finite].min(), T[finite].max(), 300)
+        ax.plot(T_fit, np.polyval(coeffs, T_fit), color='k', ls='--', lw=1.0,
+                label=rf'$A\cdot T+B$,  $A={A:.3g}\pm{A_err:.1g}$ µΩ·cm/K')
+        print(
+            f"\n  ρ_xx(T) linear fit:\n"
+            f"  A (dρ/dT)  = {A:.4g} ± {A_err:.2g}  µΩ·cm/K\n"
+            f"  B (T=0)    = {B:.4g}  µΩ·cm\n"
+            f"  [excludes {np.sum(~finite)} NaN temperatures]"
+        )
+
+    ax.set_xlabel(r'$T$ (K)')
+    ax.set_ylabel(r'$\rho_{xx}(H_{\rm ref})$ (µΩ·cm)')
+    ax.set_title(r'Longitudinal resistivity $\rho_{xx}$ vs $T$')
+    ax.legend()
+    return ax
+
+
+def plot_ryx_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
+    """ρ_yx (fitted Hall signal) vs T — no fit, for visual inspection.
+
+    ρ_yx is taken from the R_H linear fit evaluated at H_ref (the maximum
+    field in the fit window), so it is immune to the low-field antisymmetri-
+    sation noise that plagues the raw ryx_odd at small Hall-to-misalignment
+    signal ratios.
+
+    Returns
+    -------
+    ax
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7.0) / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    T    = np.array([r['T_nominal_K']       for r in results_list])
+    ryx  = np.array([r['ryx_at_ref_Ohm_m']  for r in results_list])
+
+    finite = np.isfinite(ryx) & np.isfinite(T)
+    ryx_uOcm = _to_uOhm_cm(ryx)
+
+    ax.plot(T[finite], ryx_uOcm[finite], 'o', color=color, ms=4,
+            label=r'$\rho_{yx}(H_{\rm ref})$ from R_H fit')
+
+    ax.axhline(0, color='gray', ls=':', lw=0.5)
+    ax.set_xlabel(r'$T$ (K)')
+    ax.set_ylabel(r'$\rho_{yx}(H_{\rm ref})$ (µΩ·cm)')
+    ax.set_title(r'Hall resistivity $\rho_{yx}$ vs $T$ (fitted, at $H_{\rm ref}$)')
+    ax.legend()
+    if created:
+        plt.tight_layout()
+    return ax
 
 # ==================================================================
 # Command-line interface
@@ -3564,6 +3663,22 @@ def _run_Hall_MR(args):
         path = f"{base}_multiT_HT_scaling{ext}"
         fig_ht.savefig(path, dpi=300)
         plt.close(fig_ht)
+        print(f"  Saved {path}")
+
+        # ρ_xx(H_ref) vs T — linear fit
+        fig_rxxT, ax_rxxT = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_rxx_vs_T(results, ax=ax_rxxT)
+        path = f"{base}_multiT_rxx_vs_T{ext}"
+        fig_rxxT.savefig(path, dpi=300)
+        plt.close(fig_rxxT)
+        print(f"  Saved {path}")
+
+        # ρ_yx(H_ref) vs T — no fit
+        fig_ryxT, ax_ryxT = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_ryx_vs_T(results, ax=ax_ryxT)
+        path = f"{base}_multiT_ryx_vs_T{ext}"
+        fig_ryxT.savefig(path, dpi=300)
+        plt.close(fig_ryxT)
         print(f"  Saved {path}")
 
 
