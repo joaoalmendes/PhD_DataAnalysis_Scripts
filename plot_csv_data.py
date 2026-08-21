@@ -334,14 +334,14 @@ def _remove_channel_spikes(df, sigma_thresh=5.0, min_channels=3):
               f"({'Oe' if H_col else 'index'})")
         # Interpolate ALL columns at spike positions (not just probe channels)
         for col in df.columns:
-            x = df[col].to_numpy(dtype=float)
+            x = df[col].to_numpy(dtype=float).copy()
             for idx in spike_idx:
                 x[idx] = (x[idx - 1] + x[idx + 1]) / 2.0
             df[col] = x
 
     return df
  
-def load_hall_mr_csv(csv_path, hall_n, mr_n, hall_col='X', mr_col='X'):
+def load_hall_mr_csv(csv_path, hall_n, mr_n, hall_col='R', mr_col='R'):
     """Load one Hall/MR field-sweep CSV file from the custom rack.
  
     Each file contains one complete sweep direction
@@ -357,7 +357,8 @@ def load_hall_mr_csv(csv_path, hall_n, mr_n, hall_col='X', mr_col='X'):
     mr_n : int
         LIA channel number measuring the longitudinal (MR) voltage.
     hall_col : {'X', 'R'}
-        'X' → in-phase component (recommended); 'R' → magnitude.
+        Voltage channel: 'R' → magnitude (default, correct for this setup);
+        'X' → in-phase component.
     mr_col : {'X', 'R'}
  
     Returns
@@ -758,7 +759,7 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
     elif plot_type == "dv":
         x, y = I_ma, dV_uv
         xlabel = "Current (mA)"
-        ylabel = "dV ($\mu$V)"
+        ylabel = r"dV ($\mu$V)"
     elif plot_type == "di":
         x, y = I_ma, dI_ma
         xlabel = "Current (mA)"
@@ -1974,46 +1975,16 @@ def _symmetrize(H_grid, rho):
 def _detect_H_irr_from_phase(H_sorted, theta_sorted,
                                window=7, std_threshold=5.0,
                                min_normal_frac=0.9):
-    """Detect the irreversibility field H_irr from lock-in phase stability.
+    """Detect H_irr from lock-in phase stability (legacy helper).
 
-    In the SC state the measured voltage → 0 and the lock-in phase becomes
-    random (large local variance). In the normal state the phase is stable.
-    H_irr is the lowest field at which the phase becomes stable and stays
-    stable for the remainder of the sweep.
-
-    Parameters
-    ----------
-    H_sorted : ndarray
-        Positive field values, sorted ascending (Oe).
-    theta_sorted : ndarray
-        Phase values (degrees) at the corresponding H points.
-    window : int
-        Half-width (in data points) of the rolling-std window.
-    std_threshold : float
-        Std (degrees) below which the phase is considered 'stable'
-        (normal state). Default 20° is conservative — a random signal
-        has std ≈ 104°.
-    min_normal_frac : float
-        Fraction of remaining points (from candidate H_irr onward) that
-        must also be stable to confirm the transition. Prevents early
-        false positives from a momentarily quiet SC phase.
-
-    Returns
-    -------
-    float or None
-        H_irr in Oe, or None if no stable (normal-state) region is found
-        (sample remains SC throughout the measured field range).
+    Prefer ``_detect_H_irr`` which combines magnitude and phase.
     """
     n = len(H_sorted)
     if n < 2 * window + 2:
         return None
-
-    # Only use finite theta values
     valid = np.isfinite(theta_sorted)
     if not np.any(valid):
         return None
-
-    # Rolling std of phase over sliding window
     local_std = np.full(n, np.inf)
     for i in range(n):
         lo = max(0, i - window)
@@ -2022,21 +1993,70 @@ def _detect_H_irr_from_phase(H_sorted, theta_sorted,
         finite_vals = vals[np.isfinite(vals)]
         if len(finite_vals) >= 3:
             local_std[i] = float(np.std(finite_vals))
-
     is_stable = local_std < std_threshold
-
-    # Find the lowest H where is_stable, AND at least min_normal_frac of
-    # all subsequent points are also stable → confirms entry into normal state.
     for i in range(n):
         if is_stable[i]:
             remaining = is_stable[i:]
             if np.mean(remaining) >= min_normal_frac:
                 return float(H_sorted[i])
-
     return None
 
+
+def _detect_H_irr(H_sorted, R_sorted=None, theta_sorted=None,
+                  plateau_frac=0.90, min_normal_frac=0.85,
+                  phase_window=7, phase_std_thresh=10.0,
+                  smooth_pts=11):
+    """Robust irreversibility-field detection combining magnitude & phase.
+
+    Primary criterion: smoothed |R| reaches plateau_frac of high-field median
+    and stays there. Secondary: phase rolling-std becomes quiet. When both
+    succeed, the more conservative (higher) H_irr is returned.
+    """
+    n = len(H_sorted)
+    if n < 10:
+        return None
+
+    H_irr_mag = None
+    if R_sorted is not None and np.any(np.isfinite(R_sorted)):
+        R = np.asarray(R_sorted, dtype=float)
+        k = max(3, int(smooth_pts) | 1)
+        kernel = np.ones(k) / k
+        R_pad = np.pad(R, (k // 2, k // 2), mode='edge')
+        R_s = np.convolve(R_pad, kernel, mode='valid')
+        if len(R_s) != n:
+            R_s = R_s[:n]
+        H_hi = float(np.nanmax(H_sorted))
+        hi_mask = H_sorted >= 0.8 * H_hi
+        if not np.any(hi_mask):
+            hi_mask = np.ones(n, dtype=bool)
+        R_high = float(np.nanmedian(R_s[hi_mask]))
+        if np.isfinite(R_high) and abs(R_high) >= 1e-30:
+            thresh = plateau_frac * abs(R_high)
+            above = np.abs(R_s) >= thresh
+            for i in range(n):
+                if above[i] and np.mean(above[i:]) >= min_normal_frac:
+                    H_irr_mag = float(H_sorted[i])
+                    break
+
+    H_irr_phase = None
+    if theta_sorted is not None and np.any(np.isfinite(theta_sorted)):
+        H_irr_phase = _detect_H_irr_from_phase(
+            H_sorted, theta_sorted,
+            window=phase_window,
+            std_threshold=phase_std_thresh,
+            min_normal_frac=min_normal_frac,
+        )
+
+    candidates = [h for h in (H_irr_mag, H_irr_phase) if h is not None]
+    if not candidates:
+        return None
+    if H_irr_mag is not None and H_irr_phase is not None:
+        return max(H_irr_mag, H_irr_phase)
+    return candidates[0]
+
+
 def analyze_hall_mr(fwd_source, bwd_source=None,
-                     hall_n=1, mr_n=2, hall_col='X', mr_col='X',
+                     hall_n=1, mr_n=2, hall_col='R', mr_col='R',
                      current=1e-6,
                      t=1e-9, w=None, l=None,
                      V_cell_per_Z_A3=_BI2201_VCELL_PER_Z_A3,
@@ -2056,6 +2076,18 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
     like the Hall signal); verify T stability across the sweep and check
     for non-zero ρ_yx(H→0) as a Nernst diagnostic.
  
+    How the final ρ_yx is obtained
+    ------------------------------
+    * If only a forward sweep is supplied: interpolate onto a common H grid,
+      then antisymmetrize → ρ_yx^odd.
+    * If both forward and backward sweeps are supplied: each sweep is first
+      interpolated onto the *same* common H grid; the two ρ_yx grids are
+      *averaged*, and only then is the average antisymmetrized.  Averaging
+      first suppresses slow thermal drift.  Independently antisymmetrized
+      fwd and bwd traces are also stored (``ryx_odd_fwd_full``,
+      ``ryx_odd_bwd_full``) for hysteresis checks via
+      ``plot_hall_antisym_fwd_bwd``.
+ 
     Parameters
     ----------
     fwd_source : str or dict
@@ -2070,7 +2102,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
     mr_n : int
         LIA channel number for the longitudinal (MR) voltage.
     hall_col, mr_col : {'X', 'R'}
-        'X' = in-phase output (recommended); 'R' = magnitude.
+        Voltage channel: 'R' = magnitude (default); 'X' = in-phase.
     current : float
         Source current in Amperes.
     t : float
@@ -2138,21 +2170,34 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
     ryx_f = (Vy_f / current) * t
     rxx_f = (Vx_f / current) * geom_xx
  
-    ryx_g = _interp_to_grid(H_f, ryx_f, H_grid)
-    rxx_g = _interp_to_grid(H_f, rxx_f, H_grid)
+    ryx_g_fwd = _interp_to_grid(H_f, ryx_f, H_grid)
+    rxx_g_fwd = _interp_to_grid(H_f, rxx_f, H_grid)
+    ryx_g = ryx_g_fwd.copy()
+    rxx_g = rxx_g_fwd.copy()
  
+    ryx_g_bwd = None
+    rxx_g_bwd = None
     if bwd is not None:
         ryx_b = (Vy_b / current) * t
         rxx_b = (Vx_b / current) * geom_xx
-        ryx_g = (ryx_g + _interp_to_grid(H_b, ryx_b, H_grid)) / 2.0
-        rxx_g = (rxx_g + _interp_to_grid(H_b, rxx_b, H_grid)) / 2.0
+        ryx_g_bwd = _interp_to_grid(H_b, ryx_b, H_grid)
+        rxx_g_bwd = _interp_to_grid(H_b, rxx_b, H_grid)
+        # Average first (suppresses thermal drift), then antisymmetrize below
+        ryx_g = (ryx_g_fwd + ryx_g_bwd) / 2.0
+        rxx_g = (rxx_g_fwd + rxx_g_bwd) / 2.0
  
     # ── 5. Antisymmetrize Hall, symmetrize MR ─────────────────────────────
+    ryx_odd_fwd_full = None
+    ryx_odd_bwd_full = None
+    H_asym_fwd = H_asym_bwd = None
+
     if np.any(H_grid < 0) and np.any(H_grid > 0):
         H_pos, ryx_odd_pos, H_asym, ryx_odd = _antisymmetrize(H_grid, ryx_g)
         H_pos, rxx_even_pos, H_sym,  rxx_even = _symmetrize(H_grid, rxx_g)
+        _, _, H_asym_fwd, ryx_odd_fwd_full = _antisymmetrize(H_grid, ryx_g_fwd)
+        if ryx_g_bwd is not None:
+            _, _, H_asym_bwd, ryx_odd_bwd_full = _antisymmetrize(H_grid, ryx_g_bwd)
     else:
-        # Sweep does not cross zero — can only return raw data
         warnings.warn(
             "H sweep does not cross zero; antisymmetrization not possible. "
             "Raw ρ_yx and ρ_xx are returned without symmetrization.",
@@ -2167,28 +2212,37 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         H_sym        = H_grid
         rxx_even     = rxx_g
  
-    B_pos = H_pos * _HALL_Oe_to_T     # Tesla
+    B_pos = H_pos * _HALL_Oe_to_T
 
-    # ── 5b. Auto-detect H_irr from MR phase (if fit range not user-supplied) ──
-    # Use the positive H branch of the forward sweep's MR phase channel.
+    # ── 5b. Auto-detect H_irr (magnitude + phase) ──
     _user_supplied_fit_range  = fit_H_range_Oe is not None
     _user_supplied_rho_ref    = rho_xx0_field_Oe is not None and rho_xx0_field_Oe > 0
 
-    always_sc = False   # assume normal state accessible until proven otherwise
+    always_sc = False
 
     pos_mask_f = H_f > 0
-    if np.any(pos_mask_f) and not np.all(np.isnan(thMR_f)):
+    if np.any(pos_mask_f):
         _H_det   = H_f[pos_mask_f]
-        _th_det  = thMR_f[pos_mask_f]
         _ord_det = np.argsort(_H_det)
         _H_det_s = _H_det[_ord_det]
-        _th_det_s = _th_det[_ord_det]
+        _R_det_s = np.abs(Vx_f[pos_mask_f][_ord_det])
+        _th_det_s = (thMR_f[pos_mask_f][_ord_det]
+                     if not np.all(np.isnan(thMR_f)) else None)
+        _thH_det_s = (thH_f[pos_mask_f][_ord_det]
+                      if not np.all(np.isnan(thH_f)) else None)
 
-        H_irr_detected = _detect_H_irr_from_phase(_H_det_s, _th_det_s)
+        H_irr_detected = _detect_H_irr(
+            _H_det_s, R_sorted=_R_det_s, theta_sorted=_th_det_s,
+        )
+        if H_irr_detected is None and _thH_det_s is not None:
+            H_irr_detected = _detect_H_irr(
+                _H_det_s, R_sorted=np.abs(Vy_f[pos_mask_f][_ord_det]),
+                theta_sorted=_thH_det_s,
+            )
     else:
         H_irr_detected = None
         warnings.warn(
-            "MR phase channel (theta_MR) is all-NaN; cannot auto-detect H_irr. "
+            "No positive-H points available; cannot auto-detect H_irr. "
             "Pass --fit-H-range manually.",
             UserWarning, stacklevel=2
         )
@@ -2197,12 +2251,13 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         if H_irr_detected is not None:
             H_max_pos = float(H_pos.max()) if len(H_pos) > 0 else 0.0
             fit_H_range_Oe = (H_irr_detected, H_max_pos)
-            print(f"  [auto] H_irr ≈ {H_irr_detected:.0f} Oe from MR phase; "
+            print(f"  [auto] H_irr ≈ {H_irr_detected:.0f} Oe "
+                  f"(magnitude+phase); "
                   f"fit range set to [{H_irr_detected:.0f}, {H_max_pos:.0f}] Oe")
         else:
             always_sc = True
             print(
-                f"\n  ⚠  No normal state detected in θ_MR across the entire "
+                f"\n  ⚠  No normal state detected across the entire "
                 f"measured field range — sample appears SC at all measured fields. "
                 f"R_H, n_H, p, µ_H cannot be extracted at T = {T_label}.\n"
                 f"  Raw ρ_yx and ρ_xx are still computed and returned for plotting."
@@ -2312,28 +2367,6 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
             np.abs(cot_theta) > 1e-10, 1.0 / cot_theta**2, np.nan
         )
  
-    # ── 7. Derived Hall quantities ─────────────────────────────────────────
-    n_H_m3  = (1.0 / (_HALL_e * R_H)) if abs(R_H) > 1e-20 else np.nan
-    n_H_cm3 = n_H_m3 * 1e-6 if np.isfinite(n_H_m3) else np.nan
- 
-    # Doping: p = n_H · V_cell/Z − 1  (hole-doped convention; R_H > 0 → holes)
-    V_cell_m3 = V_cell_per_Z_A3 * _HALL_A3_to_m3
-    p = abs(n_H_m3) * V_cell_m3 - 1.0 if np.isfinite(n_H_m3) else np.nan
- 
-    # ρ_xx at reference field for µ_H denominator
-    rxx_ref = float(np.interp(rho_xx0_field_Oe, H_pos, rxx_even_pos))
-    if abs(rxx_ref) > 1e-20:
-        mu_H_SI   = abs(R_H) / abs(rxx_ref)    # m²/(V·s)
-        mu_H_cm2  = mu_H_SI * 1e4               # cm²/(V·s)
-    else:
-        mu_H_SI = mu_H_cm2 = np.nan
-        warnings.warn(
-            f"  ρ_xx (ref H)   = "
-            f"{_fmt(rxx_ref * to_uOcm) if np.isfinite(rxx_ref) else 'N/A'} µΩ·cm  "
-            f"(ref H = {f'{rho_xx0_field_Oe:.0f} Oe' if rho_xx0_field_Oe is not None else 'N/A (always SC)'})\n",
-            UserWarning, stacklevel=2
-        )
- 
     # ── 8. Console summary ────────────────────────────────────────────────
     to_uOcm = _HALL_Ohm_m_to_uOhm_cm
 
@@ -2356,7 +2389,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         f"  Hall/MR — T = {T_label}   "
         f"({'fwd+bwd' if bwd is not None else 'fwd only'})\n"
         f"{'─'*62}\n"
-        f"  H_irr (phase)  : {_hirr_display}\n"
+        f"  H_irr (mag+ph) : {_hirr_display}\n"
         f"  H fit range    : {fit_H_range_Oe}\n"
         f"  R_H            = {_fmt(R_H)} m³/C\n"
         f"  Fit offset     = {_fmt(RH_offset * to_uOcm if np.isfinite(RH_offset) else np.nan)} µΩ·cm\n"
@@ -2378,9 +2411,14 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'H_pos_Oe':        H_pos,
         'H_asym_Oe':       H_asym,
         'ryx_odd_pos':     ryx_odd_pos,    # Ω·m, positive-H half
-        'ryx_odd_full':    ryx_odd,        # Ω·m, ±H
+        'ryx_odd_full':    ryx_odd,        # Ω·m, ±H (from averaged grid)
         'ryx_at_ref_Ohm_m':   ryx_at_ref_Ohm_m,
         'B_pos_T':         B_pos,
+        # Independently antisymmetrized fwd / bwd (hysteresis check)
+        'ryx_odd_fwd_full': ryx_odd_fwd_full,
+        'ryx_odd_bwd_full': ryx_odd_bwd_full,
+        'H_asym_fwd_Oe':    H_asym_fwd,
+        'H_asym_bwd_Oe':    H_asym_bwd,
         # ── Processed: symmetrized MR ────────────────────────────────────
         'H_sym_Oe':        H_sym,
         'rxx_even_pos':    rxx_even_pos,   # Ω·m
@@ -2624,15 +2662,13 @@ def plot_hall_antisym(result, ax=None, color='tab:blue',
     R_H    = result['R_H_m3_C']
     offset = result['RH_offset_Ohm_m']
     H_fit  = result['H_asym_Oe'] * 1e-4  # same axis as plot
-    ryx_fit_uOcm = _to_uOhm_cm(R_H * H_fit + offset)
- 
-    # Shade the fit window
-    if result['fit_H_range_Oe'] is not None:
-        lo, hi = [v * 1e-4 for v in result['fit_H_range_Oe']]
-        ax.axvspan(lo, hi, color=fit_color, alpha=0.08, lw=0)
- 
-    ax.plot(H_fit, ryx_fit_uOcm, color=fit_color, ls='--', lw=1.0,
-            label=(rf"$R_H = {R_H*1e9:.3g}$ mm³/C"))
+    if np.isfinite(R_H):
+        ryx_fit_uOcm = _to_uOhm_cm(R_H * H_fit + offset)
+        if result['fit_H_range_Oe'] is not None:
+            lo, hi = [v * 1e-4 for v in result['fit_H_range_Oe']]
+            ax.axvspan(lo, hi, color=fit_color, alpha=0.08, lw=0)
+        ax.plot(H_fit, ryx_fit_uOcm, color=fit_color, ls='--', lw=1.0,
+                label=(rf"$R_H = {R_H*1e9:.3g}$ mm³/C"))
  
     ax.axhline(0, color='gray', lw=0.5, ls=':')
     ax.set_xlabel(r'$\mu_0 H$ (T)')
@@ -2644,6 +2680,43 @@ def plot_hall_antisym(result, ax=None, color='tab:blue',
     return ax
  
  
+
+def plot_hall_antisym_fwd_bwd(result, ax=None, figsize=None,
+                              color_fwd='tab:blue', color_bwd='tab:red'):
+    """Overlay independently antisymmetrized ρ_yx of fwd and bwd sweeps.
+
+    Useful to check for hysteresis (possible vortex dynamics in the
+    transverse voltage).  The analysis uses the antisymmetrization of the
+    *averaged* grid; this plot shows the two sweeps before that average.
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    if result.get('ryx_odd_fwd_full') is not None and result.get('H_asym_fwd_Oe') is not None:
+        H_T = result['H_asym_fwd_Oe'] * 1e-4
+        ryx = _to_uOhm_cm(result['ryx_odd_fwd_full'])
+        ax.plot(H_T, ryx, color=color_fwd, lw=0.9, label=r'fwd $\rho_{yx}^{\rm odd}$')
+    if result.get('ryx_odd_bwd_full') is not None and result.get('H_asym_bwd_Oe') is not None:
+        H_T = result['H_asym_bwd_Oe'] * 1e-4
+        ryx = _to_uOhm_cm(result['ryx_odd_bwd_full'])
+        ax.plot(H_T, ryx, color=color_bwd, lw=0.9, label=r'bwd $\rho_{yx}^{\rm odd}$')
+    elif not result.get('has_bwd'):
+        ax.text(0.5, 0.5, 'No backward sweep supplied',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=9, color='gray')
+
+    ax.axhline(0, color='gray', lw=0.5, ls=':')
+    ax.set_xlabel(r'$\mu_0 H$ (T)')
+    ax.set_ylabel(r'$\rho_{yx}^{\rm odd}$ ($\mu\Omega\cdot$cm)')
+    ax.legend()
+    if created:
+        ax.set_title(f"T = {result['T_label']}  (fwd vs bwd antisym)")
+    return ax
+
+
 def plot_rho_xx(result, ax=None, color='tab:blue', figsize=None):
     """Plot symmetrized ρ_xx^even(H) vs field.
  
@@ -2962,6 +3035,115 @@ def plot_rxx_vs_T(results_list, ax=None, figsize=None, color='tab:blue'):
     ax.set_xlabel(r'$T$ (K)')
     ax.set_ylabel(r'$\rho_{xx}(H_{\rm ref})$ (µΩ·cm)')
     ax.set_title(r'Longitudinal resistivity $\rho_{xx}$ vs $T$')
+    ax.legend()
+    return ax
+
+
+
+def compute_T_star(results_list, poly_deg=3, y_threshold=0.95,
+                   high_T_frac=0.4):
+    """Estimate the pseudogap onset temperature T* from ρ_xx(T).
+
+    1. Collect ρ_xx(H_ref) vs T.
+    2. Linear-fit the high-T subset: ρ = a·T + ρ₀.
+    3. y(T) = (ρ_xx − ρ₀)/(a·T)  → 1 in the T-linear regime.
+    4. Polynomial-fit y(T); T* = highest T where the fit crosses
+       y_threshold (default 0.95) from above.
+    """
+    T   = np.array([r['T_nominal_K']   for r in results_list], dtype=float)
+    rxx = np.array([r['rxx_ref_Ohm_m'] for r in results_list], dtype=float)
+    finite = np.isfinite(T) & np.isfinite(rxx)
+    T, rxx = T[finite], rxx[finite]
+    if len(T) < 3:
+        return {'T_star_K': np.nan, 'T_star_err_K': np.nan,
+                'a': np.nan, 'a_err': np.nan, 'rho0': np.nan,
+                'y': np.array([]), 'T': T, 'poly': None,
+                'y_threshold': y_threshold}
+
+    order = np.argsort(T)
+    T, rxx = T[order], rxx[order]
+    rxx_u = rxx * _HALL_Ohm_m_to_uOhm_cm
+
+    n_hi = max(2, int(np.ceil(high_T_frac * len(T))))
+    hi = slice(-n_hi, None)
+    coeffs_lin, cov_lin = np.polyfit(T[hi], rxx_u[hi], deg=1, cov=True)
+    a     = float(coeffs_lin[0])
+    rho0  = float(coeffs_lin[1])
+    a_err = float(np.sqrt(cov_lin[0, 0]))
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        y = (rxx_u - rho0) / (a * T)
+
+    deg = min(poly_deg, len(T) - 1)
+    poly_c = np.polyfit(T, y, deg=deg)
+    poly   = np.poly1d(poly_c)
+
+    T_dense = np.linspace(T.min(), T.max(), 2000)
+    y_dense = poly(T_dense)
+    above = y_dense >= y_threshold
+    T_star = np.nan
+    for i in range(len(T_dense) - 1, 0, -1):
+        if above[i] and not above[i - 1]:
+            t1, t2 = T_dense[i - 1], T_dense[i]
+            y1, y2 = y_dense[i - 1], y_dense[i]
+            T_star = t1 + (y_threshold - y1) * (t2 - t1) / (y2 - y1 + 1e-30)
+            break
+    if not np.isfinite(T_star):
+        T_star = float(T.min()) if np.all(y_dense >= y_threshold) else float(T.max())
+
+    resid = y - poly(T)
+    rms = float(np.sqrt(np.mean(resid**2))) if len(resid) else np.nan
+    slope = float(np.polyder(poly)(T_star)) if np.isfinite(T_star) else np.nan
+    T_star_err = abs(rms / slope) if (np.isfinite(slope) and abs(slope) > 1e-12) else np.nan
+
+    print(
+        f"\n  T* (pseudogap) estimate:\n"
+        f"  a = dρ/dT  = {a:.4g} ± {a_err:.2g}  µΩ·cm/K  "
+        f"(from {n_hi} high-T points)\n"
+        f"  ρ₀         = {rho0:.4g}  µΩ·cm\n"
+        f"  T*         = {T_star:.1f} ± {T_star_err:.1f} K  "
+        f"(y crosses {y_threshold})\n"
+    )
+
+    return {
+        'T_star_K': T_star, 'T_star_err_K': T_star_err,
+        'a': a, 'a_err': a_err, 'rho0': rho0,
+        'y': y, 'T': T, 'poly': poly,
+        'y_threshold': y_threshold, 'rxx_uOhm_cm': rxx_u,
+    }
+
+
+def plot_T_star(results_list, tstar_result=None, ax=None, figsize=None,
+                color='tab:purple'):
+    """Plot (ρ_xx − ρ₀)/(a T) vs T and mark T*."""
+    if tstar_result is None:
+        tstar_result = compute_T_star(results_list)
+
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7.0) / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    T = tstar_result['T']
+    y = tstar_result['y']
+    if len(T) == 0:
+        return ax
+
+    ax.plot(T, y, 'o', color=color, ms=4, zorder=3,
+            label=r'$(\rho_{xx}-\rho_0)/(a\,T)$')
+    if tstar_result['poly'] is not None:
+        T_fit = np.linspace(T.min(), T.max(), 400)
+        ax.plot(T_fit, tstar_result['poly'](T_fit), 'k--', lw=1.0, label='poly fit')
+    ax.axhline(tstar_result['y_threshold'], color='gray', ls=':', lw=0.7)
+    Ts = tstar_result['T_star_K']
+    if np.isfinite(Ts):
+        ax.axvline(Ts, color='tab:red', ls='--', lw=1.0,
+                   label=rf"$T^*={Ts:.1f}\pm{tstar_result['T_star_err_K']:.1f}$ K")
+
+    ax.set_xlabel(r'$T$ (K)')
+    ax.set_ylabel(r'$(\rho_{xx}-\rho_0)/(a\,T)$')
+    ax.set_title(r'Pseudogap scaling — $T^*$')
     ax.legend()
     return ax
 
@@ -3620,6 +3802,14 @@ def _run_Hall_MR(args):
             plt.close(fig_mr)
             print(f"  Saved {path}")
 
+        # fwd vs bwd antisymmetrized ρ_yx (hysteresis / vortex check)
+        fig_fb, ax_fb = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_hall_antisym_fwd_bwd(result, ax=ax_fb)
+        path = f"{base}_ryx_fwd_bwd_{T_str}{ext}"
+        fig_fb.savefig(path, dpi=300)
+        plt.close(fig_fb)
+        print(f"  Saved {path}")
+
         # ── Closing divider ─────────────────────────────────────────────────
         print(f"{'═'*62}")
  
@@ -3679,6 +3869,15 @@ def _run_Hall_MR(args):
         path = f"{base}_multiT_ryx_vs_T{ext}"
         fig_ryxT.savefig(path, dpi=300)
         plt.close(fig_ryxT)
+        print(f"  Saved {path}")
+
+        # T* (pseudogap) from (ρ_xx − ρ₀)/(a T)
+        tstar = compute_T_star(results)
+        fig_ts, ax_ts = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_T_star(results, tstar_result=tstar, ax=ax_ts)
+        path = f"{base}_multiT_Tstar{ext}"
+        fig_ts.savefig(path, dpi=300)
+        plt.close(fig_ts)
         print(f"  Saved {path}")
 
 
