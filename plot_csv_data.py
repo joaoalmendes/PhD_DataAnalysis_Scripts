@@ -1602,6 +1602,251 @@ def fit_linear_RT(data, T_range, weighted=True, branch=None):
 # Superconducting transition temperature
 # ==================================================================
 
+def analyze_dRdT_RT(data):
+    """Compute dR/dT and determine Tc from the maximum dR/dT.
+
+    The derivative is calculated independently for each branch when
+    branch information is available.
+
+    Parameters
+    ----------
+    data : dict
+        Output of analyze_RT().
+
+    Returns
+    -------
+    dict
+        'dRdT' :
+            dR/dT evaluated at the original data points.
+
+        'Tc_branches' :
+            Dictionary containing Tc from max(dR/dT) for each branch.
+
+        'Tc' :
+            Mean Tc of all valid branches.
+
+        'T_max_dRdT' :
+            Temperature corresponding to max(dR/dT) for each branch.
+
+        'max_dRdT' :
+            Maximum derivative for each branch.
+    """
+    T = np.asarray(data["T"], dtype=float)
+    R = np.asarray(data["R"], dtype=float)
+
+    dRdT = np.full(T.shape, np.nan, dtype=float)
+
+    if "branch" in data:
+        branches = (
+            ("cooldown", data["branch"] == "cooldown"),
+            ("warmup", data["branch"] == "warmup"),
+        )
+    else:
+        branches = (
+            ("all", np.ones(T.shape, dtype=bool)),
+        )
+
+    Tc_branches = {}
+    T_max_dRdT = {}
+    max_dRdT = {}
+
+    for branch_name, branch_mask in branches:
+
+        idx = np.flatnonzero(
+            branch_mask
+            & np.isfinite(T)
+            & np.isfinite(R)
+        )
+
+        if len(idx) < 2:
+            continue
+
+        T_branch = T[idx]
+        R_branch = R[idx]
+
+        # Sort by temperature so the derivative is evaluated with
+        # increasing temperature.
+        order = np.argsort(T_branch)
+
+        T_sorted = T_branch[order]
+        R_sorted = R_branch[order]
+
+        # Repeated temperature values can occur in real measurements.
+        # Average R at identical T values before differentiating.
+        T_unique, inverse = np.unique(
+            T_sorted,
+            return_inverse=True,
+        )
+
+        if len(T_unique) < 2:
+            continue
+
+        R_sum = np.bincount(
+            inverse,
+            weights=R_sorted,
+        )
+
+        R_count = np.bincount(inverse)
+
+        R_unique = R_sum / R_count
+
+        # Numerical derivative dR/dT.
+        derivative = np.gradient(
+            R_unique,
+            T_unique,
+        )
+
+        # Put the derivative back onto the original data points.
+        dRdT[idx] = np.interp(
+            T_branch,
+            T_unique,
+            derivative,
+        )
+
+        # Tc = temperature at maximum dR/dT.
+        i_max = int(np.nanargmax(derivative))
+
+        Tc_value = float(T_unique[i_max])
+        maximum_derivative = float(derivative[i_max])
+
+        Tc_branches[branch_name] = Tc_value
+        T_max_dRdT[branch_name] = Tc_value
+        max_dRdT[branch_name] = maximum_derivative
+
+    valid_tc = list(Tc_branches.values())
+
+    if valid_tc:
+        Tc = float(np.mean(valid_tc))
+    else:
+        Tc = None
+
+    return {
+        "dRdT": dRdT,
+        "Tc_branches": Tc_branches,
+        "Tc": Tc,
+        "T_max_dRdT": T_max_dRdT,
+        "max_dRdT": max_dRdT,
+    }
+
+def plot_dRdT_RT(
+    data,
+    drdt_data,
+    ax,
+    show_branches=False,
+    branch_colors=None,
+    label=None,
+    color="tab:green",
+    linewidth=1.2,
+):
+    """Plot dR/dT on a secondary y-axis of an R(T) plot.
+
+    Parameters
+    ----------
+    data : dict
+        Output of analyze_RT().
+
+    drdt_data : dict
+        Output of analyze_dRdT_RT().
+
+    ax : matplotlib.axes.Axes
+        Main R(T) axes.
+
+    show_branches : bool
+        If True, plot cooldown and warmup derivatives separately.
+
+    branch_colors : dict, optional
+        Colors used for cooldown/warmup.
+
+    label : str, optional
+        Dataset label.
+
+    color : str
+        Derivative color when branches are not shown.
+
+    linewidth : float
+        Line width of derivative curve.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        The secondary derivative axis.
+    """
+    ax_drdt = ax.twinx()
+
+    T = np.asarray(data["T"], dtype=float)
+    dRdT = np.asarray(drdt_data["dRdT"], dtype=float)
+
+    if show_branches and "branch" in data:
+
+        colors = branch_colors or _default_RT_branch_colors()
+
+        for branch_name in ("cooldown", "warmup"):
+
+            mask = (
+                (data["branch"] == branch_name)
+                & np.isfinite(T)
+                & np.isfinite(dRdT)
+            )
+
+            if not np.any(mask):
+                continue
+
+            branch_label = (
+                f"{label} dR/dT ({branch_name})"
+                if label
+                else f"dR/dT ({branch_name})"
+            )
+
+            ax_drdt.plot(
+                T[mask],
+                dRdT[mask],
+                "-",
+                color=colors[branch_name],
+                linewidth=linewidth,
+                label=branch_label,
+            )
+
+    else:
+
+        mask = (
+            np.isfinite(T)
+            & np.isfinite(dRdT)
+        )
+
+        derivative_label = (
+            f"{label} dR/dT"
+            if label
+            else r"$dR/dT$"
+        )
+
+        ax_drdt.plot(
+            T[mask],
+            dRdT[mask],
+            "-",
+            color="r",
+            linewidth=linewidth,
+            label=derivative_label,
+        )
+
+    ax_drdt.set_ylabel(
+        r"$dR/dT$ ($\Omega$/K)"
+    )
+
+    # Keep the derivative axis synchronized with the R(T) x-axis.
+    ax_drdt.set_xlim(ax.get_xlim())
+
+    # Combine R(T) and dR/dT legends.
+    handles1, labels1 = ax.get_legend_handles_labels()
+    handles2, labels2 = ax_drdt.get_legend_handles_labels()
+
+    if handles1 or handles2:
+        ax.legend(
+            handles1 + handles2,
+            labels1 + labels2,
+        )
+
+    return ax_drdt
+
 def _find_Tc_crossing(T_sorted, R_sorted, R_threshold):
     """Find T where R crosses R_threshold upward (SC → normal state).
 
@@ -3513,114 +3758,270 @@ def plot_ryx_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
 
 def _add_RT_parser(subparsers):
     """Define the `RT` subcommand: arguments + help text only."""
-    p = subparsers.add_parser("RT", help="Resistance vs. Temperature")
-    p.add_argument("csv_files", nargs="+",
-                    help="One or more measurement CSV file(s) to plot together")
-    p.add_argument("--bridge", type=int, default=1,
-                    help="Bridge channel to use (default: 1)")
-    p.add_argument("--errorbars", action="store_true",
-                    help="Plot with error bars (default: off)")
-    p.add_argument("--branches", action="store_true",
-                    help="Color cooldown/warmup branches separately")
-    p.add_argument("--no-split", action="store_true",
-                    help="Do not split data into cooldown/warmup branches")
-    p.add_argument("--skip-points", type=int, default=0,
-                    help="Discard this many points from the start of the run "
-                         "(e.g. excitation-current SNR calibration points)")
-    p.add_argument("--labels", nargs="+", default=None,
-                    help="Legend label(s), one per CSV file "
-                         "(defaults to each file's name)")
-    p.add_argument("-o", "--output", default="RT_plot.pdf",
-                    help="Output figure path (default: RT_plot.pdf)")
-    p.add_argument("--figsize", nargs=2, type=float, default=(8.6, 6.0),
-                    metavar=("WIDTH_CM", "HEIGHT_CM"),
-                    help="Figure size in cm (default: 8.6 6.0)")
-    p.add_argument("--zoom", nargs=2, type=float, action="append",
-                    metavar=("XMIN", "XMAX"), default=None,
-                    help="Also produce a zoomed-in version of the plot "
-                         "restricted to [XMIN, XMAX] (in K). Repeatable "
-                         "for multiple windows, e.g.: "
-                         "--zoom 2 12 --zoom 25 40 "
-                         "(around Tc~7K and T_CDW~33K for NbSe2). "
-                         "Each zoom is saved with a '_zoom_XMIN-XMAX' suffix.")
-    p.add_argument("--fit-range", nargs=2, type=float,
-                    metavar=("TMIN", "TMAX"), default=None,
-                    help="Temperature window (K) for a weighted linear fit "
-                         "to the normal-state R(T), e.g. --fit-range 10 25. "
-                         "Fit results (slope dR/dT, intercept R(T=0)) are "
-                         "always printed to stdout. Use --show-fit-on to "
-                         "also draw the line on specific panels.")
-    p.add_argument("--fit-branch", choices=["cooldown", "warmup"], default=None,
-                    help="Restrict the linear fit to one branch "
-                         "(default: use all points in the fit window)")
-    p.add_argument("--show-fit-on", nargs="+", default=None, metavar="PANEL",
-                    help="Panel(s) on which to draw the linear fit line. "
-                         "Use 'main' for the full-range plot and/or "
-                         "'zoom1', 'zoom2', ... referring to the --zoom "
-                         "windows in the order they are given. The line is "
-                         "automatically extrapolated to the full x-range of "
-                         "each panel, so a deviation from linearity (e.g. "
-                         "the CDW bump at T_CDW) stands out clearly. "
-                         "Example for NbSe2: "
-                         "--fit-range 10 25 --zoom 25 40 --show-fit-on zoom1")
-    p.add_argument("--find-tc", action="store_true",
-                    help="Determine the superconducting Tc by finding where R "
-                         "drops to a fraction (--tc-criterion) of the "
-                         "normal-state R. If branches are present, Tc is "
-                         "computed per branch and averaged. Result is printed "
-                         "to stdout (precision: 0.1 K).")
-    p.add_argument("--tc-criterion", type=float, default=0.5,
-                    metavar="FRACTION",
-                    help="Fraction of R_normal that defines Tc "
-                         "(default: 0.5 = midpoint). Use 0.9 for onset, "
-                         "0.1 for near-zero resistance.")
-    p.add_argument("--tc-normal-range", nargs=2, type=float,
-                    metavar=("TMIN", "TMAX"), default=None,
-                    help="Temperature window (K) for computing the "
-                         "normal-state resistance R_normal, e.g. "
-                         "--tc-normal-range 8 20 for NbSe2. "
-                         "Strongly recommended; if omitted, R_normal is "
-                         "estimated from the top quartile of measured T.")
-    p.add_argument("--normalized", action="store_true",
-                    help="Plot R/R(T_ref) instead of R, where T_ref is the "
-                         "first measurement temperature after --skip-points, "
-                         "rounded to the nearest integer K (e.g. 300 K). "
-                         "Applies to the main plot and all zoom panels.")
-    p.add_argument("--rrr", action="store_true",
-                    help="Compute and print the Residual Resistance Ratio "
-                         "RRR = R(T_high) / R(T_low), where T_high is the "
-                         "initial temperature (rounded) and T_low is set by "
-                         "--rrr-temp. Requires --rrr-temp.")
-    p.add_argument("--rrr-temp", type=float, default=None, metavar="T_LOW",
-                    help="Temperature just above Tc for the RRR denominator, "
-                         "in K (e.g. --rrr-temp 8 for NbSe2 with Tc≈7 K). "
-                         "Rounded to the nearest integer for display. "
-                         "Required when --rrr is used.")
-    p.add_argument("--rrr-window", type=float, default=10, metavar="DT",
-                    help="Half-width in K of the averaging window around "
-                         "--rrr-temp when computing R_low (default: 0.5 K). "
-                         "Increase if few data points fall near that "
-                         "temperature.")
-    p.add_argument("--source", choices=["ppms", "rack"], default="rack",
-                    help="Instrument that produced the CSV file(s): "
-                         "'ppms' for PPMS/MultiVu (default), "
-                         "'rack' for the custom rack with lock-in amplifier.")
-    p.add_argument("--current", type=float, default=None, metavar="AMPS",
-                    help="Source current in Amperes. Required when "
-                         "--source rack (e.g. --current 1e-6 for 1 µA). "
-                         "Used to convert the recorded voltage to resistance: "
-                         "R = V / I.")
-    p.add_argument("--channel", type=int, default=2, choices=[1, 2, 3],
-                    metavar="{1,2,3}",
-                    help="Lock-in amplifier channel to read from the rack CSV "
-                         "(1→R1, 2→R2, 3→R3). Default: 2. "
-                         "Only relevant when --source rack. Legacy single-channel.")
-    p.add_argument("--rack-signals", nargs="*", default=None,
-                    help="For source='rack', specify multiple signal columns "
-                         "and optional legends, e.g. 'X1:Josephson' 'R2:bottom_flake' "
-                         "X2:top_flake. Each item is 'col' or 'col:legend'. "
-                         "If provided, treats as multiple datasets from one CSV, "
-                         "overrides --channel and --labels for rack.")
+
+    p = subparsers.add_parser(
+        "RT",
+        help="Resistance vs. Temperature",
+    )
+
+    p.add_argument(
+        "csv_files",
+        nargs="+",
+        help="One or more measurement CSV file(s) to plot together",
+    )
+
+    p.add_argument(
+        "--bridge",
+        type=int,
+        default=1,
+        help="Bridge channel to use (default: 1)",
+    )
+
+    p.add_argument(
+        "--errorbars",
+        action="store_true",
+        help="Plot with error bars (default: off)",
+    )
+
+    p.add_argument(
+        "--branches",
+        action="store_true",
+        help="Color cooldown/warmup branches separately",
+    )
+
+    p.add_argument(
+        "--no-split",
+        action="store_true",
+        help="Do not split data into cooldown/warmup branches",
+    )
+
+    p.add_argument(
+        "--skip-points",
+        type=int,
+        default=0,
+        help=(
+            "Discard this many points from the start of the run "
+            "(e.g. excitation-current SNR calibration points)"
+        ),
+    )
+
+    p.add_argument(
+        "--labels",
+        nargs="+",
+        default=None,
+        help=(
+            "Legend label(s), one per CSV file "
+            "(defaults to each file's name)"
+        ),
+    )
+
+    p.add_argument(
+        "-o",
+        "--output",
+        default="RT_plot.pdf",
+        help="Output figure path (default: RT_plot.pdf)",
+    )
+
+    p.add_argument(
+        "--figsize",
+        nargs=2,
+        type=float,
+        default=(8.6, 6.0),
+        metavar=("WIDTH_CM", "HEIGHT_CM"),
+        help="Figure size in cm (default: 8.6 6.0)",
+    )
+
+    p.add_argument(
+        "--zoom",
+        nargs=2,
+        type=float,
+        action="append",
+        metavar=("XMIN", "XMAX"),
+        default=None,
+        help=(
+            "Also produce a zoomed-in version of the plot "
+            "restricted to [XMIN, XMAX] (in K). Repeatable "
+            "for multiple windows, e.g.: "
+            "--zoom 2 12 --zoom 25 40. "
+            "Each zoom is saved with a '_zoom_XMIN-XMAX' suffix."
+        ),
+    )
+
+    p.add_argument(
+        "--fit-range",
+        nargs=2,
+        type=float,
+        metavar=("TMIN", "TMAX"),
+        default=None,
+        help=(
+            "Temperature window (K) for a weighted linear fit "
+            "to the normal-state R(T). Fit results are always "
+            "printed to stdout. Use --show-fit-on to also draw "
+            "the line on specific panels."
+        ),
+    )
+
+    p.add_argument(
+        "--fit-branch",
+        choices=["cooldown", "warmup"],
+        default=None,
+        help=(
+            "Restrict the linear fit to one branch "
+            "(default: use all points in the fit window)"
+        ),
+    )
+
+    p.add_argument(
+        "--show-fit-on",
+        nargs="+",
+        default=None,
+        metavar="PANEL",
+        help=(
+            "Panel(s) on which to draw the linear fit line. "
+            "Use 'main' for the full-range plot and/or "
+            "'zoom1', 'zoom2', ... referring to the --zoom "
+            "windows."
+        ),
+    )
+
+    p.add_argument(
+        "--find-tc",
+        action="store_true",
+        help=(
+            "Determine the superconducting Tc by finding where R "
+            "drops to a fraction (--tc-criterion) of the normal-state R. "
+            "If branches are present, Tc is computed per branch "
+            "and averaged."
+        ),
+    )
+
+    p.add_argument(
+        "--tc-criterion",
+        type=float,
+        default=0.5,
+        metavar="FRACTION",
+        help=(
+            "Fraction of R_normal that defines Tc "
+            "(default: 0.5 = midpoint). Use 0.9 for onset, "
+            "0.1 for near-zero resistance."
+        ),
+    )
+
+    p.add_argument(
+        "--tc-normal-range",
+        nargs=2,
+        type=float,
+        metavar=("TMIN", "TMAX"),
+        default=None,
+        help=(
+            "Temperature window (K) for computing the normal-state "
+            "resistance R_normal."
+        ),
+    )
+
+    # --------------------------------------------------------------
+    # New dR/dT analysis
+    # --------------------------------------------------------------
+    p.add_argument(
+        "--drdt",
+        action="store_true",
+        help=(
+            "For a single R(T) dataset, plot dR/dT on a secondary "
+            "y-axis and determine Tc from the temperature where "
+            "dR/dT is maximum. If branches are present, Tc is "
+            "computed independently for cooldown and warmup and "
+            "their mean is printed. The same dR/dT curve is also "
+            "shown in all --zoom panels."
+        ),
+    )
+
+    p.add_argument(
+        "--normalized",
+        action="store_true",
+        help=(
+            "Plot R/R(T_ref) instead of R. Applies to the main "
+            "plot and all zoom panels."
+        ),
+    )
+
+    p.add_argument(
+        "--rrr",
+        action="store_true",
+        help=(
+            "Compute and print the Residual Resistance Ratio "
+            "RRR = R(T_high) / R(T_low)."
+        ),
+    )
+
+    p.add_argument(
+        "--rrr-temp",
+        type=float,
+        default=None,
+        metavar="T_LOW",
+        help=(
+            "Temperature just above Tc for the RRR denominator, "
+            "in K. Required when --rrr is used."
+        ),
+    )
+
+    p.add_argument(
+        "--rrr-window",
+        type=float,
+        default=10,
+        metavar="DT",
+        help=(
+            "Half-width in K of the averaging window around "
+            "--rrr-temp when computing R_low."
+        ),
+    )
+
+    p.add_argument(
+        "--source",
+        choices=["ppms", "rack"],
+        default="rack",
+        help=(
+            "Instrument that produced the CSV file(s): "
+            "'ppms' for PPMS/MultiVu, "
+            "'rack' for the custom rack with lock-in amplifier."
+        ),
+    )
+
+    p.add_argument(
+        "--current",
+        type=float,
+        default=None,
+        metavar="AMPS",
+        help=(
+            "Source current in Amperes. Required when "
+            "--source rack is used. Resistance is calculated "
+            "as R = V / I."
+        ),
+    )
+
+    p.add_argument(
+        "--channel",
+        type=int,
+        default=2,
+        choices=[1, 2, 3],
+        metavar="{1,2,3}",
+        help=(
+            "Lock-in amplifier channel to read from the rack CSV "
+            "(1→R1, 2→R2, 3→R3). Default: 2."
+        ),
+    )
+
+    p.add_argument(
+        "--rack-signals",
+        nargs="*",
+        default=None,
+        help=(
+            "For source='rack', specify multiple signal columns "
+            "and optional legends, e.g. "
+            "'X1:Josephson' 'R2:bottom_flake' X2:top_flake. "
+            "Each item is 'col' or 'col:legend'."
+        ),
+    )
+
     return p
 
 def _add_IV_dVdI_parser(subparsers):
@@ -3784,189 +4185,623 @@ def _add_Hall_MR_parser(subparsers):
 
 def _run_RT(args):
     """Execute the `RT` subcommand: call analyze_RT / plot_RT and save."""
-    fig, ax = plt.subplots(figsize=(args.figsize[0] / 2.54, args.figsize[1] / 2.54),
-                            constrained_layout=True)
- 
-    labels = args.labels or [os.path.splitext(os.path.basename(f))[0]
-                              for f in args.csv_files]
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    fig, ax = plt.subplots(
+        figsize=(
+            args.figsize[0] / 2.54,
+            args.figsize[1] / 2.54,
+        ),
+        constrained_layout=True,
+    )
+
+    labels = args.labels or [
+        os.path.splitext(os.path.basename(f))[0]
+        for f in args.csv_files
+    ]
+
+    color_cycle = (
+        plt.rcParams["axes.prop_cycle"]
+        .by_key()["color"]
+    )
+
     show_fit_on = set(args.show_fit_on or [])
- 
-    # ---- load + fit data for every input file ----
+
+    # ================================================================
+    # Load all datasets first
+    # ================================================================
     datasets = []
-    is_multi_rack = (args.source == "rack" and getattr(args, 'rack_signals', None) is not None and len(getattr(args, 'rack_signals', [])) > 0)
+
+    is_multi_rack = (
+        args.source == "rack"
+        and getattr(args, "rack_signals", None) is not None
+        and len(getattr(args, "rack_signals", [])) > 0
+    )
 
     for i, csv_file in enumerate(args.csv_files):
+
+        # ------------------------------------------------------------
+        # Multiple rack signals from one CSV
+        # ------------------------------------------------------------
         if is_multi_rack:
+
             signal_list = []
+
             for item in args.rack_signals:
-                if ':' in item:
-                    col, leg = [x.strip() for x in item.split(':', 1)]
+
+                if ":" in item:
+                    col, leg = [
+                        x.strip()
+                        for x in item.split(":", 1)
+                    ]
                     signal_list.append((col, leg))
+
                 else:
                     col = item.strip()
                     signal_list.append((col, col))
-            
-            csv_base = os.path.splitext(os.path.basename(csv_file))[0]
+
+            csv_base = os.path.splitext(
+                os.path.basename(csv_file)
+            )[0]
+
             for s_idx, (sig_col, leg) in enumerate(signal_list):
-                color = color_cycle[s_idx % len(color_cycle)]
-                data = analyze_RT(csv_file,
-                                   bridge=1,
-                                   split_branches=not args.no_split,
-                                   skip_points=args.skip_points,
-                                   source=args.source,
-                                   current=args.current,
-                                   signal_col=sig_col)
+
+                color = color_cycle[
+                    s_idx % len(color_cycle)
+                ]
+
+                data = analyze_RT(
+                    csv_file,
+                    bridge=1,
+                    split_branches=not args.no_split,
+                    skip_points=args.skip_points,
+                    source=args.source,
+                    current=args.current,
+                    signal_col=sig_col,
+                )
+
                 label = leg
                 fit = None
+
+                # ----------------------------------------------------
+                # Linear fit
+                # ----------------------------------------------------
                 if args.fit_range is not None:
-                    fit = fit_linear_RT(data, tuple(args.fit_range), branch=args.fit_branch)
-                    print(f"[{csv_base} | {label}] Linear fit over {args.fit_range[0]:g}–{args.fit_range[1]:g} K ({fit['n_points']} pts, branch={args.fit_branch or 'both'})")
+
+                    fit = fit_linear_RT(
+                        data,
+                        tuple(args.fit_range),
+                        branch=args.fit_branch,
+                    )
+
+                    print(
+                        f"[{csv_base} | {label}] "
+                        f"Linear fit over "
+                        f"{args.fit_range[0]:g}–"
+                        f"{args.fit_range[1]:g} K "
+                        f"({fit['n_points']} pts, "
+                        f"branch={args.fit_branch or 'both'})"
+                    )
+
+                # ----------------------------------------------------
+                # Existing Tc criterion
+                # ----------------------------------------------------
                 if args.find_tc:
+
                     tc_result = find_Tc_RT(
                         data,
                         criterion=args.tc_criterion,
-                        T_normal_range=(tuple(args.tc_normal_range)
-                                        if args.tc_normal_range else None),
+                        T_normal_range=(
+                            tuple(args.tc_normal_range)
+                            if args.tc_normal_range
+                            else None
+                        ),
                     )
-                    pct = int(round(tc_result["criterion"] * 100))
+
+                    pct = int(
+                        round(
+                            tc_result["criterion"] * 100
+                        )
+                    )
+
                     print(
-                        f"[{label}] Tc ({pct}% criterion, "
-                        f"R_normal = {tc_result['R_normal']:.4g} Ω from "
+                        f"[{label}] Tc "
+                        f"({pct}% criterion, "
+                        f"R_normal = "
+                        f"{tc_result['R_normal']:.4g} Ω "
+                        f"from "
                         f"{tc_result['n_normal_points']} pts):"
                     )
-                    for branch_name, Tc_val in tc_result["Tc_branches"].items():
-                        val_str = f"{Tc_val:.1f} K" if Tc_val is not None else "not found"
-                        print(f"  {branch_name.capitalize():<12}: {val_str}")
-                    mean_str = (f"{tc_result['Tc']:.1f} K"
-                                if tc_result["Tc"] is not None else "not found")
-                    print(f"  {'Mean':<12}: {mean_str}")
-                if args.rrr:
-                    if args.rrr_temp is None:
-                        raise ValueError("--rrr requires --rrr-temp T_LOW")
-                    rrr_result = compute_RRR_RT(data, T_low=args.rrr_temp,
-                                                window=args.rrr_window)
-                    print(
-                        f"[{label}] RRR = R({rrr_result['T_high']} K) / "
-                        f"R({rrr_result['T_low']} K) "
-                        f"= {rrr_result['R_high']:.4g} / {rrr_result['R_low']:.4g} "
-                        f"({rrr_result['n_pts_low']} pts in window) "
-                        f"= {rrr_result['RRR']:.2f}"
-                    )
-                plot_RT(data, ax=ax, show_errorbars=args.errorbars,
-                        show_branches=args.branches, normalized=args.normalized,
-                        label=label, color=color)
-                datasets.append({"data": data, "label": label, "color": color, "fit": fit})
-        else:
-            # Original single-dataset per file logic
-            label = labels[i] if i < len(labels) else os.path.splitext(os.path.basename(csv_file))[0]
-            color = color_cycle[i % len(color_cycle)]
-            data = analyze_RT(csv_file,
-                               bridge=1 if args.source == "rack" else args.bridge,
-                               split_branches=not args.no_split,
-                               skip_points=args.skip_points,
-                               source=args.source,
-                               current=args.current,
-                               channel=args.channel)
 
-            fit = None
-            if args.fit_range is not None:
-                fit = fit_linear_RT(data, tuple(args.fit_range),
-                                     branch=args.fit_branch)
-                print(
-                    f"[{label}] Linear fit over "
-                    f"{args.fit_range[0]:g}–{args.fit_range[1]:g} K "
-                    f"({fit['n_points']} pts, "
-                    f"branch={args.fit_branch or 'both'}):\n"
-                    f"  dR/dT  = {fit['slope']:.4g} ± {fit['slope_err']:.2g} Ω/K\n"
-                    f"  R(T=0) = {fit['intercept']:.4g} ± {fit['intercept_err']:.2g} Ω"
+                    for (
+                        branch_name,
+                        Tc_val,
+                    ) in tc_result["Tc_branches"].items():
+
+                        val_str = (
+                            f"{Tc_val:.1f} K"
+                            if Tc_val is not None
+                            else "not found"
+                        )
+
+                        print(
+                            f"  "
+                            f"{branch_name.capitalize():<12}: "
+                            f"{val_str}"
+                        )
+
+                    mean_str = (
+                        f"{tc_result['Tc']:.1f} K"
+                        if tc_result["Tc"] is not None
+                        else "not found"
+                    )
+
+                    print(
+                        f"  {'Mean':<12}: {mean_str}"
+                    )
+
+                # ----------------------------------------------------
+                # RRR
+                # ----------------------------------------------------
+                if args.rrr:
+
+                    if args.rrr_temp is None:
+                        raise ValueError(
+                            "--rrr requires "
+                            "--rrr-temp T_LOW"
+                        )
+
+                    rrr_result = compute_RRR_RT(
+                        data,
+                        T_low=args.rrr_temp,
+                        window=args.rrr_window,
+                    )
+
+                    print(
+                        f"[{label}] RRR = "
+                        f"R({rrr_result['T_high']} K) / "
+                        f"R({rrr_result['T_low']} K) "
+                        f"= "
+                        f"{rrr_result['R_high']:.4g} / "
+                        f"{rrr_result['R_low']:.4g} "
+                        f"("
+                        f"{rrr_result['n_pts_low']} "
+                        f"pts in window) "
+                        f"= "
+                        f"{rrr_result['RRR']:.2f}"
+                    )
+
+                # ----------------------------------------------------
+                # Plot R(T)
+                # ----------------------------------------------------
+                plot_RT(
+                    data,
+                    ax=ax,
+                    show_errorbars=args.errorbars,
+                    show_branches=args.branches,
+                    normalized=args.normalized,
+                    label=label,
+                    color=color,
                 )
 
+                # ----------------------------------------------------
+                # Store dataset
+                # ----------------------------------------------------
+                datasets.append({
+                    "data": data,
+                    "label": label,
+                    "color": color,
+                    "fit": fit,
+                    "drdt": (
+                        analyze_dRdT_RT(data)
+                        if args.drdt
+                        else None
+                    ),
+                })
+
+        # ------------------------------------------------------------
+        # Normal single-dataset-per-file mode
+        # ------------------------------------------------------------
+        else:
+
+            label = (
+                labels[i]
+                if i < len(labels)
+                else os.path.splitext(
+                    os.path.basename(csv_file)
+                )[0]
+            )
+
+            color = color_cycle[
+                i % len(color_cycle)
+            ]
+
+            data = analyze_RT(
+                csv_file,
+                bridge=(
+                    1
+                    if args.source == "rack"
+                    else args.bridge
+                ),
+                split_branches=not args.no_split,
+                skip_points=args.skip_points,
+                source=args.source,
+                current=args.current,
+                channel=args.channel,
+            )
+
+            fit = None
+
+            # --------------------------------------------------------
+            # Linear fit
+            # --------------------------------------------------------
+            if args.fit_range is not None:
+
+                fit = fit_linear_RT(
+                    data,
+                    tuple(args.fit_range),
+                    branch=args.fit_branch,
+                )
+
+                print(
+                    f"[{label}] Linear fit over "
+                    f"{args.fit_range[0]:g}–"
+                    f"{args.fit_range[1]:g} K "
+                    f"({fit['n_points']} pts, "
+                    f"branch={args.fit_branch or 'both'}):\n"
+                    f"  dR/dT  = "
+                    f"{fit['slope']:.4g} ± "
+                    f"{fit['slope_err']:.2g} Ω/K\n"
+                    f"  R(T=0) = "
+                    f"{fit['intercept']:.4g} ± "
+                    f"{fit['intercept_err']:.2g} Ω"
+                )
+
+            # --------------------------------------------------------
+            # Existing Tc criterion
+            # --------------------------------------------------------
             if args.find_tc:
+
                 tc_result = find_Tc_RT(
                     data,
                     criterion=args.tc_criterion,
-                    T_normal_range=(tuple(args.tc_normal_range)
-                                    if args.tc_normal_range else None),
+                    T_normal_range=(
+                        tuple(args.tc_normal_range)
+                        if args.tc_normal_range
+                        else None
+                    ),
                 )
-                pct = int(round(tc_result["criterion"] * 100))
+
+                pct = int(
+                    round(
+                        tc_result["criterion"] * 100
+                    )
+                )
+
                 print(
-                    f"[{label}] Tc ({pct}% criterion, "
-                    f"R_normal = {tc_result['R_normal']:.4g} Ω from "
+                    f"[{label}] Tc "
+                    f"({pct}% criterion, "
+                    f"R_normal = "
+                    f"{tc_result['R_normal']:.4g} Ω "
+                    f"from "
                     f"{tc_result['n_normal_points']} pts):"
                 )
-                for branch_name, Tc_val in tc_result["Tc_branches"].items():
-                    val_str = f"{Tc_val:.1f} K" if Tc_val is not None else "not found"
-                    print(f"  {branch_name.capitalize():<12}: {val_str}")
-                mean_str = (f"{tc_result['Tc']:.1f} K"
-                            if tc_result["Tc"] is not None else "not found")
-                print(f"  {'Mean':<12}: {mean_str}")
 
-            if args.rrr:
-                if args.rrr_temp is None:
-                    raise ValueError("--rrr requires --rrr-temp T_LOW")
-                rrr_result = compute_RRR_RT(data, T_low=args.rrr_temp,
-                                             window=args.rrr_window)
-                print(
-                    f"[{label}] RRR = R({rrr_result['T_high']} K) / "
-                    f"R({rrr_result['T_low']} K) "
-                    f"= {rrr_result['R_high']:.4g} / {rrr_result['R_low']:.4g} "
-                    f"({rrr_result['n_pts_low']} pts in window) "
-                    f"= {rrr_result['RRR']:.2f}"
+                for (
+                    branch_name,
+                    Tc_val,
+                ) in tc_result["Tc_branches"].items():
+
+                    val_str = (
+                        f"{Tc_val:.1f} K"
+                        if Tc_val is not None
+                        else "not found"
+                    )
+
+                    print(
+                        f"  "
+                        f"{branch_name.capitalize():<12}: "
+                        f"{val_str}"
+                    )
+
+                mean_str = (
+                    f"{tc_result['Tc']:.1f} K"
+                    if tc_result["Tc"] is not None
+                    else "not found"
                 )
 
-            plot_RT(data, ax=ax, show_errorbars=args.errorbars,
-                    show_branches=args.branches, normalized=args.normalized,
-                    label=label, color=color)
-            datasets.append({"data": data, "label": label, "color": color, "fit": fit})
- 
-    # ---- optionally draw fit on the main panel ----
-    if "main" in show_fit_on:
-        for ds in datasets:
-            if ds["fit"] is not None:
-                display_fit = _scale_fit_for_plot(
-                        ds["fit"],
-                        ds["data"]["R_ref"] if args.normalized else 1.0,
+                print(
+                    f"  {'Mean':<12}: {mean_str}"
+                )
+
+            # --------------------------------------------------------
+            # RRR
+            # --------------------------------------------------------
+            if args.rrr:
+
+                if args.rrr_temp is None:
+                    raise ValueError(
+                        "--rrr requires "
+                        "--rrr-temp T_LOW"
                     )
-                plot_linear_fit(display_fit, ax=ax,
-                                 color=_fit_color(args.branches, ds["color"]),
-                                 label=f"{ds['label']} linear fit")
+
+                rrr_result = compute_RRR_RT(
+                    data,
+                    T_low=args.rrr_temp,
+                    window=args.rrr_window,
+                )
+
+                print(
+                    f"[{label}] RRR = "
+                    f"R({rrr_result['T_high']} K) / "
+                    f"R({rrr_result['T_low']} K) "
+                    f"= "
+                    f"{rrr_result['R_high']:.4g} / "
+                    f"{rrr_result['R_low']:.4g} "
+                    f"("
+                    f"{rrr_result['n_pts_low']} "
+                    f"pts in window) "
+                    f"= "
+                    f"{rrr_result['RRR']:.2f}"
+                )
+
+            # --------------------------------------------------------
+            # Plot R(T)
+            # --------------------------------------------------------
+            plot_RT(
+                data,
+                ax=ax,
+                show_errorbars=args.errorbars,
+                show_branches=args.branches,
+                normalized=args.normalized,
+                label=label,
+                color=color,
+            )
+
+            # --------------------------------------------------------
+            # Store dataset
+            # --------------------------------------------------------
+            datasets.append({
+                "data": data,
+                "label": label,
+                "color": color,
+                "fit": fit,
+                "drdt": (
+                    analyze_dRdT_RT(data)
+                    if args.drdt
+                    else None
+                ),
+            })
+
+    # ================================================================
+    # Main-panel linear-fit overlay
+    # ================================================================
+    if "main" in show_fit_on:
+
+        for ds in datasets:
+
+            if ds["fit"] is not None:
+
+                display_fit = _scale_fit_for_plot(
+                    ds["fit"],
+                    (
+                        ds["data"]["R_ref"]
+                        if args.normalized
+                        else 1.0
+                    ),
+                )
+
+                plot_linear_fit(
+                    display_fit,
+                    ax=ax,
+                    color=_fit_color(
+                        args.branches,
+                        ds["color"],
+                    ),
+                    label=(
+                        f"{ds['label']} linear fit"
+                    ),
+                )
+
         ax.legend()
+
+    # ================================================================
+    # dR/dT on main panel
+    # ================================================================
+    if args.drdt:
+
+        if len(datasets) != 1:
+            raise ValueError(
+                "--drdt requires exactly one "
+                "R(T) dataset. "
+                "Use one CSV file and one rack signal."
+            )
+
+        ds = datasets[0]
+
+        plot_dRdT_RT(
+            ds["data"],
+            ds["drdt"],
+            ax=ax,
+            show_branches=args.branches,
+            branch_colors=(
+                _default_RT_branch_colors()
+                if args.branches
+                else None
+            ),
+            label=ds["label"],
+            color=ds["color"],
+        )
+
+        # ------------------------------------------------------------
+        # Print Tc from maximum dR/dT
+        # ------------------------------------------------------------
+        print(
+            f"[{ds['label']}] "
+            f"Tc from maximum dR/dT:"
+        )
+
+        for (
+            branch_name,
+            Tc_val,
+        ) in ds["drdt"]["Tc_branches"].items():
+
+            print(
+                f"  "
+                f"{branch_name.capitalize():<12}: "
+                f"{Tc_val:.1f} K "
+                f"(max dR/dT = "
+                f"{ds['drdt']['max_dRdT'][branch_name]:.4g} "
+                f"Ω/K)"
+            )
+
+        if ds["drdt"]["Tc"] is not None:
+
+            print(
+                f"  {'Mean':<12}: "
+                f"{ds['drdt']['Tc']:.1f} K"
+            )
+
+        else:
+
+            print(
+                f"  {'Mean':<12}: not found"
+            )
+
+    # ================================================================
+    # Save main figure
+    # ================================================================
     fig.savefig(args.output)
     print(f"Saved {args.output}")
- 
-    # ---- zoom panels ----
-    y_key = "R_norm" if args.normalized else "R"
-    base, ext = os.path.splitext(args.output)
-    for i, (xmin, xmax) in enumerate(args.zoom or [], start=1):
+
+    # ================================================================
+    # Zoom panels
+    # ================================================================
+    y_key = (
+        "R_norm"
+        if args.normalized
+        else "R"
+    )
+
+    base, ext = os.path.splitext(
+        args.output
+    )
+
+    for i, (xmin, xmax) in enumerate(
+        args.zoom or [],
+        start=1,
+    ):
+
         zoom_fig, zoom_ax = plt.subplots(
-            figsize=(args.figsize[0] / 2.54, args.figsize[1] / 2.54),
-            constrained_layout=True)
- 
+            figsize=(
+                args.figsize[0] / 2.54,
+                args.figsize[1] / 2.54,
+            ),
+            constrained_layout=True,
+        )
+
+        # ------------------------------------------------------------
+        # R(T) zoom
+        # ------------------------------------------------------------
         for ds in datasets:
-            plot_zoomed(plot_RT, ds["data"], x_key="T", y_key=y_key,
-                        xlim=(xmin, xmax), ax=zoom_ax,
-                        show_errorbars=args.errorbars,
-                        show_branches=args.branches,
-                        normalized=args.normalized,
-                        label=ds["label"], color=ds["color"])
-        # fit overlay: x_range=None lets plot_linear_fit default to
-        # the zoom panel's x-limits, so the line is extrapolated across
-        # the full window even if fit was computed on a different range.
+
+            plot_zoomed(
+                plot_RT,
+                ds["data"],
+                x_key="T",
+                y_key=y_key,
+                xlim=(xmin, xmax),
+                ax=zoom_ax,
+                show_errorbars=args.errorbars,
+                show_branches=args.branches,
+                normalized=args.normalized,
+                label=ds["label"],
+                color=ds["color"],
+            )
+
+        # ------------------------------------------------------------
+        # Linear fit on zoom
+        # ------------------------------------------------------------
         if f"zoom{i}" in show_fit_on:
+
             for ds in datasets:
+
                 if ds["fit"] is not None:
+
                     display_fit = _scale_fit_for_plot(
-                            ds["fit"],
-                            ds["data"]["R_ref"] if args.normalized else 1.0,
-                        )
-                    plot_linear_fit(display_fit, ax=zoom_ax,
-                                    color=_fit_color(args.branches, ds["color"]),
-                                    label=f"{ds['label']} linear fit")
-            zoom_ax.legend()
-        zoom_path = f"{base}_zoom_{xmin:g}-{xmax:g}{ext}"
-        zoom_fig.savefig(zoom_path)
-        print(f"Saved {zoom_path}")
+                        ds["fit"],
+                        (
+                            ds["data"]["R_ref"]
+                            if args.normalized
+                            else 1.0
+                        ),
+                    )
+
+                    plot_linear_fit(
+                        display_fit,
+                        ax=zoom_ax,
+                        color=_fit_color(
+                            args.branches,
+                            ds["color"],
+                        ),
+                        label=(
+                            f"{ds['label']} linear fit"
+                        ),
+                    )
+
+        # ------------------------------------------------------------
+        # dR/dT on zoom
+        # ------------------------------------------------------------
+        if args.drdt:
+
+            if len(datasets) != 1:
+                raise ValueError(
+                    "--drdt requires exactly one "
+                    "R(T) dataset."
+                )
+
+            ds = datasets[0]
+
+            zoom_drdt_ax = plot_dRdT_RT(
+                ds["data"],
+                ds["drdt"],
+                ax=zoom_ax,
+                show_branches=args.branches,
+                branch_colors=(
+                    _default_RT_branch_colors()
+                    if args.branches
+                    else None
+                ),
+                label=ds["label"],
+                color=ds["color"],
+            )
+
+            # plot_dRdT_RT() creates a twin axis. The x-axis is shared,
+            # but explicitly set the limits for clarity/robustness.
+            zoom_drdt_ax.set_xlim(
+                xmin,
+                xmax,
+            )
+
+        # ------------------------------------------------------------
+        # Save zoom
+        # ------------------------------------------------------------
+        zoom_path = (
+            f"{base}_zoom_"
+            f"{xmin:g}-{xmax:g}"
+            f"{ext}"
+        )
+
+        zoom_fig.savefig(
+            zoom_path
+        )
+
+        plt.close(
+            zoom_fig
+        )
+
+        print(
+            f"Saved {zoom_path}"
+        )
 
 def _run_IV_dVdI(args):
     set_paper_style()
