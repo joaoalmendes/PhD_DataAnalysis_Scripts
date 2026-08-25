@@ -2005,16 +2005,25 @@ def _detect_H_irr_from_phase(H_sorted, theta_sorted,
 def _detect_H_irr(H_sorted, R_sorted=None, theta_sorted=None,
                   plateau_frac=0.90, min_normal_frac=0.85,
                   phase_window=7, phase_std_thresh=10.0,
-                  smooth_pts=11):
+                  smooth_pts=11, min_contrast=2.0,
+                  min_normal_field_frac=0.15, min_normal_field_Oe=3000.0):
     """Robust irreversibility-field detection combining magnitude & phase.
 
     Primary criterion: smoothed |R| reaches plateau_frac of high-field median
-    and stays there. Secondary: phase rolling-std becomes quiet. When both
-    succeed, the more conservative (higher) H_irr is returned.
+    and stays there, *and* low-field |R| is clearly smaller (contrast).
+    Secondary: phase rolling-std becomes quiet.
+
+    Returns None (→ always-SC) when:
+      * neither magnitude nor phase finds a normal-state region, or
+      * a candidate H_irr leaves too little field range for a useful
+        high-field fit (min_normal_field_frac of H_max, and at least
+        min_normal_field_Oe).
     """
     n = len(H_sorted)
     if n < 10:
         return None
+
+    H_max = float(np.nanmax(H_sorted)) if n else 0.0
 
     H_irr_mag = None
     if R_sorted is not None and np.any(np.isfinite(R_sorted)):
@@ -2025,12 +2034,26 @@ def _detect_H_irr(H_sorted, R_sorted=None, theta_sorted=None,
         R_s = np.convolve(R_pad, kernel, mode='valid')
         if len(R_s) != n:
             R_s = R_s[:n]
-        H_hi = float(np.nanmax(H_sorted))
-        hi_mask = H_sorted >= 0.8 * H_hi
+
+        hi_mask = H_sorted >= 0.8 * H_max
         if not np.any(hi_mask):
             hi_mask = np.ones(n, dtype=bool)
-        R_high = float(np.nanmedian(R_s[hi_mask]))
-        if np.isfinite(R_high) and abs(R_high) >= 1e-30:
+        R_high = float(np.nanmedian(np.abs(R_s[hi_mask])))
+
+        # Low-field reference (SC residual / noise floor)
+        lo_mask = H_sorted <= 0.2 * H_max
+        if not np.any(lo_mask):
+            lo_mask = np.arange(n) < max(3, n // 10)
+        R_low = float(np.nanmedian(np.abs(R_s[lo_mask])))
+
+        # Require a real rise from low to high field — without it the
+        # "plateau" is just a flat SC residual and must not be trusted.
+        contrast_ok = (
+            np.isfinite(R_high) and abs(R_high) >= 1e-30
+            and (R_low < 1e-30 or (R_high / max(R_low, 1e-30)) >= min_contrast)
+        )
+
+        if contrast_ok:
             thresh = plateau_frac * abs(R_high)
             above = np.abs(R_s) >= thresh
             for i in range(n):
@@ -2047,13 +2070,38 @@ def _detect_H_irr(H_sorted, R_sorted=None, theta_sorted=None,
             min_normal_frac=min_normal_frac,
         )
 
-    candidates = [h for h in (H_irr_mag, H_irr_phase) if h is not None]
+    # Prefer phase when it says "no normal state" and magnitude alone
+    # only found a candidate very near H_max (classic false positive
+    # when the sample is still SC at the highest field).
+    candidates = []
+    if H_irr_mag is not None:
+        candidates.append(H_irr_mag)
+    if H_irr_phase is not None:
+        candidates.append(H_irr_phase)
+
     if not candidates:
         return None
-    if H_irr_mag is not None and H_irr_phase is not None:
-        return max(H_irr_mag, H_irr_phase)
-    return candidates[0]
 
+    if H_irr_mag is not None and H_irr_phase is not None:
+        H_irr = max(H_irr_mag, H_irr_phase)
+    elif H_irr_phase is not None:
+        H_irr = H_irr_phase
+    else:
+        H_irr = H_irr_mag
+        # Magnitude-only: reject if the normal-state window is tiny
+        # (likely still SC; plateau was noise or a weak residual).
+        normal_span = H_max - H_irr
+        if (normal_span < min_normal_field_Oe
+                or (H_max > 0 and normal_span / H_max < min_normal_field_frac)):
+            return None
+
+    # Final window-size check for any accepted candidate
+    normal_span = H_max - H_irr
+    if (normal_span < min_normal_field_Oe
+            or (H_max > 0 and normal_span / H_max < min_normal_field_frac)):
+        return None
+
+    return H_irr
 
 def analyze_hall_mr(fwd_source, bwd_source=None,
                      hall_n=1, mr_n=2, hall_col='R', mr_col='R',
@@ -2355,6 +2403,36 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                 cot_theta_scalar = cot_theta_at_ref = np.nan
             ryx_at_ref_Ohm_m = ryx_fit_at_ref   # store for multi-T plot
 
+            # ── Reliability gate ──────────────────────────────────────────
+            # Reject fits that are statistically useless so they do not
+            # pollute multi-T plots (e.g. tiny normal-state window near Tc
+            # → enormous R_H_err).
+            _rel_err = (abs(R_H_err / R_H) if abs(R_H) > 1e-30 else np.inf)
+            _span_Oe = float(H_pos[fit_mask].max() - H_pos[fit_mask].min())
+            _min_pts = 8
+            _max_rel_err = 0.5   # |σ_RH / RH| > 50 % → discard
+            _min_span_Oe = 3000.0
+
+            unreliable = (
+                n_fit < _min_pts
+                or _rel_err > _max_rel_err
+                or _span_Oe < _min_span_Oe
+            )
+            if unreliable:
+                print(
+                    f"  ⚠  R_H fit unreliable — excluding from multi-T "
+                    f"analysis\n"
+                    f"     n_fit={n_fit} (min {_min_pts}),  "
+                    f"|σ/RH|={_rel_err:.2g} (max {_max_rel_err}),  "
+                    f"window={_span_Oe:.0f} Oe (min {_min_span_Oe:.0f} Oe)\n"
+                    f"     R_H, n_H, p, µ_H, cot θ_H set to NaN."
+                )
+                R_H = R_H_err = RH_offset = np.nan
+                n_H_m3 = n_H_cm3 = p = mu_H_SI = mu_H_cm2 = np.nan
+                cot_theta_scalar = cot_theta_at_ref = H_ref_Oe = np.nan
+                rxx_ref = np.nan
+                ryx_at_ref_Ohm_m = np.nan
+
     # ── 7. MR quantities ──────────────────────────────────────────────────
     rxx0 = float(np.interp(0.0, H_sym, rxx_even))
     if abs(rxx0) > 1e-20 and not always_sc:
@@ -2438,6 +2516,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'H_ref_Oe':        H_ref_Oe,
         'H_irr_Oe':       H_irr_detected,   # auto-detected or None
         'always_sc':      always_sc,         # True if no normal state found
+        'hall_reliable':  bool(np.isfinite(R_H)),  # False → exclude from multi-T
         'fit_mask':       fit_mask,
         # ── MR quantities ────────────────────────────────────────────────
         'MR':              MR,             # ΔR/R₀, dimensionless
@@ -2468,16 +2547,11 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'rho_xx0_field_Oe': rho_xx0_field_Oe,
         'geom_factor':     geom_xx,
     }
-
 # Fitting for the costheta
 
-def fit_cot_theta_vs_T2(results_list):
-    """Fit cot(θ_H) = α·T² + β.  Uses cot_theta_scalar (mean over the fit
-    window) — the same quantity printed in the terminal analysis — so the
-    fit and the plot are always consistent with the reported values.
-    NaN entries (always-SC temperatures) are silently excluded.
-    """
-    T_arr  = np.array([r['T_nominal_K']    for r in results_list])
+def fit_cot_theta_vs_T2(results_list, exponent=1.70):
+    """Fit cot(θ_H) = α·T^n + β  (default n=2)."""
+    T_arr  = np.array([r['T_nominal_K']     for r in results_list])
     ct_arr = np.array([r['cot_theta_scalar'] for r in results_list])
 
     finite = np.isfinite(ct_arr) & np.isfinite(T_arr)
@@ -2486,44 +2560,41 @@ def fit_cot_theta_vs_T2(results_list):
     if n_valid < 2:
         warnings.warn(
             f"Only {n_valid} temperature(s) with finite cot(θ_H) — "
-            "cannot fit α·T² + β.", UserWarning
+            f"cannot fit α·T^{exponent:g} + β.", UserWarning
         )
         return {
-            'T_K': T_arr, 'cot_theta': ct_arr, 'T2': T_arr**2,
+            'T_K': T_arr, 'cot_theta': ct_arr,
+            'Tn': T_arr**exponent, 'exponent': exponent,
             'alpha': np.nan, 'alpha_err': np.nan,
             'beta':  np.nan, 'beta_err':  np.nan,
             'poly':  None,   'R2':        np.nan,
             'n_valid': n_valid,
         }
 
-    T2 = T_arr[finite]**2
+    Tn = T_arr[finite]**exponent
     ct = ct_arr[finite]
-    coeffs, cov = np.polyfit(T2, ct, deg=1, cov=True)
-    alpha, beta   = float(coeffs[0]), float(coeffs[1])
-    alpha_err     = float(np.sqrt(cov[0, 0]))
-    beta_err      = float(np.sqrt(cov[1, 1]))
-    ct_fit        = np.polyval(coeffs, T2)
-    ss_res        = np.sum((ct - ct_fit)**2)
-    ss_tot        = np.sum((ct - ct.mean())**2)
-    R2            = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+    coeffs, cov = np.polyfit(Tn, ct, deg=1, cov=True)
+    alpha, beta = float(coeffs[0]), float(coeffs[1])
+    alpha_err   = float(np.sqrt(cov[0, 0]))
+    beta_err    = float(np.sqrt(cov[1, 1]))
+    ct_fit = np.polyval(coeffs, Tn)
+    ss_res = np.sum((ct - ct_fit)**2)
+    ss_tot = np.sum((ct - ct.mean())**2)
+    R2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
 
-    # Report excluded temperatures
-    excluded = T_arr[~finite]
-    excl_str = (f"  Excluded (NaN / always-SC): T = {excluded.tolist()} K\n"
-                if len(excluded) > 0 else "")
     print(
-        f"\n  cot(θ_H) = α·T² + β  [{n_valid} temperatures used]\n"
-        f"{excl_str}"
-        f"  α = {alpha:.4g} ± {alpha_err:.2g}  K⁻²\n"
+        f"\n  cot(θ_H) = α·T^{exponent:g} + β  [{n_valid} temperatures used]\n"
+        f"  α = {alpha:.4g} ± {alpha_err:.2g}  K^{{-{exponent:g}}}\n"
         f"  β = {beta:.4g}  ± {beta_err:.2g}\n"
         f"  R² = {R2:.4f}"
     )
     return {
-        'T_K':       T_arr,    'cot_theta':  ct_arr,
-        'T2':        T_arr**2, 'alpha':      alpha,
-        'alpha_err': alpha_err,'beta':       beta,
-        'beta_err':  beta_err, 'poly':       np.poly1d(coeffs),
-        'R2':        R2,       'n_valid':    n_valid,
+        'T_K': T_arr, 'cot_theta': ct_arr,
+        'Tn': T_arr**exponent, 'exponent': exponent,
+        'alpha': alpha, 'alpha_err': alpha_err,
+        'beta': beta, 'beta_err': beta_err,
+        'poly': np.poly1d(coeffs), 'R2': R2,
+        'n_valid': n_valid,
     }
 
 # ==========================================================================
@@ -2779,7 +2850,139 @@ def plot_MR_hall(result, ax=None, color='tab:blue', figsize=None):
  
  
 # ── Multi-temperature plot helpers ─────────────────────────────────────────
- 
+def _filter_reliable_hall(results_list):
+    """Return (T, values...) masks for temperatures with a reliable Hall fit.
+
+    A result is kept when ``hall_reliable`` is True (or absent, for
+    backward compatibility) and the primary Hall scalar is finite.
+    """
+    keep = []
+    for r in results_list:
+        reliable = r.get('hall_reliable', True)
+        if reliable is False:
+            keep.append(False)
+            continue
+        if r.get('always_sc', False):
+            keep.append(False)
+            continue
+        keep.append(np.isfinite(r.get('R_H_m3_C', np.nan)))
+    return np.asarray(keep, dtype=bool)
+
+
+def _exclude_RH_error_outliers(results_list, keep, z_thresh=4.0):
+    """Drop temperatures whose R_H_err is an extreme outlier vs the rest.
+
+    Uses a robust MAD criterion on log(|σ_RH|).  Points already excluded
+    by ``keep`` are ignored when estimating the typical error scale.
+    """
+    keep = keep.copy()
+    errs = np.array([
+        abs(r.get('R_H_err_m3_C', np.nan)) for r in results_list
+    ], dtype=float)
+    valid = keep & np.isfinite(errs) & (errs > 0)
+    if np.sum(valid) < 3:
+        return keep
+    log_e = np.log10(errs[valid])
+    med = np.median(log_e)
+    mad = np.median(np.abs(log_e - med))
+    if mad < 1e-12:
+        # all similar — use a mild absolute factor vs the median error
+        med_err = np.median(errs[valid])
+        for i, r in enumerate(results_list):
+            if not keep[i]:
+                continue
+            e = abs(r.get('R_H_err_m3_C', np.nan))
+            if np.isfinite(e) and e > 20.0 * med_err:
+                keep[i] = False
+                print(
+                    f"  [multi-T] excluding T={r['T_nominal_K']:.1f} K — "
+                    f"R_H_err={e:.3g} is >> median {med_err:.3g}"
+                )
+        return keep
+    # modified z-score
+    for i, r in enumerate(results_list):
+        if not keep[i]:
+            continue
+        e = abs(r.get('R_H_err_m3_C', np.nan))
+        if not np.isfinite(e) or e <= 0:
+            keep[i] = False
+            continue
+        z = abs(np.log10(e) - med) / (1.4826 * mad)
+        if z > z_thresh:
+            keep[i] = False
+            print(
+                f"  [multi-T] excluding T={r['T_nominal_K']:.1f} K — "
+                f"R_H_err outlier (log-MAD z={z:.1f} > {z_thresh})"
+            )
+    return keep
+
+def _filter_reliable_hall(results_list):
+    """Return (T, values...) masks for temperatures with a reliable Hall fit.
+
+    A result is kept when ``hall_reliable`` is True (or absent, for
+    backward compatibility) and the primary Hall scalar is finite.
+    """
+    keep = []
+    for r in results_list:
+        reliable = r.get('hall_reliable', True)
+        if reliable is False:
+            keep.append(False)
+            continue
+        if r.get('always_sc', False):
+            keep.append(False)
+            continue
+        keep.append(np.isfinite(r.get('R_H_m3_C', np.nan)))
+    return np.asarray(keep, dtype=bool)
+
+
+def _exclude_RH_error_outliers(results_list, keep, z_thresh=4.0):
+    """Drop temperatures whose R_H_err is an extreme outlier vs the rest.
+
+    Uses a robust MAD criterion on log(|σ_RH|).  Points already excluded
+    by ``keep`` are ignored when estimating the typical error scale.
+    """
+    keep = keep.copy()
+    errs = np.array([
+        abs(r.get('R_H_err_m3_C', np.nan)) for r in results_list
+    ], dtype=float)
+    valid = keep & np.isfinite(errs) & (errs > 0)
+    if np.sum(valid) < 3:
+        return keep
+    log_e = np.log10(errs[valid])
+    med = np.median(log_e)
+    mad = np.median(np.abs(log_e - med))
+    if mad < 1e-12:
+        # all similar — use a mild absolute factor vs the median error
+        med_err = np.median(errs[valid])
+        for i, r in enumerate(results_list):
+            if not keep[i]:
+                continue
+            e = abs(r.get('R_H_err_m3_C', np.nan))
+            if np.isfinite(e) and e > 20.0 * med_err:
+                keep[i] = False
+                print(
+                    f"  [multi-T] excluding T={r['T_nominal_K']:.1f} K — "
+                    f"R_H_err={e:.3g} is >> median {med_err:.3g}"
+                )
+        return keep
+    # modified z-score
+    for i, r in enumerate(results_list):
+        if not keep[i]:
+            continue
+        e = abs(r.get('R_H_err_m3_C', np.nan))
+        if not np.isfinite(e) or e <= 0:
+            keep[i] = False
+            continue
+        z = abs(np.log10(e) - med) / (1.4826 * mad)
+        if z > z_thresh:
+            keep[i] = False
+            print(
+                f"  [multi-T] excluding T={r['T_nominal_K']:.1f} K — "
+                f"R_H_err outlier (log-MAD z={z:.1f} > {z_thresh})"
+            )
+    return keep
+
+
 def plot_RH_vs_T(results_list, ax=None, figsize=None, color='tab:blue'):
     """R_H vs temperature from a list of single-T results.
  
@@ -2791,11 +2994,24 @@ def plot_RH_vs_T(results_list, ax=None, figsize=None, color='tab:blue'):
         h = (figsize[1] if figsize else 7)  / 2.54
         fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
  
+    keep = _filter_reliable_hall(results_list)
+    keep = _exclude_RH_error_outliers(results_list, keep)
+
     T   = np.array([r['T_nominal_K'] for r in results_list])
     RH  = np.array([r['R_H_m3_C']   for r in results_list]) * 1e9  # → mm³/C
     RHe = np.array([r['R_H_err_m3_C'] for r in results_list]) * 1e9
- 
-    ax.errorbar(T, RH, yerr=RHe, fmt='o', color=color, ms=4, capsize=3)
+
+    if np.any(keep):
+        ax.errorbar(T[keep], RH[keep], yerr=RHe[keep],
+                    fmt='o', color=color, ms=4, capsize=3)
+    n_excl = int(np.sum(~keep))
+    if n_excl > 0:
+        excl = [f"{r['T_nominal_K']:.0f}K" for r, k in zip(results_list, keep) if not k]
+        ax.annotate(
+            f"excluded: {', '.join(excl)}",
+            xy=(0.02, 0.97), xycoords='axes fraction',
+            va='top', fontsize=6, color='gray'
+        )
     ax.axhline(0, color='gray', ls=':', lw=0.5)
     ax.set_xlabel(r'$T$ (K)')
     ax.set_ylabel(r'$R_H$ (mm³/C)')
@@ -2814,10 +3030,14 @@ def plot_nH_vs_T(results_list, ax=None, figsize=None, color='tab:orange'):
         h = (figsize[1] if figsize else 7)  / 2.54
         fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
  
+    keep = _filter_reliable_hall(results_list)
+    keep = _exclude_RH_error_outliers(results_list, keep)
+
     T  = np.array([r['T_nominal_K'] for r in results_list])
     nH = np.array([r['n_H_cm3']     for r in results_list])
- 
-    ax.plot(T, nH, 'o', color=color, ms=4)
+
+    if np.any(keep):
+        ax.plot(T[keep], nH[keep], 'o', color=color, ms=4)
     ax.set_xlabel(r'$T$ (K)')
     ax.set_ylabel(r'$n_H$ (cm$^{-3}$)')
     ax.set_title(r'Hall carrier density $n_H(T)$')
@@ -2835,10 +3055,14 @@ def plot_muH_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
         h = (figsize[1] if figsize else 7)  / 2.54
         fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
  
+    keep = _filter_reliable_hall(results_list)
+    keep = _exclude_RH_error_outliers(results_list, keep)
+
     T  = np.array([r['T_nominal_K']  for r in results_list])
     mu = np.array([r['mu_H_cm2_Vs']  for r in results_list])
- 
-    ax.plot(T, mu, 'o', color=color, ms=4)
+
+    if np.any(keep):
+        ax.plot(T[keep], mu[keep], 'o', color=color, ms=4)
     ax.set_xlabel(r'$T$ (K)')
     ax.set_ylabel(r'$\mu_H$ (cm²/V·s)')
     ax.set_title(r'Hall mobility $\mu_H(T)$')
@@ -2846,11 +3070,12 @@ def plot_muH_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
  
  
 def plot_cot_theta_vs_T2(results_list, cot_fit=None, ax=None,
-                           figsize=None, color='tab:purple'):
-    """cot(θ_H) vs T² — uses cot_theta_scalar (mean over fit window),
-    matching the printed terminal values exactly.
-    NaN entries (always-SC, no normal state) are excluded from the plot.
-    """
+                         figsize=None, color='tab:purple',
+                         exponent=None):
+    """cot(θ_H) vs T^n.  If exponent is None, take it from cot_fit (else 2)."""
+    if exponent is None:
+        exponent = cot_fit.get('exponent', 2.0) if cot_fit else 2.0
+    
     created = ax is None
     if created:
         w = (figsize[0] if figsize else 8.6) / 2.54
@@ -2868,30 +3093,19 @@ def plot_cot_theta_vs_T2(results_list, cot_fit=None, ax=None,
         ax.set_title(r'$\cot\theta_H$ vs $T^2$  (no valid data)')
         return ax
 
-    ax.plot(T[finite]**2, ct[finite], 'o', color=color, ms=4,
-            label=r'$\cot\theta_H$ (mean over fit window)')
+    ax.plot(T[finite]**exponent, ct[finite], 'o', color=color, ms=4,
+            label=r'$\cot\theta_H$')
 
     if cot_fit is not None and cot_fit['poly'] is not None:
-        T2_plot = np.linspace(0, (T[finite]**2).max() * 1.05, 300)
-        ax.plot(T2_plot, cot_fit['poly'](T2_plot), color='k', ls='--', lw=1.0,
-                label=(rf"$\alpha T^2+\beta$,  "
-                        rf"$\alpha={cot_fit['alpha']:.3g}$ K$^{{-2}}$,  "
-                        rf"$R^2={cot_fit['R2']:.3f}$"))
+        Tn_max = (T[finite]**exponent).max()
+        Tn_plot = np.linspace(0, Tn_max * 1.05, 300)
+        ax.plot(Tn_plot, cot_fit['poly'](Tn_plot), color='k', ls='--', lw=1.0,
+                label=(rf"$\alpha T^{{{exponent:g}}}+\beta$,  "
+                       rf"$R^2={cot_fit['R2']:.3f}$"))
 
-    # Mark excluded (NaN/SC) temperatures if any
-    n_excl = int(np.sum(~finite))
-    if n_excl > 0:
-        excl_T = T[~finite]
-        ax.annotate(
-            f"{n_excl} T excluded (always SC): "
-            f"{[f'{v:.0f} K' for v in excl_T]}",
-            xy=(0.02, 0.97), xycoords='axes fraction',
-            va='top', fontsize=6, color='gray'
-        )
-
-    ax.set_xlabel(r'$T^2$ (K²)')
-    ax.set_ylabel(r'$\cot\theta_H$  (dimensionless)')
-    ax.set_title(r'Strange-metal diagnostic: $\cot\theta_H\propto T^2$')
+    ax.set_xlabel(rf'$T^{{{exponent:g}}}$ (K$^{{{exponent:g}}}$)')
+    ax.set_ylabel(r'$\cot\theta_H$')
+    ax.set_title(rf'$\cot\theta_H \propto T^{{{exponent:g}}}$')
     ax.legend()
     return ax
  
@@ -3038,77 +3252,169 @@ def plot_rxx_vs_T(results_list, ax=None, figsize=None, color='tab:blue'):
     ax.legend()
     return ax
 
-
-
-def compute_T_star(results_list, poly_deg=3, y_threshold=0.95,
-                   high_T_frac=0.4):
+def compute_T_star(results_list, y_threshold=0.95, high_T_frac=0.4):
     """Estimate the pseudogap onset temperature T* from ρ_xx(T).
 
     1. Collect ρ_xx(H_ref) vs T.
     2. Linear-fit the high-T subset: ρ = a·T + ρ₀.
     3. y(T) = (ρ_xx − ρ₀)/(a·T)  → 1 in the T-linear regime.
-    4. Polynomial-fit y(T); T* = highest T where the fit crosses
-       y_threshold (default 0.95) from above.
+    4. Fit a *constrained log model* that encodes the expected shape:
+
+           y_fit(T) = 1                         for  T ≥ T₀
+           y_fit(T) = 1 − B·ln(T₀/T)            for  T <  T₀
+
+       with B ≥ 0.  T₀ is the temperature where y first leaves the
+       plateau at 1 — i.e. the natural definition of T*.  A dense grid
+       search over T₀ (plus an analytic best-B for each trial) is used
+       so the fit remains stable with only a handful of points.
+    5. T* is reported as T₀; an optional y_threshold crossing on the
+       fitted curve is also computed for comparison.  Uncertainty comes
+       from the residual rms propagated through the local slope.
+
+    This constrained form extrapolates more reliably than a free
+    A − B·ln(T) polynomial when data are sparse, because the high-T
+    asymptote y → 1 is built in rather than fitted.
     """
     T   = np.array([r['T_nominal_K']   for r in results_list], dtype=float)
     rxx = np.array([r['rxx_ref_Ohm_m'] for r in results_list], dtype=float)
-    finite = np.isfinite(T) & np.isfinite(rxx)
+    finite = np.isfinite(T) & np.isfinite(rxx) & (T > 0)
     T, rxx = T[finite], rxx[finite]
-    if len(T) < 3:
-        return {'T_star_K': np.nan, 'T_star_err_K': np.nan,
-                'a': np.nan, 'a_err': np.nan, 'rho0': np.nan,
-                'y': np.array([]), 'T': T, 'poly': None,
-                'y_threshold': y_threshold}
+
+    empty = {
+        'T_star_K': np.nan, 'T_star_err_K': np.nan,
+        'a': np.nan, 'a_err': np.nan, 'rho0': np.nan,
+        'y': np.array([]), 'T': T, 'poly': None,
+        'fit_A': np.nan, 'fit_B': np.nan, 'fit_T0': np.nan,
+        'y_threshold': y_threshold, 'rxx_uOhm_cm': np.array([]),
+    }
+    if len(T) < 2:
+        print("  [T*] fewer than 2 finite ρ_xx(T) points — cannot estimate T*.")
+        return empty
 
     order = np.argsort(T)
     T, rxx = T[order], rxx[order]
     rxx_u = rxx * _HALL_Ohm_m_to_uOhm_cm
 
+    # ── High-T linear fit for a = dρ/dT ────────────────────────────────
     n_hi = max(2, int(np.ceil(high_T_frac * len(T))))
+    n_hi = min(n_hi, len(T))
     hi = slice(-n_hi, None)
-    coeffs_lin, cov_lin = np.polyfit(T[hi], rxx_u[hi], deg=1, cov=True)
-    a     = float(coeffs_lin[0])
-    rho0  = float(coeffs_lin[1])
-    a_err = float(np.sqrt(cov_lin[0, 0]))
+    if n_hi >= 3:
+        coeffs_lin, cov_lin = np.polyfit(T[hi], rxx_u[hi], deg=1, cov=True)
+        a_err = float(np.sqrt(cov_lin[0, 0]))
+    else:
+        coeffs_lin = np.polyfit(T[hi], rxx_u[hi], deg=1)
+        a_err = np.nan
+    a    = float(coeffs_lin[0])
+    rho0 = float(coeffs_lin[1])
 
     with np.errstate(divide='ignore', invalid='ignore'):
         y = (rxx_u - rho0) / (a * T)
 
-    deg = min(poly_deg, len(T) - 1)
-    poly_c = np.polyfit(T, y, deg=deg)
-    poly   = np.poly1d(poly_c)
+    # ── Constrained log model via grid search over T₀ ─────────────────
+    # y_fit = 1                     (T ≥ T₀)
+    # y_fit = 1 - B·ln(T₀/T)        (T < T₀),  B ≥ 0
+    #
+    # For a fixed T₀ the optimal B is analytic:
+    #   points above T₀ contribute (y_i − 1)²
+    #   points below: minimise Σ[y_i − 1 + B·ln(T₀/T_i)]²
+    #     → B = Σ(1−y_i)·L_i  /  Σ L_i²    with L_i = ln(T₀/T_i)
+    #     (then clamp B ≥ 0)
 
-    T_dense = np.linspace(T.min(), T.max(), 2000)
-    y_dense = poly(T_dense)
-    above = y_dense >= y_threshold
-    T_star = np.nan
-    for i in range(len(T_dense) - 1, 0, -1):
-        if above[i] and not above[i - 1]:
-            t1, t2 = T_dense[i - 1], T_dense[i]
-            y1, y2 = y_dense[i - 1], y_dense[i]
-            T_star = t1 + (y_threshold - y1) * (t2 - t1) / (y2 - y1 + 1e-30)
-            break
-    if not np.isfinite(T_star):
-        T_star = float(T.min()) if np.all(y_dense >= y_threshold) else float(T.max())
+    T_lo = float(T.min())
+    T_hi = float(T.max())
+    # Allow T₀ slightly outside the measured window for extrapolation
+    T0_grid = np.unique(np.concatenate([
+        np.linspace(max(T_lo * 0.5, 1.0), T_hi * 1.5, 400),
+        T,  # always test the data abscissae themselves
+    ]))
 
-    resid = y - poly(T)
-    rms = float(np.sqrt(np.mean(resid**2))) if len(resid) else np.nan
-    slope = float(np.polyder(poly)(T_star)) if np.isfinite(T_star) else np.nan
+    best = {'rss': np.inf, 'T0': np.nan, 'B': np.nan}
+
+    for T0 in T0_grid:
+        if T0 <= 0:
+            continue
+        below = T < T0
+        above = ~below
+        rss = 0.0
+        B = 0.0
+
+        if np.any(above):
+            rss += float(np.sum((y[above] - 1.0) ** 2))
+
+        if np.any(below):
+            L = np.log(T0 / T[below])          # > 0
+            # avoid degenerate L≈0 (T very close to T₀)
+            valid = L > 1e-12
+            if np.any(valid):
+                Lv = L[valid]
+                yv = y[below][valid]
+                denom = float(np.sum(Lv ** 2))
+                if denom > 0:
+                    B = float(np.sum((1.0 - yv) * Lv) / denom)
+                B = max(B, 0.0)
+                rss += float(np.sum((yv - (1.0 - B * Lv)) ** 2))
+                # points with L≈0 treated as on the plateau
+                if np.any(~valid):
+                    rss += float(np.sum((y[below][~valid] - 1.0) ** 2))
+            else:
+                rss += float(np.sum((y[below] - 1.0) ** 2))
+
+        if rss < best['rss']:
+            best = {'rss': rss, 'T0': float(T0), 'B': float(B)}
+
+    T0 = best['T0']
+    B  = best['B']
+    A  = 1.0   # plateau value (for API compatibility with earlier A - B ln T)
+
+    def y_fit(t):
+        t = np.asarray(t, dtype=float)
+        out = np.ones_like(t, dtype=float)
+        mask = t < T0
+        if np.any(mask) and B > 0:
+            out[mask] = 1.0 - B * np.log(T0 / t[mask])
+        return out
+
+    # T* ≡ T₀ (onset of departure from the plateau)
+    T_star = T0
+
+    # Also compute the y_threshold crossing on the fitted curve (T < T₀)
+    # 1 - B·ln(T₀/T_cross) = y_threshold
+    # → T_cross = T₀ · exp(−(1 − y_threshold)/B)
+    T_cross = np.nan
+    if B > 1e-12 and y_threshold < 1.0:
+        T_cross = T0 * np.exp(-(1.0 - y_threshold) / B)
+
+    resid = y - y_fit(T)
+    rms = float(np.sqrt(np.mean(resid ** 2))) if len(resid) else np.nan
+    # dy/dT |_{T*} : just below T₀ the slope is B/T₀
+    slope = (B / T0) if (np.isfinite(T0) and T0 > 0) else np.nan
     T_star_err = abs(rms / slope) if (np.isfinite(slope) and abs(slope) > 1e-12) else np.nan
 
+    a_err_str = f"{a_err:.2g}" if np.isfinite(a_err) else "n/a"
+    ts_err_str = f"{T_star_err:.1f}" if np.isfinite(T_star_err) else "n/a"
+    cross_str = f"{T_cross:.1f} K" if np.isfinite(T_cross) else "n/a"
     print(
         f"\n  T* (pseudogap) estimate:\n"
-        f"  a = dρ/dT  = {a:.4g} ± {a_err:.2g}  µΩ·cm/K  "
+        f"  a = dρ/dT  = {a:.4g} ± {a_err_str}  µΩ·cm/K  "
         f"(from {n_hi} high-T points)\n"
         f"  ρ₀         = {rho0:.4g}  µΩ·cm\n"
-        f"  T*         = {T_star:.1f} ± {T_star_err:.1f} K  "
-        f"(y crosses {y_threshold})\n"
+        f"  constrained log fit:\n"
+        f"    y = 1                     (T ≥ T₀)\n"
+        f"    y = 1 − B·ln(T₀/T)        (T <  T₀)\n"
+        f"    T₀ = {T0:.1f} K ,  B = {B:.4g}\n"
+        f"  T* (≡ T₀)  = {T_star:.1f} ± {ts_err_str} K\n"
+        f"  y={y_threshold} crossing on fit: {cross_str}\n"
     )
 
     return {
         'T_star_K': T_star, 'T_star_err_K': T_star_err,
+        'T_cross_K': T_cross,
         'a': a, 'a_err': a_err, 'rho0': rho0,
-        'y': y, 'T': T, 'poly': poly,
+        'y': y, 'T': T,
+        'poly': None,
+        'y_fit': y_fit,
+        'fit_A': A, 'fit_B': B, 'fit_T0': T0,
         'y_threshold': y_threshold, 'rxx_uOhm_cm': rxx_u,
     }
 
@@ -3132,14 +3438,26 @@ def plot_T_star(results_list, tstar_result=None, ax=None, figsize=None,
 
     ax.plot(T, y, 'o', color=color, ms=4, zorder=3,
             label=r'$(\rho_{xx}-\rho_0)/(a\,T)$')
-    if tstar_result['poly'] is not None:
-        T_fit = np.linspace(T.min(), T.max(), 400)
-        ax.plot(T_fit, tstar_result['poly'](T_fit), 'k--', lw=1.0, label='poly fit')
+
+    y_fit = tstar_result.get('y_fit')
+    T0 = tstar_result.get('fit_T0', np.nan)
+    if y_fit is not None and len(T) > 0:
+        # Extend slightly below lowest T to show extrapolation
+        t_min = max(T.min() * 0.7, 1.0)
+        t_max = T.max() * 1.05
+        T_fit = np.linspace(t_min, t_max, 500)
+        ax.plot(T_fit, y_fit(T_fit), 'k--', lw=1.0,
+                label=r'constrained $1 - B\ln(T_0/T)$')
+
+    ax.axhline(1.0, color='gray', ls=':', lw=0.6, alpha=0.7)
     ax.axhline(tstar_result['y_threshold'], color='gray', ls=':', lw=0.7)
+
     Ts = tstar_result['T_star_K']
     if np.isfinite(Ts):
+        err = tstar_result['T_star_err_K']
+        err_str = f"{err:.1f}" if np.isfinite(err) else "?"
         ax.axvline(Ts, color='tab:red', ls='--', lw=1.0,
-                   label=rf"$T^*={Ts:.1f}\pm{tstar_result['T_star_err_K']:.1f}$ K")
+                   label=rf"$T^*={Ts:.1f}\pm{err_str}$ K")
 
     ax.set_xlabel(r'$T$ (K)')
     ax.set_ylabel(r'$(\rho_{xx}-\rho_0)/(a\,T)$')
