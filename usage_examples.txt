@@ -1,0 +1,36 @@
+### Usage examples on how to use and run the code for each data type ###
+
+--- R(T) ---
+
+python3 plot_csv_data.py RT 260812_RT_300to3K_001.csv --skip-points 3 --drdt --current 1e-6 --labels "Bi2201 t~40nm" --zoom 25 50  -o "Bi2201_t40nm_RT.pdf"
+
+[python] [file] [mode] [file or files for multiple R(T) plots] --skip-points [on the beggining of the measurement] --drdt [include dR/dT]
+--current [input current in A] --labels [plot label to show] --zoom [x0] [x1] [zoomed-in plots; can do multiple for multiple zoomed plots]
+-o [output file base name; needs to come last]
+
+--- MR and Hall analysis ---
+
+python3 plot_csv_data.py Hall_MR *-5to5T*.csv --bwd *5to-5T*.csv --comments *.txt  --thickness 40e-9 --show-T --current 1e-6 --check-hysteresis --zoom-Rxx -500 500
+
+[python] [file] [mode] [all fwd files] --bwd [all bwd files] --comments[all comments files] --thickness [m] --show-T [multi-T plots/analysis]
+--current [input current in A] --check-hysteresis [resistivity plots of fwd and bwd] --zoom-Rxx [x0] [x1] [zoomed window for rho_xx plots of fwd and bwd]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
