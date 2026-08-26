@@ -2355,6 +2355,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                      V_cell_per_Z_A3=_BI2201_VCELL_PER_Z_A3,
                      fit_H_range_Oe=None,
                      rho_xx0_field_Oe=None,
+                     ryx_fit_mode='full',
                      T_label=None,
                      n_grid=500):
     """Full Hall and magnetoresistance analysis for one temperature scan.
@@ -2411,13 +2412,21 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         for <25% precision on p.
     fit_H_range_Oe : (float, float), optional
         Positive-H window (Oe) for the linear R_H fit: R_H = ρ_yx^odd/B.
-        Should be above H_irr(T) (determined from sweep hysteresis or
-        from the phase channel θ becoming constant).  If None, the full
-        field range is used (valid only if the sample is fully normal).
+        Overrides the auto window from H_irr when supplied.
     rho_xx0_field_Oe : float
         Field (Oe) at which to evaluate ρ_xx for the µ_H denominator.
         Default: 0 (zero-field limit, appropriate in the normal state).
         If the sample is SC at H=0, set this to a field above H_irr(T).
+        Always taken in the normal-state region when H_irr is known —
+        independent of ryx_fit_mode.
+    ryx_fit_mode : {'normal', 'full'}
+        'normal' (default): fit ρ_yx only above H_irr (normal-state window
+        shared with ρ_xx diagnostics).  If no normal state is found the
+        Hall fit is skipped (always_sc).
+        'full': fit ρ_yx over the entire positive-H range (or
+        fit_H_range_Oe if given), even when the sample is SC at low field.
+        Reliability checks still apply.  Quantities that mix ρ_yx and ρ_xx
+        (µ_H, cot θ_H) still use ρ_xx evaluated in the normal regime.
     T_label : str or float, optional
         Temperature label; defaults to mean(Tsample).
     n_grid : int
@@ -2483,13 +2492,18 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
     ryx_odd_fwd_full = None
     ryx_odd_bwd_full = None
     H_asym_fwd = H_asym_bwd = None
+    rxx_even_fwd_full = None
+    rxx_even_bwd_full = None
+    H_sym_fwd = H_sym_bwd = None
 
     if np.any(H_grid < 0) and np.any(H_grid > 0):
         H_pos, ryx_odd_pos, H_asym, ryx_odd = _antisymmetrize(H_grid, ryx_g)
         H_pos, rxx_even_pos, H_sym,  rxx_even = _symmetrize(H_grid, rxx_g)
         _, _, H_asym_fwd, ryx_odd_fwd_full = _antisymmetrize(H_grid, ryx_g_fwd)
+        _, _, H_sym_fwd,  rxx_even_fwd_full = _symmetrize(H_grid, rxx_g_fwd)
         if ryx_g_bwd is not None:
             _, _, H_asym_bwd, ryx_odd_bwd_full = _antisymmetrize(H_grid, ryx_g_bwd)
+            _, _, H_sym_bwd,  rxx_even_bwd_full = _symmetrize(H_grid, rxx_g_bwd)
     else:
         warnings.warn(
             "H sweep does not cross zero; antisymmetrization not possible. "
@@ -2540,33 +2554,80 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
             UserWarning, stacklevel=2
         )
 
-    if not _user_supplied_fit_range:
-        if H_irr_detected is not None:
-            H_max_pos = float(H_pos.max()) if len(H_pos) > 0 else 0.0
-            fit_H_range_Oe = (H_irr_detected, H_max_pos)
-            print(f"  [auto] H_irr ≈ {H_irr_detected:.0f} Oe "
-                  f"(magnitude+phase); "
-                  f"fit range set to [{H_irr_detected:.0f}, {H_max_pos:.0f}] Oe")
-        else:
-            always_sc = True
-            print(
-                f"\n  ⚠  No normal state detected across the entire "
-                f"measured field range — sample appears SC at all measured fields. "
-                f"R_H, n_H, p, µ_H cannot be extracted at T = {T_label}.\n"
-                f"  Raw ρ_yx and ρ_xx are still computed and returned for plotting."
-            )
+    ryx_fit_mode = str(ryx_fit_mode).lower().strip()
+    if ryx_fit_mode not in ('normal', 'full'):
+        raise ValueError(
+            f"ryx_fit_mode must be 'normal' or 'full', got {ryx_fit_mode!r}"
+        )
 
+    H_max_pos = float(H_pos.max()) if len(H_pos) > 0 else 0.0
+
+    if not _user_supplied_fit_range:
+        if ryx_fit_mode == 'normal':
+            if H_irr_detected is not None:
+                fit_H_range_Oe = (H_irr_detected, H_max_pos)
+                print(f"  [auto] H_irr ≈ {H_irr_detected:.0f} Oe "
+                      f"(magnitude+phase); "
+                      f"ρ_yx fit range (normal) "
+                      f"[{H_irr_detected:.0f}, {H_max_pos:.0f}] Oe")
+            else:
+                always_sc = True
+                print(
+                    f"\n  ⚠  No normal state detected across the entire "
+                    f"measured field range — sample appears SC at all measured "
+                    f"fields.  With ryx_fit_mode='normal', R_H cannot be "
+                    f"extracted at T = {T_label}.\n"
+                    f"  Raw ρ_yx and ρ_xx are still computed and returned "
+                    f"for plotting.  Use --ryx-fit-mode full to force a "
+                    f"full-range ρ_yx fit."
+                )
+        else:  # full
+            fit_H_range_Oe = (0.0, H_max_pos)
+            if H_irr_detected is None:
+                always_sc = True
+                print(
+                    f"  [auto] No normal state detected (always_sc).  "
+                    f"ryx_fit_mode='full' → ρ_yx fit over full positive-H "
+                    f"range [0, {H_max_pos:.0f}] Oe."
+                )
+            else:
+                print(f"  [auto] H_irr ≈ {H_irr_detected:.0f} Oe; "
+                      f"ryx_fit_mode='full' → ρ_yx fit over "
+                      f"[0, {H_max_pos:.0f}] Oe (not restricted to normal).")
+    elif H_irr_detected is None:
+        always_sc = True
+        print(
+            f"  ⚠  No normal state detected; user-supplied fit_H_range "
+            f"{fit_H_range_Oe} will still be used for ρ_yx."
+        )
+
+    # ρ_xx reference field: ALWAYS preferred in the normal regime
     if not _user_supplied_rho_ref:
         if H_irr_detected is not None:
             rho_xx0_field_Oe = H_irr_detected
             print(f"  [auto] ρ_xx reference field set to H_irr = "
-                  f"{H_irr_detected:.0f} Oe")
+                  f"{H_irr_detected:.0f} Oe (normal regime)")
         elif not always_sc:
-            rho_xx0_field_Oe = 0.0   # phase suggests normal at H=0
- 
-  # ── 6–8. Derived quantities, fit, and summary ──────────────────────────
-    # Initialise ALL derived scalars to NaN so the always-SC branch never
-    # hits an undefined variable or a None format string.
+            rho_xx0_field_Oe = 0.0
+        else:
+            rho_xx0_field_Oe = None  # no reliable normal-state ρ_xx
+
+    # Zero-field values per sweep (hysteresis diagnostics)
+    def _at_zero(H_arr, rho_arr):
+        if H_arr is None or rho_arr is None:
+            return np.nan
+        H_arr = np.asarray(H_arr, dtype=float)
+        rho_arr = np.asarray(rho_arr, dtype=float)
+        if len(H_arr) == 0 or not np.any(np.isfinite(rho_arr)):
+            return np.nan
+        return float(np.interp(0.0, H_arr, rho_arr))
+
+    rxx0_fwd = _at_zero(H_sym_fwd, rxx_even_fwd_full)
+    rxx0_bwd = _at_zero(H_sym_bwd, rxx_even_bwd_full)
+    ryx0_fwd = _at_zero(H_asym_fwd, ryx_odd_fwd_full)
+    ryx0_bwd = _at_zero(H_asym_bwd, ryx_odd_bwd_full)
+
+    # ── 6–8. Derived quantities, fit, and summary ──────────────────────────
     R_H = R_H_err = RH_offset = np.nan
     n_H_m3 = n_H_cm3 = p = mu_H_SI = mu_H_cm2 = np.nan
     cot_theta_scalar = cot_theta_at_ref = H_ref_Oe = np.nan
@@ -2574,7 +2635,6 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
     ryx_at_ref_Ohm_m = np.nan
     fit_mask = np.zeros(len(H_pos), dtype=bool)
 
-    # cot(θ_H) array — computed regardless of SC state (used for plotting)
     with np.errstate(divide='ignore', invalid='ignore'):
         cot_theta = np.where(
             np.abs(ryx_odd_pos) > 1e-20,
@@ -2582,7 +2642,13 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
             np.nan
         )
 
-    if not always_sc:
+    # R_H fit: allowed whenever we have a fit window (normal or full mode)
+    _do_RH_fit = (
+        fit_H_range_Oe is not None
+        or ryx_fit_mode == 'full'
+        or not always_sc
+    )
+    if _do_RH_fit:
         # ── 6. R_H linear fit ─────────────────────────────────────────────
         if fit_H_range_Oe is not None:
             fit_mask = ((H_pos >= fit_H_range_Oe[0]) &
@@ -2611,20 +2677,22 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                 V_cell_m3 = V_cell_per_Z_A3 * _HALL_A3_to_m3
                 p = abs(n_H_m3) * V_cell_m3 - 1.0
 
-            # ρ_xx at reference field
-            _ref_H = rho_xx0_field_Oe if rho_xx0_field_Oe is not None else 0.0
-            rxx_ref = float(np.interp(_ref_H, H_pos, rxx_even_pos))
-            if abs(rxx_ref) > 1e-20:
-                mu_H_SI  = abs(R_H) / abs(rxx_ref)
-                mu_H_cm2 = mu_H_SI * 1e4
+            # ρ_xx at reference field (ALWAYS normal-regime preference)
+            if rho_xx0_field_Oe is not None:
+                _ref_H = float(rho_xx0_field_Oe)
+                rxx_ref = float(np.interp(_ref_H, H_pos, rxx_even_pos))
+                if abs(rxx_ref) > 1e-20 and abs(R_H) > 1e-30:
+                    mu_H_SI  = abs(R_H) / abs(rxx_ref)
+                    mu_H_cm2 = mu_H_SI * 1e4
+                else:
+                    warnings.warn(
+                        f"ρ_xx ≈ 0 at the reference field ({_ref_H:.0f} Oe) — "
+                        "µ_H cannot be computed.",
+                        UserWarning, stacklevel=2
+                    )
             else:
-                _ref_str = (f"{_ref_H:.0f} Oe"
-                            if rho_xx0_field_Oe is not None else "auto")
-                warnings.warn(
-                    f"ρ_xx ≈ 0 at the reference field ({_ref_str}) — "
-                    "µ_H cannot be computed.",
-                    UserWarning, stacklevel=2
-                )
+                rxx_ref = np.nan
+                # no normal-state ρ_xx → µ_H unavailable even if R_H is finite
 
                         # ── cot(θ_H) from fitted ρ_yx (immune to low-field noise) ──────
             # Using the raw antisymmetrised ryx_odd to compute cot_theta is
@@ -2742,6 +2810,16 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'ryx_odd_bwd_full': ryx_odd_bwd_full,
         'H_asym_fwd_Oe':    H_asym_fwd,
         'H_asym_bwd_Oe':    H_asym_bwd,
+        # Independently symmetrized fwd / bwd ρ_xx
+        'rxx_even_fwd_full': rxx_even_fwd_full,
+        'rxx_even_bwd_full': rxx_even_bwd_full,
+        'H_sym_fwd_Oe':     H_sym_fwd,
+        'H_sym_bwd_Oe':     H_sym_bwd,
+        # Zero-field hysteresis diagnostics
+        'rxx0_fwd_Ohm_m':  rxx0_fwd,
+        'rxx0_bwd_Ohm_m':  rxx0_bwd,
+        'ryx0_fwd_Ohm_m':  ryx0_fwd,
+        'ryx0_bwd_Ohm_m':  ryx0_bwd,
         # ── Processed: symmetrized MR ────────────────────────────────────
         'H_sym_Oe':        H_sym,
         'rxx_even_pos':    rxx_even_pos,   # Ω·m
@@ -2790,6 +2868,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'V_cell_per_Z_A3': V_cell_per_Z_A3,
         'fit_H_range_Oe':  fit_H_range_Oe,
         'rho_xx0_field_Oe': rho_xx0_field_Oe,
+        'ryx_fit_mode':    ryx_fit_mode,
         'geom_factor':     geom_xx,
     }
 # Fitting for the costheta
@@ -2994,9 +3073,7 @@ def plot_hall_antisym(result, ax=None, color='tab:blue',
     if created:
         ax.set_title(f"T = {result['T_label']}")
     return ax
- 
- 
-
+  
 def plot_hall_antisym_fwd_bwd(result, ax=None, figsize=None,
                               color_fwd='tab:blue', color_bwd='tab:red'):
     """Overlay independently antisymmetrized ρ_yx of fwd and bwd sweeps.
@@ -3032,6 +3109,85 @@ def plot_hall_antisym_fwd_bwd(result, ax=None, figsize=None,
         ax.set_title(f"T = {result['T_label']}  (fwd vs bwd antisym)")
     return ax
 
+def plot_rho_xx_fwd_bwd(result, ax=None, figsize=None,
+                        color_fwd='tab:blue', color_bwd='tab:red',
+                        xlim=None):
+    """Overlay independently symmetrized ρ_xx of fwd and bwd sweeps.
+
+    Parameters
+    ----------
+    xlim : (float, float), optional
+        Field limits in Oe for a zoomed view (e.g. near H=0).
+        When set, the y-axis is scaled to the data inside that window only.
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7)  / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    y_for_scale = []
+
+    if result.get('rxx_even_fwd_full') is not None and result.get('H_sym_fwd_Oe') is not None:
+        H_Oe = np.asarray(result['H_sym_fwd_Oe'], dtype=float)
+        rxx = _to_uOhm_cm(result['rxx_even_fwd_full'])
+        ax.plot(H_Oe * 1e-4, rxx, color=color_fwd, lw=0.9,
+                label=r'fwd $\rho_{xx}^{\rm even}$')
+        if xlim is not None:
+            m = (H_Oe >= xlim[0]) & (H_Oe <= xlim[1]) & np.isfinite(rxx)
+            if np.any(m):
+                y_for_scale.append(rxx[m])
+        else:
+            finite = rxx[np.isfinite(rxx)]
+            if len(finite):
+                y_for_scale.append(finite)
+
+    if result.get('rxx_even_bwd_full') is not None and result.get('H_sym_bwd_Oe') is not None:
+        H_Oe = np.asarray(result['H_sym_bwd_Oe'], dtype=float)
+        rxx = _to_uOhm_cm(result['rxx_even_bwd_full'])
+        ax.plot(H_Oe * 1e-4, rxx, color=color_bwd, lw=0.9,
+                label=r'bwd $\rho_{xx}^{\rm even}$')
+        if xlim is not None:
+            m = (H_Oe >= xlim[0]) & (H_Oe <= xlim[1]) & np.isfinite(rxx)
+            if np.any(m):
+                y_for_scale.append(rxx[m])
+        else:
+            finite = rxx[np.isfinite(rxx)]
+            if len(finite):
+                y_for_scale.append(finite)
+    elif not result.get('has_bwd'):
+        ax.text(0.5, 0.5, 'No backward sweep supplied',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=9, color='gray')
+
+    if xlim is not None:
+        ax.set_xlim(xlim[0] * 1e-4, xlim[1] * 1e-4)
+
+    # Scale y to the (possibly zoomed) data only — do not force-include 0
+    if y_for_scale:
+        y_all = np.concatenate([np.asarray(y, dtype=float).ravel() for y in y_for_scale])
+        y_all = y_all[np.isfinite(y_all)]
+        if len(y_all):
+            y_lo, y_hi = float(np.min(y_all)), float(np.max(y_all))
+            if y_hi > y_lo:
+                pad = 0.05 * (y_hi - y_lo)
+            else:
+                pad = 0.05 * (abs(y_hi) + 1e-30)
+            ax.set_ylim(y_lo - pad, y_hi + pad)
+
+    # Vertical guide at H=0 (does not affect y-limits once set)
+    if xlim is None or (xlim[0] <= 0 <= xlim[1]):
+        ax.axvline(0, color='gray', lw=0.5, ls=':')
+
+    ax.set_xlabel(r'$\mu_0 H$ (T)')
+    ax.set_ylabel(r'$\rho_{xx}^{\rm even}$ ($\mu\Omega\cdot$cm)')
+    ax.legend()
+    if created:
+        title = f"T = {result['T_label']}  (fwd vs bwd sym)"
+        if xlim is not None:
+            title += f"  zoom [{xlim[0]:.0f},{xlim[1]:.0f}] Oe"
+        ax.set_title(title)
+    return ax
 
 def plot_rho_xx(result, ax=None, color='tab:blue', figsize=None):
     """Plot symmetrized ρ_xx^even(H) vs field.
@@ -4181,6 +4337,25 @@ def _add_Hall_MR_parser(subparsers):
         "--n-grid", type=int, default=500,
         help="Points in the common H interpolation grid (default: 500)."
     )
+    p.add_argument(
+        "--ryx-fit-mode", choices=["normal", "full"], default="full",
+        help="Field window for the linear ρ_yx (R_H) fit. "
+             "'normal' (default): only above auto-detected H_irr. "
+             "'full': entire positive-H range (still subject to reliability "
+             "checks).  ρ_xx for µ_H / cot θ_H is always taken in the "
+             "normal regime when H_irr is known."
+    )
+    p.add_argument(
+        "--zoom-Rxx", nargs=2, type=float, default=None,
+        metavar=("HMIN_OE", "HMAX_OE"),
+        help="If set, also save a zoomed fwd/bwd symmetrized ρ_xx plot "
+             "restricted to this field window in Oe (e.g. --zoom-Rxx -500 500)."
+    )
+    p.add_argument(
+        "--check-hysteresis", action="store_true",
+        help="Print ρ_xx(H=0) and ρ_yx(H=0) for fwd and bwd sweeps "
+             "(from independently sym/antisymmetrized curves)."
+    )
     return p
 
 def _run_RT(args):
@@ -4854,6 +5029,212 @@ def _run_IV_dVdI(args):
 
 def _run_Hall_MR(args):
     """Execute the Hall_MR subcommand."""
+    n_T = len(args.fwd_files)
+ 
+    bwd_files  = args.bwd_files  or [None] * n_T
+    comments   = args.comments   or [None] * n_T
+    T_labels   = args.T_labels   or [None] * n_T
+ 
+    if len(bwd_files) not in (0, n_T):
+        raise ValueError(
+            f"--bwd-files must match the number of fwd_files ({n_T}), "
+            f"got {len(bwd_files)}."
+        )
+    bwd_files = list(bwd_files) + [None] * (n_T - len(bwd_files))
+    T_labels  = list(T_labels)  + [None] * (n_T - len(T_labels))
+ 
+    fs = (args.figsize[0] / 2.54, args.figsize[1] / 2.54)
+    base, ext = os.path.splitext(args.output)
+    if not ext:
+        ext = ".pdf"
+ 
+    print(f"\nHall/MR analysis — {n_T} temperature scan(s)")
+ 
+    results = []
+ 
+    for i, (fwd, bwd, cmt, lbl) in enumerate(
+        zip(args.fwd_files, bwd_files, comments, T_labels)
+    ):
+        # ── Banner — printed BEFORE anything else for this temperature ──────
+        T_display = lbl if lbl else "auto"
+        print(f"\n{'═'*62}")
+        print(f"  Scan {i+1}/{n_T}   T = {T_display}")
+        print(f"  fwd : {os.path.basename(fwd)}")
+        if bwd:
+            print(f"  bwd : {os.path.basename(bwd)}")
+        print(f"{'─'*62}")
+
+        # ── Comments — immediately after banner, before any analysis ────────
+        for cmt_path, label in [(cmt, 'comments')]:
+            if cmt_path is not None and os.path.isfile(cmt_path):
+                meta = parse_hall_mr_comments(cmt_path)
+                print(f"  [{label}]")
+                for line in meta['raw']:
+                    if line.strip():
+                        print(f"    {line}")
+                print(f"  {'─'*56}")
+
+        # ── Analysis (prints spikes / trim / H_irr / results internally) ────
+        #    All internal messages now come after the banner and comments.
+        result = analyze_hall_mr(
+            fwd_source       = fwd,
+            bwd_source       = bwd,
+            hall_n           = args.hall_n,
+            mr_n             = args.mr_n,
+            hall_col         = args.hall_col,
+            mr_col           = args.mr_col,
+            current          = args.current,
+            t                = args.thickness,
+            w                = args.width,
+            l                = args.length,
+            V_cell_per_Z_A3  = args.V_cell_Z,
+            fit_H_range_Oe   = (tuple(args.fit_H_range)
+                                 if args.fit_H_range else None),
+            rho_xx0_field_Oe = (args.rho_xx_field
+                                 if args.rho_xx_field else None),
+            ryx_fit_mode     = args.ryx_fit_mode,
+            T_label          = lbl,
+            n_grid           = args.n_grid,
+        )
+        results.append(result)
+
+        # ── Per-temperature figures ─────────────────────────────────────────
+        T_str = f"{int(round(result['T_nominal_K']))}K"
+        set_paper_style()
+
+        fig_raw, _ = plot_hall_raw(result, show_T=args.show_T,
+                                    figsize=args.figsize)
+        path = f"{base}_raw_{T_str}{ext}"
+        fig_raw.savefig(path, dpi=300)
+        plt.close(fig_raw)
+        print(f"  Saved {path}")
+
+        fig_ah, ax_ah = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_hall_antisym(result, ax=ax_ah)
+        path = f"{base}_ryx_{T_str}{ext}"
+        fig_ah.savefig(path, dpi=300)
+        plt.close(fig_ah)
+        print(f"  Saved {path}")
+
+        fig_rx, ax_rx = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_rho_xx(result, ax=ax_rx)
+        path = f"{base}_rxx_{T_str}{ext}"
+        fig_rx.savefig(path, dpi=300)
+        plt.close(fig_rx)
+        print(f"  Saved {path}")
+
+        if np.any(np.isfinite(result['MR'])):
+            fig_mr, ax_mr = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_MR_hall(result, ax=ax_mr)
+            path = f"{base}_MR_{T_str}{ext}"
+            fig_mr.savefig(path, dpi=300)
+            plt.close(fig_mr)
+            print(f"  Saved {path}")
+
+        # fwd vs bwd antisymmetrized ρ_yx (hysteresis / vortex check)
+        fig_fb, ax_fb = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_hall_antisym_fwd_bwd(result, ax=ax_fb)
+        path = f"{base}_ryx_fwd_bwd_{T_str}{ext}"
+        fig_fb.savefig(path, dpi=300)
+        plt.close(fig_fb)
+        print(f"  Saved {path}")
+
+        # fwd vs bwd symmetrized ρ_xx
+        fig_rxfb, ax_rxfb = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_rho_xx_fwd_bwd(result, ax=ax_rxfb)
+        path = f"{base}_rxx_fwd_bwd_{T_str}{ext}"
+        fig_rxfb.savefig(path, dpi=300)
+        plt.close(fig_rxfb)
+        print(f"  Saved {path}")
+
+        if getattr(args, 'zoom_Rxx', None) is not None:
+            zlim = tuple(args.zoom_Rxx)
+            fig_zx, ax_zx = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_rho_xx_fwd_bwd(result, ax=ax_zx, xlim=zlim)
+            path = f"{base}_rxx_fwd_bwd_zoom_{zlim[0]:g}-{zlim[1]:g}_{T_str}{ext}"
+            fig_zx.savefig(path, dpi=300)
+            plt.close(fig_zx)
+            print(f"  Saved {path}")
+
+        if getattr(args, 'check_hysteresis', False):
+            to_u = _HALL_Ohm_m_to_uOhm_cm
+            def _fu(v):
+                return f"{v * to_u:.4g}" if np.isfinite(v) else "n/a"
+            print(f"  [hysteresis H=0]")
+            print(f"    ρ_xx^even(0)  fwd = {_fu(result.get('rxx0_fwd_Ohm_m'))} µΩ·cm"
+                  f"   bwd = {_fu(result.get('rxx0_bwd_Ohm_m'))} µΩ·cm")
+            print(f"    ρ_yx^odd(0)   fwd = {_fu(result.get('ryx0_fwd_Ohm_m'))} µΩ·cm"
+                  f"   bwd = {_fu(result.get('ryx0_bwd_Ohm_m'))} µΩ·cm")
+
+        # ── Closing divider ─────────────────────────────────────────────────
+        print(f"{'═'*62}")
+ 
+    # ── Multi-temperature figures (only if >1 temperature) ────────────────
+    if n_T > 1:
+        set_paper_style()
+ 
+        for plot_fn, fname_suffix in [
+            (plot_RH_vs_T,   'multiT_RH'),
+            (plot_nH_vs_T,   'multiT_nH'),
+            (plot_muH_vs_T,  'multiT_muH'),
+        ]:
+            fig, ax = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_fn(results, ax=ax)
+            path = f"{base}_{fname_suffix}{ext}"
+            fig.savefig(path, dpi=300)
+            plt.close(fig)
+            print(f"  Saved {path}")
+ 
+        # cot(θ_H) vs T²
+        cot_fit = fit_cot_theta_vs_T2(results)
+        fig, ax = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_cot_theta_vs_T2(results, cot_fit=cot_fit, ax=ax)
+        path = f"{base}_multiT_cotTheta{ext}"
+        fig.savefig(path, dpi=300)
+        plt.close(fig)
+        print(f"  Saved {path}")
+ 
+        # Kohler
+        w2 = (args.figsize[0] * 2 / 2.54, args.figsize[1] / 2.54)
+        fig_k, axes_k = plt.subplots(1, 2, figsize=w2, constrained_layout=True)
+        plot_kohler(results, axes=axes_k)
+        path = f"{base}_multiT_Kohler{ext}"
+        fig_k.savefig(path, dpi=300)
+        plt.close(fig_k)
+        print(f"  Saved {path}")
+ 
+        # H/T scaling
+        fig_ht, ax_ht = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_HT_scaling(results, ax=ax_ht)
+        path = f"{base}_multiT_HT_scaling{ext}"
+        fig_ht.savefig(path, dpi=300)
+        plt.close(fig_ht)
+        print(f"  Saved {path}")
+
+        # ρ_xx(H_ref) vs T — linear fit
+        fig_rxxT, ax_rxxT = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_rxx_vs_T(results, ax=ax_rxxT)
+        path = f"{base}_multiT_rxx_vs_T{ext}"
+        fig_rxxT.savefig(path, dpi=300)
+        plt.close(fig_rxxT)
+        print(f"  Saved {path}")
+
+        # ρ_yx(H_ref) vs T — no fit
+        fig_ryxT, ax_ryxT = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_ryx_vs_T(results, ax=ax_ryxT)
+        path = f"{base}_multiT_ryx_vs_T{ext}"
+        fig_ryxT.savefig(path, dpi=300)
+        plt.close(fig_ryxT)
+        print(f"  Saved {path}")
+
+        # T* (pseudogap) from (ρ_xx − ρ₀)/(a T)
+        tstar = compute_T_star(results)
+        fig_ts, ax_ts = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_T_star(results, tstar_result=tstar, ax=ax_ts)
+        path = f"{base}_multiT_Tstar{ext}"
+        fig_ts.savefig(path, dpi=300)
+        plt.close(fig_ts)
+        print(f"  Saved {path}")    #"""Execute the Hall_MR subcommand."""
     n_T = len(args.fwd_files)
  
     bwd_files  = args.bwd_files  or [None] * n_T
