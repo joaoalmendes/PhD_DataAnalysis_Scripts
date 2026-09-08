@@ -8,7 +8,9 @@ python3 plot_csv_data.py RT 260812_RT_300to3K_001.csv --skip-points 3 --drdt --c
 --current [input current in A] --labels [plot label to show] --zoom [x0] [x1] [zoomed-in plots; can do multiple for multiple zoomed plots]
 -o [output file base name; needs to come last]
 
---- MR and Hall analysis ---
+--- I(V) & dV/dI ---
+
+--- MR & Hall analysis ---
 
 python3 plot_csv_data.py Hall_MR *-5to5T*.csv --bwd *5to-5T*.csv --comments *.txt  --thickness 40e-9 --show-T --current 1e-6 --check-hysteresis --zoom-Rxx -500 500
 
