@@ -2355,7 +2355,7 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
                      V_cell_per_Z_A3=_BI2201_VCELL_PER_Z_A3,
                      fit_H_range_Oe=None,
                      rho_xx0_field_Oe=None,
-                     ryx_fit_mode='full',
+                     ryx_fit_mode='normal',
                      T_label=None,
                      n_grid=500):
     """Full Hall and magnetoresistance analysis for one temperature scan.
@@ -2612,20 +2612,34 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         else:
             rho_xx0_field_Oe = None  # no reliable normal-state ρ_xx
 
-    # Zero-field values per sweep (hysteresis diagnostics)
-    def _at_zero(H_arr, rho_arr):
-        if H_arr is None or rho_arr is None:
-            return np.nan
+    # Closest-to-H=0 *raw* data points (not interpolated) for hysteresis
+    def _closest_to_zero_raw(H_arr, Vx, Vy, current, geom_xx, t_m):
+        """Return (H_Oe, rxx_Ohm_m, ryx_Ohm_m) at the raw point nearest H=0."""
+        if H_arr is None or len(H_arr) == 0:
+            return np.nan, np.nan, np.nan
         H_arr = np.asarray(H_arr, dtype=float)
-        rho_arr = np.asarray(rho_arr, dtype=float)
-        if len(H_arr) == 0 or not np.any(np.isfinite(rho_arr)):
-            return np.nan
-        return float(np.interp(0.0, H_arr, rho_arr))
+        Vx = np.asarray(Vx, dtype=float)
+        Vy = np.asarray(Vy, dtype=float)
+        finite = np.isfinite(H_arr)
+        if not np.any(finite):
+            return np.nan, np.nan, np.nan
+        idx = int(np.nanargmin(np.abs(H_arr[finite])))
+        # map back to original index
+        finite_idx = np.where(finite)[0][idx]
+        H0 = float(H_arr[finite_idx])
+        rxx0 = float((Vx[finite_idx] / current) * geom_xx) if np.isfinite(Vx[finite_idx]) else np.nan
+        ryx0 = float((Vy[finite_idx] / current) * t_m) if np.isfinite(Vy[finite_idx]) else np.nan
+        return H0, rxx0, ryx0
 
-    rxx0_fwd = _at_zero(H_sym_fwd, rxx_even_fwd_full)
-    rxx0_bwd = _at_zero(H_sym_bwd, rxx_even_bwd_full)
-    ryx0_fwd = _at_zero(H_asym_fwd, ryx_odd_fwd_full)
-    ryx0_bwd = _at_zero(H_asym_bwd, ryx_odd_bwd_full)
+    H0_fwd, rxx0_fwd, ryx0_fwd = _closest_to_zero_raw(
+        H_f, Vx_f, Vy_f, current, geom_xx, t)
+    if bwd is not None:
+        H0_bwd, rxx0_bwd, ryx0_bwd = _closest_to_zero_raw(
+            H_b, Vx_b, Vy_b, current, geom_xx, t)
+    else:
+        H0_bwd = rxx0_bwd = ryx0_bwd = np.nan
+    dH0_abs = (abs(H0_fwd - H0_bwd)
+               if np.isfinite(H0_fwd) and np.isfinite(H0_bwd) else np.nan)
 
     # ── 6–8. Derived quantities, fit, and summary ──────────────────────────
     R_H = R_H_err = RH_offset = np.nan
@@ -2815,11 +2829,14 @@ def analyze_hall_mr(fwd_source, bwd_source=None,
         'rxx_even_bwd_full': rxx_even_bwd_full,
         'H_sym_fwd_Oe':     H_sym_fwd,
         'H_sym_bwd_Oe':     H_sym_bwd,
-        # Zero-field hysteresis diagnostics
+        # Closest-to-H=0 raw-point hysteresis diagnostics
         'rxx0_fwd_Ohm_m':  rxx0_fwd,
         'rxx0_bwd_Ohm_m':  rxx0_bwd,
         'ryx0_fwd_Ohm_m':  ryx0_fwd,
         'ryx0_bwd_Ohm_m':  ryx0_bwd,
+        'H0_fwd_Oe':       H0_fwd,
+        'H0_bwd_Oe':       H0_bwd,
+        'dH0_abs_Oe':      dH0_abs,
         # ── Processed: symmetrized MR ────────────────────────────────────
         'H_sym_Oe':        H_sym,
         'rxx_even_pos':    rxx_even_pos,   # Ω·m
@@ -3111,7 +3128,7 @@ def plot_hall_antisym_fwd_bwd(result, ax=None, figsize=None,
 
 def plot_rho_xx_fwd_bwd(result, ax=None, figsize=None,
                         color_fwd='tab:blue', color_bwd='tab:red',
-                        xlim=None):
+                        xlim=None, show_raw_points=True):
     """Overlay independently symmetrized ρ_xx of fwd and bwd sweeps.
 
     Parameters
@@ -3119,6 +3136,10 @@ def plot_rho_xx_fwd_bwd(result, ax=None, figsize=None,
     xlim : (float, float), optional
         Field limits in Oe for a zoomed view (e.g. near H=0).
         When set, the y-axis is scaled to the data inside that window only.
+    show_raw_points : bool
+        If True (default), overlay the raw measured ρ_xx points (converted
+        from voltage) on top of the symmetrized interpolation lines — most
+        useful in the zoomed near-H=0 view.
     """
     created = ax is None
     if created:
@@ -3127,7 +3148,19 @@ def plot_rho_xx_fwd_bwd(result, ax=None, figsize=None,
         fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
 
     y_for_scale = []
+    current = result.get('current_A', 1e-6)
+    geom = result.get('geom_factor', result.get('t_m', 1e-9))
 
+    def _raw_rxx_points(H_raw, Vx_raw):
+        if H_raw is None or Vx_raw is None:
+            return None, None
+        H_raw = np.asarray(H_raw, dtype=float)
+        Vx_raw = np.asarray(Vx_raw, dtype=float)
+        rxx = (Vx_raw / current) * geom
+        rxx_u = _to_uOhm_cm(rxx)
+        return H_raw, rxx_u
+
+    # Symmetrized interpolation lines
     if result.get('rxx_even_fwd_full') is not None and result.get('H_sym_fwd_Oe') is not None:
         H_Oe = np.asarray(result['H_sym_fwd_Oe'], dtype=float)
         rxx = _to_uOhm_cm(result['rxx_even_fwd_full'])
@@ -3160,10 +3193,35 @@ def plot_rho_xx_fwd_bwd(result, ax=None, figsize=None,
                 transform=ax.transAxes, ha='center', va='center',
                 fontsize=9, color='gray')
 
+    # Raw data points on top (especially for zoom)
+    if show_raw_points:
+        H_f, rxx_f = _raw_rxx_points(result.get('fwd_H_Oe'), result.get('fwd_Vx_V'))
+        if H_f is not None:
+            if xlim is not None:
+                m = (H_f >= xlim[0]) & (H_f <= xlim[1]) & np.isfinite(rxx_f)
+            else:
+                m = np.isfinite(rxx_f) & np.isfinite(H_f)
+            if np.any(m):
+                ax.plot(H_f[m] * 1e-4, rxx_f[m], 'o', color=color_fwd,
+                        ms=3, mew=0.4, mec='k', alpha=0.85, zorder=5,
+                        label='fwd raw' if xlim is not None else None)
+                y_for_scale.append(rxx_f[m])
+        if result.get('has_bwd'):
+            H_b, rxx_b = _raw_rxx_points(result.get('bwd_H_Oe'), result.get('bwd_Vx_V'))
+            if H_b is not None:
+                if xlim is not None:
+                    m = (H_b >= xlim[0]) & (H_b <= xlim[1]) & np.isfinite(rxx_b)
+                else:
+                    m = np.isfinite(rxx_b) & np.isfinite(H_b)
+                if np.any(m):
+                    ax.plot(H_b[m] * 1e-4, rxx_b[m], 's', color=color_bwd,
+                            ms=3, mew=0.4, mec='k', alpha=0.85, zorder=5,
+                            label='bwd raw' if xlim is not None else None)
+                    y_for_scale.append(rxx_b[m])
+
     if xlim is not None:
         ax.set_xlim(xlim[0] * 1e-4, xlim[1] * 1e-4)
 
-    # Scale y to the (possibly zoomed) data only — do not force-include 0
     if y_for_scale:
         y_all = np.concatenate([np.asarray(y, dtype=float).ravel() for y in y_for_scale])
         y_all = y_all[np.isfinite(y_all)]
@@ -3175,18 +3233,193 @@ def plot_rho_xx_fwd_bwd(result, ax=None, figsize=None,
                 pad = 0.05 * (abs(y_hi) + 1e-30)
             ax.set_ylim(y_lo - pad, y_hi + pad)
 
-    # Vertical guide at H=0 (does not affect y-limits once set)
     if xlim is None or (xlim[0] <= 0 <= xlim[1]):
         ax.axvline(0, color='gray', lw=0.5, ls=':')
 
     ax.set_xlabel(r'$\mu_0 H$ (T)')
-    ax.set_ylabel(r'$\rho_{xx}^{\rm even}$ ($\mu\Omega\cdot$cm)')
-    ax.legend()
+    ax.set_ylabel(r'$\rho_{xx}$ ($\mu\Omega\cdot$cm)')
+    ax.legend(fontsize=7)
     if created:
-        title = f"T = {result['T_label']}  (fwd vs bwd sym)"
+        title = f"T = {result['T_label']}  (fwd vs bwd)"
         if xlim is not None:
             title += f"  zoom [{xlim[0]:.0f},{xlim[1]:.0f}] Oe"
         ax.set_title(title)
+    return ax
+
+def plot_drxx_dH_intensity(results_list, ax=None, figsize=None):
+    """Colour plot of T vs μ₀H with intensity = dρ_xx/dH (mΩ·cm/T).
+
+    Built from the symmetrized ρ_xx of each single-T analysis.
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 12.0) / 2.54
+        h = (figsize[1] if figsize else 8.0) / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    Ts, Hs, dRdHs = [], [], []
+    for r in results_list:
+        T = r.get('T_nominal_K', np.nan)
+        H_Oe = np.asarray(r.get('H_sym_Oe', []), dtype=float)
+        rxx = np.asarray(r.get('rxx_even_full', []), dtype=float)  # Ω·m
+        if len(H_Oe) < 5 or not np.isfinite(T):
+            continue
+        H_T = H_Oe * 1e-4
+        # ρ in mΩ·cm: 1 Ω·m = 1e5 mΩ·cm
+        rxx_mOcm = rxx * 1e5
+        order = np.argsort(H_T)
+        H_T = H_T[order]
+        rxx_mOcm = rxx_mOcm[order]
+        dr = np.gradient(rxx_mOcm, H_T)
+        Ts.append(np.full_like(H_T, T))
+        Hs.append(H_T)
+        dRdHs.append(dr)
+
+    if not Ts:
+        ax.text(0.5, 0.5, 'No data for dρ_xx/dH intensity',
+                transform=ax.transAxes, ha='center')
+        return ax
+
+    H_all = np.concatenate(Hs)
+    T_all = np.concatenate(Ts)
+    Z_all = np.concatenate(dRdHs)
+    finite = np.isfinite(H_all) & np.isfinite(T_all) & np.isfinite(Z_all)
+    H_all, T_all, Z_all = H_all[finite], T_all[finite], Z_all[finite]
+
+    # Bin onto a regular grid for pcolormesh
+    nH = min(300, max(50, len(np.unique(np.round(H_all, 4)))))
+    nT = max(len(results_list) * 2, 10)
+    H_edges = np.linspace(H_all.min(), H_all.max(), nH + 1)
+    T_edges = np.linspace(T_all.min(), T_all.max(), nT + 1)
+    # Use nearest-T rows: for each result, fill H-bins
+    H_c = 0.5 * (H_edges[:-1] + H_edges[1:])
+    T_c = 0.5 * (T_edges[:-1] + T_edges[1:])
+    grid = np.full((len(T_c), len(H_c)), np.nan)
+    for r in results_list:
+        T = r.get('T_nominal_K', np.nan)
+        H_Oe = np.asarray(r.get('H_sym_Oe', []), dtype=float)
+        rxx = np.asarray(r.get('rxx_even_full', []), dtype=float)
+        if len(H_Oe) < 5 or not np.isfinite(T):
+            continue
+        H_T = H_Oe * 1e-4
+        rxx_mOcm = rxx * 1e5
+        order = np.argsort(H_T)
+        H_T, rxx_mOcm = H_T[order], rxx_mOcm[order]
+        dr = np.gradient(rxx_mOcm, H_T)
+        iT = int(np.argmin(np.abs(T_c - T)))
+        for h, z in zip(H_T, dr):
+            if not np.isfinite(z):
+                continue
+            iH = int(np.clip(np.searchsorted(H_edges, h) - 1, 0, len(H_c) - 1))
+            grid[iT, iH] = z
+
+    vmax = np.nanpercentile(np.abs(grid), 98) if np.any(np.isfinite(grid)) else 1.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    pcm = ax.pcolormesh(H_edges, T_edges, grid, shading='flat',
+                        cmap='viridis', vmin=-vmax, vmax=vmax)
+    cb = plt.colorbar(pcm, ax=ax, pad=0.02)
+    cb.set_label(r'$d\rho_{xx}/dH$ (m$\Omega\cdot$cm/T)')
+    ax.set_xlabel(r'$\mu_0 H$ (T)')
+    ax.set_ylabel(r'$T$ (K)')
+    ax.set_title(r'$d\rho_{xx}/dH$ intensity')
+    return ax
+
+
+def plot_drxx_dH_FFT_intensity(results_list, ax=None, figsize=None):
+    """Colour plot of T vs frequency with intensity = |FFT(dρ_xx/dH)|.
+
+    For each temperature, dρ_xx/dH is interpolated onto a uniform 1/H grid
+    and Fourier-transformed (SdH-style).  Amplitude is in arbitrary units.
+    """
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 12.0) / 2.54
+        h = (figsize[1] if figsize else 8.0) / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    spectra = []  # list of (T, freqs_T, amp)
+    for r in results_list:
+        T = r.get('T_nominal_K', np.nan)
+        H_Oe = np.asarray(r.get('H_sym_Oe', []), dtype=float)
+        rxx = np.asarray(r.get('rxx_even_full', []), dtype=float)
+        if len(H_Oe) < 20 or not np.isfinite(T):
+            continue
+        H_T = np.abs(H_Oe) * 1e-4
+        rxx_mOcm = rxx * 1e5
+        # positive-H only for 1/H transform
+        mask = (H_T > 0.1) & np.isfinite(rxx_mOcm)  # avoid H~0
+        if np.sum(mask) < 20:
+            continue
+        H_T = H_T[mask]
+        rxx_mOcm = rxx_mOcm[mask]
+        order = np.argsort(H_T)
+        H_T, rxx_mOcm = H_T[order], rxx_mOcm[order]
+        # unique H
+        _, uniq = np.unique(np.round(H_T, 6), return_index=True)
+        H_T, rxx_mOcm = H_T[uniq], rxx_mOcm[uniq]
+        if len(H_T) < 20:
+            continue
+        invH = 1.0 / H_T
+        order = np.argsort(invH)
+        invH, rxx_s = invH[order], rxx_mOcm[order]
+        # uniform 1/H grid
+        n = min(512, max(64, len(invH) * 2))
+        invH_u = np.linspace(invH.min(), invH.max(), n)
+        rxx_u = np.interp(invH_u, invH, rxx_s)
+        dr = np.gradient(rxx_u, invH_u)
+        dr = dr - np.nanmean(dr)
+        window = np.hanning(len(dr))
+        spec = np.fft.rfft(dr * window)
+        amp = np.abs(spec)
+        # frequency in Tesla (since dx = d(1/H) in T^-1)
+        d_invH = invH_u[1] - invH_u[0]
+        freqs = np.fft.rfftfreq(len(dr), d=d_invH)
+        # skip zero-freq
+        spectra.append((T, freqs[1:], amp[1:]))
+
+    if not spectra:
+        ax.text(0.5, 0.5, 'No data for FFT intensity',
+                transform=ax.transAxes, ha='center')
+        return ax
+
+    # Common frequency axis
+    f_max = max(s[1].max() for s in spectra)
+    f_grid = np.linspace(0, f_max, 200)
+    T_vals = np.array([s[0] for s in spectra])
+    order = np.argsort(T_vals)
+    T_vals = T_vals[order]
+    grid = np.full((len(T_vals), len(f_grid)), np.nan)
+    for i, idx in enumerate(order):
+        _, fr, am = spectra[idx]
+        grid[i, :] = np.interp(f_grid, fr, am, left=np.nan, right=np.nan)
+
+    if len(T_vals) == 1:
+        T_edges = np.array([T_vals[0] - 1, T_vals[0] + 1])
+    else:
+        # midpoints for pcolormesh
+        dT = np.diff(T_vals)
+        T_edges = np.concatenate([
+            [T_vals[0] - dT[0] / 2],
+            0.5 * (T_vals[:-1] + T_vals[1:]),
+            [T_vals[-1] + dT[-1] / 2],
+        ])
+    f_edges = np.concatenate([
+        [f_grid[0] - (f_grid[1] - f_grid[0]) / 2],
+        0.5 * (f_grid[:-1] + f_grid[1:]),
+        [f_grid[-1] + (f_grid[-1] - f_grid[-2]) / 2],
+    ])
+
+    vmax = np.nanpercentile(grid, 99) if np.any(np.isfinite(grid)) else 1.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    pcm = ax.pcolormesh(f_edges, T_edges, grid, shading='flat',
+                        cmap='viridis', vmin=0, vmax=vmax)
+    cb = plt.colorbar(pcm, ax=ax, pad=0.02)
+    cb.set_label('Amplitude (a.u.)')
+    ax.set_xlabel(r'Frequency $F$ (T)')
+    ax.set_ylabel(r'$T$ (K)')
+    ax.set_title(r'FFT of $d\rho_{xx}/dH$ vs $1/H$')
     return ax
 
 def plot_rho_xx(result, ax=None, color='tab:blue', figsize=None):
@@ -4338,7 +4571,7 @@ def _add_Hall_MR_parser(subparsers):
         help="Points in the common H interpolation grid (default: 500)."
     )
     p.add_argument(
-        "--ryx-fit-mode", choices=["normal", "full"], default="full",
+        "--ryx-fit-mode", choices=["normal", "full"], default="normal",
         help="Field window for the linear ρ_yx (R_H) fit. "
              "'normal' (default): only above auto-detected H_irr. "
              "'full': entire positive-H range (still subject to reliability "
@@ -4353,8 +4586,13 @@ def _add_Hall_MR_parser(subparsers):
     )
     p.add_argument(
         "--check-hysteresis", action="store_true",
-        help="Print ρ_xx(H=0) and ρ_yx(H=0) for fwd and bwd sweeps "
-             "(from independently sym/antisymmetrized curves)."
+        help="Print ρ_xx and ρ_yx at the raw data point closest to H=0 "
+             "for fwd and bwd, with the actual field values and |ΔH|."
+    )
+    p.add_argument(
+        "--intensity-plots", action="store_true",
+        help="For multi-T runs: save colour plots of dρ_xx/dH (T vs H) "
+             "and of the FFT amplitude of dρ_xx/dH (T vs frequency)."
     )
     return p
 
@@ -5027,55 +5265,101 @@ def _run_IV_dVdI(args):
                                         )
         return
 
+def _find_comments_for_csv(csv_path):
+    """Auto-locate a comments file next to a Hall/MR CSV."""
+    stem = os.path.splitext(os.path.abspath(csv_path))[0]
+    candidates = [
+        stem + '_comments.txt',
+        stem + '_comment.txt',
+        stem + '.comments.txt',
+        stem.replace('_001', '_001_comments') + '.txt',
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    # directory fallback: same prefix + comments
+    d = os.path.dirname(stem)
+    base = os.path.basename(stem)
+    if os.path.isdir(d):
+        for name in os.listdir(d):
+            low = name.lower()
+            if 'comment' in low and name.endswith('.txt') and base[:12] in name:
+                return os.path.join(d, name)
+    return None
+
+
 def _run_Hall_MR(args):
     """Execute the Hall_MR subcommand."""
     n_T = len(args.fwd_files)
- 
+
     bwd_files  = args.bwd_files  or [None] * n_T
-    comments   = args.comments   or [None] * n_T
     T_labels   = args.T_labels   or [None] * n_T
- 
-    if len(bwd_files) not in (0, n_T):
+
+    if args.bwd_files is not None and len(args.bwd_files) not in (0, n_T):
         raise ValueError(
             f"--bwd-files must match the number of fwd_files ({n_T}), "
-            f"got {len(bwd_files)}."
+            f"got {len(args.bwd_files)}."
         )
     bwd_files = list(bwd_files) + [None] * (n_T - len(bwd_files))
     T_labels  = list(T_labels)  + [None] * (n_T - len(T_labels))
- 
+
+    # Comments: explicit list, or auto-discover next to each fwd CSV
+    if args.comments:
+        comments = list(args.comments) + [None] * (n_T - len(args.comments))
+    else:
+        comments = [_find_comments_for_csv(f) for f in args.fwd_files]
+
     fs = (args.figsize[0] / 2.54, args.figsize[1] / 2.54)
     base, ext = os.path.splitext(args.output)
     if not ext:
         ext = ".pdf"
- 
-    print(f"\nHall/MR analysis — {n_T} temperature scan(s)")
- 
+
+    # Log file (rewritten each run) — comments and verbose meta go here only
+    log_path = f"{base}_Hall_MR.log"
+    log_fh = open(log_path, 'w', encoding='utf-8')
+
+    def log(msg=''):
+        log_fh.write(msg + '\n')
+        log_fh.flush()
+
+    def term(msg=''):
+        print(msg)
+
+    term(f"\nHall/MR analysis — {n_T} temperature scan(s)")
+    log(f"Hall/MR analysis — {n_T} temperature scan(s)")
+    log(f"output base: {base}")
+    log(f"ryx_fit_mode: {getattr(args, 'ryx_fit_mode', 'normal')}")
+
     results = []
- 
+
     for i, (fwd, bwd, cmt, lbl) in enumerate(
         zip(args.fwd_files, bwd_files, comments, T_labels)
     ):
-        # ── Banner — printed BEFORE anything else for this temperature ──────
         T_display = lbl if lbl else "auto"
-        print(f"\n{'═'*62}")
-        print(f"  Scan {i+1}/{n_T}   T = {T_display}")
-        print(f"  fwd : {os.path.basename(fwd)}")
+        banner = (
+            f"\n{'═'*62}\n"
+            f"  Scan {i+1}/{n_T}   T = {T_display}\n"
+            f"  fwd : {os.path.basename(fwd)}\n"
+        )
         if bwd:
-            print(f"  bwd : {os.path.basename(bwd)}")
-        print(f"{'─'*62}")
+            banner += f"  bwd : {os.path.basename(bwd)}\n"
+        banner += f"{'─'*62}"
+        term(banner)
+        log(banner)
 
-        # ── Comments — immediately after banner, before any analysis ────────
-        for cmt_path, label in [(cmt, 'comments')]:
-            if cmt_path is not None and os.path.isfile(cmt_path):
-                meta = parse_hall_mr_comments(cmt_path)
-                print(f"  [{label}]")
-                for line in meta['raw']:
-                    if line.strip():
-                        print(f"    {line}")
-                print(f"  {'─'*56}")
+        # Comments → log only (never terminal)
+        if cmt is not None and os.path.isfile(cmt):
+            meta = parse_hall_mr_comments(cmt)
+            log(f"  [comments] file: {cmt}")
+            for line in meta['raw']:
+                if line.strip():
+                    log(f"    {line}")
+            log(f"  {'─'*56}")
+        elif cmt is not None:
+            log(f"  [comments] file not found: {cmt}")
+        else:
+            log(f"  [comments] none associated with {os.path.basename(fwd)}")
 
-        # ── Analysis (prints spikes / trim / H_irr / results internally) ────
-        #    All internal messages now come after the banner and comments.
         result = analyze_hall_mr(
             fwd_source       = fwd,
             bwd_source       = bwd,
@@ -5098,210 +5382,28 @@ def _run_Hall_MR(args):
         )
         results.append(result)
 
-        # ── Per-temperature figures ─────────────────────────────────────────
-        T_str = f"{int(round(result['T_nominal_K']))}K"
-        set_paper_style()
-
-        fig_raw, _ = plot_hall_raw(result, show_T=args.show_T,
-                                    figsize=args.figsize)
-        path = f"{base}_raw_{T_str}{ext}"
-        fig_raw.savefig(path, dpi=300)
-        plt.close(fig_raw)
-        print(f"  Saved {path}")
-
-        fig_ah, ax_ah = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_hall_antisym(result, ax=ax_ah)
-        path = f"{base}_ryx_{T_str}{ext}"
-        fig_ah.savefig(path, dpi=300)
-        plt.close(fig_ah)
-        print(f"  Saved {path}")
-
-        fig_rx, ax_rx = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_rho_xx(result, ax=ax_rx)
-        path = f"{base}_rxx_{T_str}{ext}"
-        fig_rx.savefig(path, dpi=300)
-        plt.close(fig_rx)
-        print(f"  Saved {path}")
-
-        if np.any(np.isfinite(result['MR'])):
-            fig_mr, ax_mr = plt.subplots(figsize=fs, constrained_layout=True)
-            plot_MR_hall(result, ax=ax_mr)
-            path = f"{base}_MR_{T_str}{ext}"
-            fig_mr.savefig(path, dpi=300)
-            plt.close(fig_mr)
-            print(f"  Saved {path}")
-
-        # fwd vs bwd antisymmetrized ρ_yx (hysteresis / vortex check)
-        fig_fb, ax_fb = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_hall_antisym_fwd_bwd(result, ax=ax_fb)
-        path = f"{base}_ryx_fwd_bwd_{T_str}{ext}"
-        fig_fb.savefig(path, dpi=300)
-        plt.close(fig_fb)
-        print(f"  Saved {path}")
-
-        # fwd vs bwd symmetrized ρ_xx
-        fig_rxfb, ax_rxfb = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_rho_xx_fwd_bwd(result, ax=ax_rxfb)
-        path = f"{base}_rxx_fwd_bwd_{T_str}{ext}"
-        fig_rxfb.savefig(path, dpi=300)
-        plt.close(fig_rxfb)
-        print(f"  Saved {path}")
-
-        if getattr(args, 'zoom_Rxx', None) is not None:
-            zlim = tuple(args.zoom_Rxx)
-            fig_zx, ax_zx = plt.subplots(figsize=fs, constrained_layout=True)
-            plot_rho_xx_fwd_bwd(result, ax=ax_zx, xlim=zlim)
-            path = f"{base}_rxx_fwd_bwd_zoom_{zlim[0]:g}-{zlim[1]:g}_{T_str}{ext}"
-            fig_zx.savefig(path, dpi=300)
-            plt.close(fig_zx)
-            print(f"  Saved {path}")
-
+        # Hysteresis diagnostics BEFORE saved-file messages
         if getattr(args, 'check_hysteresis', False):
             to_u = _HALL_Ohm_m_to_uOhm_cm
             def _fu(v):
                 return f"{v * to_u:.4g}" if np.isfinite(v) else "n/a"
-            print(f"  [hysteresis H=0]")
-            print(f"    ρ_xx^even(0)  fwd = {_fu(result.get('rxx0_fwd_Ohm_m'))} µΩ·cm"
-                  f"   bwd = {_fu(result.get('rxx0_bwd_Ohm_m'))} µΩ·cm")
-            print(f"    ρ_yx^odd(0)   fwd = {_fu(result.get('ryx0_fwd_Ohm_m'))} µΩ·cm"
-                  f"   bwd = {_fu(result.get('ryx0_bwd_Ohm_m'))} µΩ·cm")
-
-        # ── Closing divider ─────────────────────────────────────────────────
-        print(f"{'═'*62}")
- 
-    # ── Multi-temperature figures (only if >1 temperature) ────────────────
-    if n_T > 1:
-        set_paper_style()
- 
-        for plot_fn, fname_suffix in [
-            (plot_RH_vs_T,   'multiT_RH'),
-            (plot_nH_vs_T,   'multiT_nH'),
-            (plot_muH_vs_T,  'multiT_muH'),
-        ]:
-            fig, ax = plt.subplots(figsize=fs, constrained_layout=True)
-            plot_fn(results, ax=ax)
-            path = f"{base}_{fname_suffix}{ext}"
-            fig.savefig(path, dpi=300)
-            plt.close(fig)
-            print(f"  Saved {path}")
- 
-        # cot(θ_H) vs T²
-        cot_fit = fit_cot_theta_vs_T2(results)
-        fig, ax = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_cot_theta_vs_T2(results, cot_fit=cot_fit, ax=ax)
-        path = f"{base}_multiT_cotTheta{ext}"
-        fig.savefig(path, dpi=300)
-        plt.close(fig)
-        print(f"  Saved {path}")
- 
-        # Kohler
-        w2 = (args.figsize[0] * 2 / 2.54, args.figsize[1] / 2.54)
-        fig_k, axes_k = plt.subplots(1, 2, figsize=w2, constrained_layout=True)
-        plot_kohler(results, axes=axes_k)
-        path = f"{base}_multiT_Kohler{ext}"
-        fig_k.savefig(path, dpi=300)
-        plt.close(fig_k)
-        print(f"  Saved {path}")
- 
-        # H/T scaling
-        fig_ht, ax_ht = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_HT_scaling(results, ax=ax_ht)
-        path = f"{base}_multiT_HT_scaling{ext}"
-        fig_ht.savefig(path, dpi=300)
-        plt.close(fig_ht)
-        print(f"  Saved {path}")
-
-        # ρ_xx(H_ref) vs T — linear fit
-        fig_rxxT, ax_rxxT = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_rxx_vs_T(results, ax=ax_rxxT)
-        path = f"{base}_multiT_rxx_vs_T{ext}"
-        fig_rxxT.savefig(path, dpi=300)
-        plt.close(fig_rxxT)
-        print(f"  Saved {path}")
-
-        # ρ_yx(H_ref) vs T — no fit
-        fig_ryxT, ax_ryxT = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_ryx_vs_T(results, ax=ax_ryxT)
-        path = f"{base}_multiT_ryx_vs_T{ext}"
-        fig_ryxT.savefig(path, dpi=300)
-        plt.close(fig_ryxT)
-        print(f"  Saved {path}")
-
-        # T* (pseudogap) from (ρ_xx − ρ₀)/(a T)
-        tstar = compute_T_star(results)
-        fig_ts, ax_ts = plt.subplots(figsize=fs, constrained_layout=True)
-        plot_T_star(results, tstar_result=tstar, ax=ax_ts)
-        path = f"{base}_multiT_Tstar{ext}"
-        fig_ts.savefig(path, dpi=300)
-        plt.close(fig_ts)
-        print(f"  Saved {path}")    #"""Execute the Hall_MR subcommand."""
-    n_T = len(args.fwd_files)
- 
-    bwd_files  = args.bwd_files  or [None] * n_T
-    comments   = args.comments   or [None] * n_T
-    T_labels   = args.T_labels   or [None] * n_T
- 
-    if len(bwd_files) not in (0, n_T):
-        raise ValueError(
-            f"--bwd-files must match the number of fwd_files ({n_T}), "
-            f"got {len(bwd_files)}."
-        )
-    bwd_files = list(bwd_files) + [None] * (n_T - len(bwd_files))
-    T_labels  = list(T_labels)  + [None] * (n_T - len(T_labels))
- 
-    fs = (args.figsize[0] / 2.54, args.figsize[1] / 2.54)
-    base, ext = os.path.splitext(args.output)
-    if not ext:
-        ext = ".pdf"
- 
-    print(f"\nHall/MR analysis — {n_T} temperature scan(s)")
- 
-    results = []
- 
-    for i, (fwd, bwd, cmt, lbl) in enumerate(
-        zip(args.fwd_files, bwd_files, comments, T_labels)
-    ):
-        # ── Banner — printed BEFORE anything else for this temperature ──────
-        T_display = lbl if lbl else "auto"
-        print(f"\n{'═'*62}")
-        print(f"  Scan {i+1}/{n_T}   T = {T_display}")
-        print(f"  fwd : {os.path.basename(fwd)}")
-        if bwd:
-            print(f"  bwd : {os.path.basename(bwd)}")
-        print(f"{'─'*62}")
-
-        # ── Comments — immediately after banner, before any analysis ────────
-        for cmt_path, label in [(cmt, 'comments')]:
-            if cmt_path is not None and os.path.isfile(cmt_path):
-                meta = parse_hall_mr_comments(cmt_path)
-                print(f"  [{label}]")
-                for line in meta['raw']:
-                    if line.strip():
-                        print(f"    {line}")
-                print(f"  {'─'*56}")
-
-        # ── Analysis (prints spikes / trim / H_irr / results internally) ────
-        #    All internal messages now come after the banner and comments.
-        result = analyze_hall_mr(
-            fwd_source       = fwd,
-            bwd_source       = bwd,
-            hall_n           = args.hall_n,
-            mr_n             = args.mr_n,
-            hall_col         = args.hall_col,
-            mr_col           = args.mr_col,
-            current          = args.current,
-            t                = args.thickness,
-            w                = args.width,
-            l                = args.length,
-            V_cell_per_Z_A3  = args.V_cell_Z,
-            fit_H_range_Oe   = (tuple(args.fit_H_range)
-                                 if args.fit_H_range else None),
-            rho_xx0_field_Oe = (args.rho_xx_field
-                                 if args.rho_xx_field else None),
-            T_label          = lbl,
-            n_grid           = args.n_grid,
-        )
-        results.append(result)
+            def _fh(v):
+                return f"{v:.2f}" if np.isfinite(v) else "n/a"
+            H0f = result.get('H0_fwd_Oe', np.nan)
+            H0b = result.get('H0_bwd_Oe', np.nan)
+            dH0 = result.get('dH0_abs_Oe', np.nan)
+            msg = (
+                f"  [hysteresis — raw point closest to H=0]\n"
+                f"    fwd: H = {_fh(H0f)} Oe ,  "
+                f"ρ_xx = {_fu(result.get('rxx0_fwd_Ohm_m'))} µΩ·cm ,  "
+                f"ρ_yx = {_fu(result.get('ryx0_fwd_Ohm_m'))} µΩ·cm\n"
+                f"    bwd: H = {_fh(H0b)} Oe ,  "
+                f"ρ_xx = {_fu(result.get('rxx0_bwd_Ohm_m'))} µΩ·cm ,  "
+                f"ρ_yx = {_fu(result.get('ryx0_bwd_Ohm_m'))} µΩ·cm\n"
+                f"    |H_fwd − H_bwd| = {_fh(dH0)} Oe"
+            )
+            term(msg)
+            log(msg)
 
         # ── Per-temperature figures ─────────────────────────────────────────
         T_str = f"{int(round(result['T_nominal_K']))}K"
@@ -5312,21 +5414,21 @@ def _run_Hall_MR(args):
         path = f"{base}_raw_{T_str}{ext}"
         fig_raw.savefig(path, dpi=300)
         plt.close(fig_raw)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
 
         fig_ah, ax_ah = plt.subplots(figsize=fs, constrained_layout=True)
         plot_hall_antisym(result, ax=ax_ah)
         path = f"{base}_ryx_{T_str}{ext}"
         fig_ah.savefig(path, dpi=300)
         plt.close(fig_ah)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
 
         fig_rx, ax_rx = plt.subplots(figsize=fs, constrained_layout=True)
         plot_rho_xx(result, ax=ax_rx)
         path = f"{base}_rxx_{T_str}{ext}"
         fig_rx.savefig(path, dpi=300)
         plt.close(fig_rx)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
 
         if np.any(np.isfinite(result['MR'])):
             fig_mr, ax_mr = plt.subplots(figsize=fs, constrained_layout=True)
@@ -5334,23 +5436,40 @@ def _run_Hall_MR(args):
             path = f"{base}_MR_{T_str}{ext}"
             fig_mr.savefig(path, dpi=300)
             plt.close(fig_mr)
-            print(f"  Saved {path}")
+            term(f"  Saved {path}")
 
-        # fwd vs bwd antisymmetrized ρ_yx (hysteresis / vortex check)
         fig_fb, ax_fb = plt.subplots(figsize=fs, constrained_layout=True)
         plot_hall_antisym_fwd_bwd(result, ax=ax_fb)
         path = f"{base}_ryx_fwd_bwd_{T_str}{ext}"
         fig_fb.savefig(path, dpi=300)
         plt.close(fig_fb)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
 
-        # ── Closing divider ─────────────────────────────────────────────────
-        print(f"{'═'*62}")
- 
+        fig_rxfb, ax_rxfb = plt.subplots(figsize=fs, constrained_layout=True)
+        plot_rho_xx_fwd_bwd(result, ax=ax_rxfb, show_raw_points=False)
+        path = f"{base}_rxx_fwd_bwd_{T_str}{ext}"
+        fig_rxfb.savefig(path, dpi=300)
+        plt.close(fig_rxfb)
+        term(f"  Saved {path}")
+
+        if getattr(args, 'zoom_Rxx', None) is not None:
+            zlim = tuple(args.zoom_Rxx)
+            fig_zx, ax_zx = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_rho_xx_fwd_bwd(result, ax=ax_zx, xlim=zlim,
+                                show_raw_points=True)
+            path = (f"{base}_rxx_fwd_bwd_zoom_"
+                    f"{zlim[0]:g}-{zlim[1]:g}_{T_str}{ext}")
+            fig_zx.savefig(path, dpi=300)
+            plt.close(fig_zx)
+            term(f"  Saved {path}")
+
+        term(f"{'═'*62}")
+        log(f"{'═'*62}")
+
     # ── Multi-temperature figures (only if >1 temperature) ────────────────
     if n_T > 1:
         set_paper_style()
- 
+
         for plot_fn, fname_suffix in [
             (plot_RH_vs_T,   'multiT_RH'),
             (plot_nH_vs_T,   'multiT_nH'),
@@ -5361,58 +5480,70 @@ def _run_Hall_MR(args):
             path = f"{base}_{fname_suffix}{ext}"
             fig.savefig(path, dpi=300)
             plt.close(fig)
-            print(f"  Saved {path}")
- 
-        # cot(θ_H) vs T²
+            term(f"  Saved {path}")
+
         cot_fit = fit_cot_theta_vs_T2(results)
         fig, ax = plt.subplots(figsize=fs, constrained_layout=True)
         plot_cot_theta_vs_T2(results, cot_fit=cot_fit, ax=ax)
         path = f"{base}_multiT_cotTheta{ext}"
         fig.savefig(path, dpi=300)
         plt.close(fig)
-        print(f"  Saved {path}")
- 
-        # Kohler
+        term(f"  Saved {path}")
+
         w2 = (args.figsize[0] * 2 / 2.54, args.figsize[1] / 2.54)
         fig_k, axes_k = plt.subplots(1, 2, figsize=w2, constrained_layout=True)
         plot_kohler(results, axes=axes_k)
         path = f"{base}_multiT_Kohler{ext}"
         fig_k.savefig(path, dpi=300)
         plt.close(fig_k)
-        print(f"  Saved {path}")
- 
-        # H/T scaling
+        term(f"  Saved {path}")
+
         fig_ht, ax_ht = plt.subplots(figsize=fs, constrained_layout=True)
         plot_HT_scaling(results, ax=ax_ht)
         path = f"{base}_multiT_HT_scaling{ext}"
         fig_ht.savefig(path, dpi=300)
         plt.close(fig_ht)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
 
-        # ρ_xx(H_ref) vs T — linear fit
         fig_rxxT, ax_rxxT = plt.subplots(figsize=fs, constrained_layout=True)
         plot_rxx_vs_T(results, ax=ax_rxxT)
         path = f"{base}_multiT_rxx_vs_T{ext}"
         fig_rxxT.savefig(path, dpi=300)
         plt.close(fig_rxxT)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
 
-        # ρ_yx(H_ref) vs T — no fit
         fig_ryxT, ax_ryxT = plt.subplots(figsize=fs, constrained_layout=True)
         plot_ryx_vs_T(results, ax=ax_ryxT)
         path = f"{base}_multiT_ryx_vs_T{ext}"
         fig_ryxT.savefig(path, dpi=300)
         plt.close(fig_ryxT)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
 
-        # T* (pseudogap) from (ρ_xx − ρ₀)/(a T)
         tstar = compute_T_star(results)
         fig_ts, ax_ts = plt.subplots(figsize=fs, constrained_layout=True)
         plot_T_star(results, tstar_result=tstar, ax=ax_ts)
         path = f"{base}_multiT_Tstar{ext}"
         fig_ts.savefig(path, dpi=300)
         plt.close(fig_ts)
-        print(f"  Saved {path}")
+        term(f"  Saved {path}")
+
+        if getattr(args, 'intensity_plots', False):
+            fig_i, ax_i = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_drxx_dH_intensity(results, ax=ax_i)
+            path = f"{base}_multiT_drxx_dH_intensity{ext}"
+            fig_i.savefig(path, dpi=300)
+            plt.close(fig_i)
+            term(f"  Saved {path}")
+
+            fig_f, ax_f = plt.subplots(figsize=fs, constrained_layout=True)
+            plot_drxx_dH_FFT_intensity(results, ax=ax_f)
+            path = f"{base}_multiT_drxx_dH_FFT{ext}"
+            fig_f.savefig(path, dpi=300)
+            plt.close(fig_f)
+            term(f"  Saved {path}")
+
+    log_fh.close()
+    term(f"\n  Log written to {log_path}")
 
 
 PLOT_TYPES = {
