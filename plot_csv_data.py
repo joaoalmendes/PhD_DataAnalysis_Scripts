@@ -892,18 +892,28 @@ def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0))
 
 def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
                                        n_T_bins=100, n_I_bins=200,
-                                       clim_pct=(2, 98)):
+                                       clim_pct=(2, 98), T_max=None):
     """Load a multi-T rack IV file and produce a 2D dV/dI colour map.
 
     Uses 2D binning (not a pivot) so it works correctly even when T drifts
     continuously during the current sweep, giving nearly-unique (T, I) pairs
     rather than a clean regular grid.
+
+    Parameters
+    ----------
+    T_max : float or None
+        If set, only rows with Tsample <= T_max are used.
     """
     from scipy.stats import binned_statistic_2d
 
     print("Loading multi-T file...")
     df = _load_csv_rack(filepath, mode="iv",
                         channel_dV=channel_dV, channel_dI=channel_dI)
+    if T_max is not None:
+        n_before = len(df)
+        df = df.loc[df["Tsample"] <= float(T_max)].copy()
+        print(f"  T_max = {T_max} K → kept {len(df):,}/{n_before:,} rows "
+              f"(Tsample ≤ {T_max})")
     print(f"  {len(df):,} rows, "
           f"{df['Tsample'].nunique()} unique temperatures, "
           f"{df['Current (A)'].nunique()} unique currents")
@@ -1243,10 +1253,23 @@ def plot_didv(result, ax=None, show_peaks=True, xlim=None,
 
     return ax
 
-def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outlier_thresh=5.0, advanced=False, diff_threshold=0.001, figsize=None):
-    """Compute Ic, Jc, R_N, Jc*R_N from I(V) data."""
-    I = data['I']
-    V = data['V']
+def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
+                         outlier_thresh=5.0, advanced=False, diff_threshold=0.001,
+                         figsize=None, ic_I_min=None, ic_I_max=None):
+    """Compute Ic, Jc, R_N, Jc*R_N from I(V) data.
+
+    Parameters
+    ----------
+    ic_I_min, ic_I_max : float or None
+        Absolute-current window (Amperes) for the Ic search.  Only points with
+        ic_I_min ≤ |I| ≤ ic_I_max are considered (each bound optional).
+        Use this to ignore circuit-switching artefacts at very large |I|.
+    rn_criterion : float
+        Fraction of max |I| (not |V|) defining the high-bias window for the
+        R_N linear fit: |I| > rn_criterion · max|I|.
+    """
+    I = np.asarray(data['I'], dtype=float)
+    V = np.asarray(data['V'], dtype=float)
     dVdI = data.get('dVdI', None)
     is_bf = data.get('is_bf', False)
     branch = data.get('branch', np.full(len(I), "forward", dtype=object))
@@ -1254,82 +1277,217 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10, outl
     results = {
         'T_K': round(np.mean(data.get('T', np.nan)),2),
         'is_bf': is_bf,
+        'ic_I_min_A': ic_I_min,
+        'ic_I_max_A': ic_I_max,
     }
     
+    # Optional absolute-current window for Ic search
+    I_abs = np.abs(I)
+    ic_window = np.ones(len(I), dtype=bool)
+    if ic_I_min is not None:
+        ic_window &= I_abs >= float(ic_I_min)
+    if ic_I_max is not None:
+        ic_window &= I_abs <= float(ic_I_max)
+
     # Signal for transition detection
     signal = dVdI if dVdI is not None and not np.all(np.isnan(dVdI)) else np.abs(V)
     
-    def find_ic_in_direction(I_seg, signal_seg, direction_sign=1, span=10, outlier_threshold=5.0, diff_threshold=0.001):
-        """Outlier removal + only sum significant differences."""
-        #signal_seg = gaussian_filter1d(signal_seg, sigma=2) #If the data is too noisy, e.g. near Tc
+    def find_ic_in_direction(I_seg, signal_seg, direction_sign=1, span=10,
+                               outlier_threshold=5.0, diff_threshold=0.001):
+        """Locate Ic via a peak-weighted jump score in the signal.
+
+        For each sliding window on the chosen polarity:
+          1. MAD-based outlier rejection (same as before).
+          2. Build normalised weights from proximity to the global peak
+             of |signal| on this polarity:
+                 w_i = |s_i| / max|s|   ∈ [0, 1]
+             so points near the largest dV/dI (or |V|) peak dominate.
+          3. Weighted step:
+                 δ_i = |s_{i+1}·w_{i+1} − s_i·w_i|
+             A true SC→normal (or reverse) transition produces a large
+             rise/fall of dV/dI *near the peak*, so those steps get both
+             a large |Δs| and large weights → highest score.
+          4. Sum δ_i (optionally only those above diff_threshold) and pick
+             the window with the maximum score.  Ic is |I| at the window
+             centre.
+
+        Weighting makes the detector much less sensitive to the absolute
+        scale of dV/dI across temperatures, so a single span /
+        diff_threshold works better over a multi-T set.
+        """
         if len(I_seg) < 2 * span:
-            return abs(I_seg[-1])
+            # Too short for a robust jump search → let caller use max-|signal| fallback
+            return np.nan
         if direction_sign > 0:
             mask = I_seg > 0
         else:
             mask = I_seg < 0
         if not np.any(mask):
             return np.nan
-        I_dir = I_seg[mask]
-        sig_dir = signal_seg[mask]
-        
-        max_change = 0
-        best_idx = 0
-        for i in range(len(sig_dir) - span):
-            window = sig_dir[i:i+span+1]
-            # Outlier removal
-            median = np.median(window)
-            mad = np.median(np.abs(window - median))
-            if mad == 0:
+        I_dir = np.asarray(I_seg[mask], dtype=float)
+        sig_dir = np.asarray(signal_seg[mask], dtype=float)
+
+        # Global peak scale on this polarity (for weights)
+        peak = float(np.nanmax(np.abs(sig_dir)))
+        if not np.isfinite(peak) or peak < 1e-30:
+            peak = 1.0
+
+        max_change = -1.0
+        best_idx = None
+        n = len(sig_dir)
+        for i in range(max(n - span, 0)):
+            window = sig_dir[i:i + span + 1]
+            # Outlier removal (MAD)
+            median = np.nanmedian(window)
+            mad = np.nanmedian(np.abs(window - median))
+            if not np.isfinite(mad) or mad == 0:
                 mad = 1e-10
             outliers = np.abs(window - median) > outlier_threshold * mad
-            clean_window = window[~outliers]
-            if len(clean_window) < 3:
+            # also drop non-finite
+            outliers = outliers | ~np.isfinite(window)
+            clean = window[~outliers]
+            if len(clean) < 3:
                 continue
-            # Sum only significant differences
-            diffs = np.abs(np.diff(clean_window))
-            significant_diffs = diffs[diffs > diff_threshold]
-            change = np.sum(significant_diffs) if len(significant_diffs) > 0 else 0
+
+            # Weights: proximity to global |signal| peak, normalised to [0, 1]
+            w = np.abs(clean) / peak
+            w = np.clip(w, 0.0, 1.0)
+
+            # Weighted differences: |s_{j+1} w_{j+1} - s_j w_j|
+            weighted = clean * w
+            deltas = np.abs(np.diff(weighted))
+            if diff_threshold is not None and diff_threshold > 0:
+                deltas = deltas[deltas > diff_threshold]
+            change = float(np.sum(deltas)) if len(deltas) else 0.0
+
             if change > max_change:
                 max_change = change
                 best_idx = i + span // 2
-        return abs(I_dir[best_idx])
+
+        # No meaningful jump → nan so caller falls back to max |dV/dI|
+        if best_idx is None or max_change <= 0:
+            return np.nan
+        best_idx = int(np.clip(best_idx, 0, len(I_dir) - 1))
+        return abs(float(I_dir[best_idx]))
     
-    # Overall Ic+ and Ic-
-    Ic_plus = find_ic_in_direction(I, signal, direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold)
-    Ic_minus = find_ic_in_direction(I, signal, direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold)
-    
-    results['Ic+_mA'] = Ic_plus * 1000
-    results['Ic-_mA'] = Ic_minus * 1000
-    results['Ic_mA'] = (Ic_plus + Ic_minus) / 2 * 1000 if not np.isnan(Ic_plus) and not np.isnan(Ic_minus) else np.nan
-    
+    # Overall Ic+ and Ic- (restricted to absolute-current window)
+    # ic_window already excludes the symmetric SC core |I| < ic_I_min (and
+    # |I| > ic_I_max if set).  That is the "do not search near zero" window.
+    sig_arr = np.asarray(signal, dtype=float)
+    I_ic = I[ic_window]
+    sig_ic = sig_arr[ic_window]
+
+    def _ic_at_max_signal(I_seg, sig_seg, direction_sign=None):
+        """|I| at maximum |signal| (dV/dI or |V|).
+
+        direction_sign:
+          +1 / -1 → restrict to that polarity
+          None    → use all points in the segment
+        """
+        I_seg = np.asarray(I_seg, dtype=float)
+        sig_seg = np.asarray(sig_seg, dtype=float)
+        if len(I_seg) == 0:
+            return np.nan
+        if direction_sign is not None:
+            m = I_seg > 0 if direction_sign > 0 else I_seg < 0
+            if not np.any(m):
+                return np.nan
+            I_d = I_seg[m]
+            s_d = np.abs(sig_seg[m])
+        else:
+            I_d = I_seg
+            s_d = np.abs(sig_seg)
+        finite = np.isfinite(s_d) & np.isfinite(I_d)
+        if not np.any(finite):
+            return np.nan
+        I_d = I_d[finite]
+        s_d = s_d[finite]
+        j = int(np.argmax(s_d))
+        return abs(float(I_d[j]))
+
+    def _resolve_ic(I_seg, sig_seg, direction_sign, span, out_thr, d_thr):
+        """Jump-based Ic; if that fails, |I| at max |signal| on polarity,
+        then on the whole segment.  Almost never returns nan if any finite
+        signal exists in the considered window.
+        """
+        I_seg = np.asarray(I_seg, dtype=float)
+        sig_seg = np.asarray(sig_seg, dtype=float)
+        if len(I_seg) == 0:
+            return np.nan, False
+
+        val = find_ic_in_direction(
+            I_seg, sig_seg, direction_sign=direction_sign,
+            span=span, outlier_threshold=out_thr, diff_threshold=d_thr,
+        )
+        if val is not None and np.isfinite(val):
+            return float(val), False
+
+        # 1) max |signal| on requested polarity
+        fb = _ic_at_max_signal(I_seg, sig_seg, direction_sign=direction_sign)
+        if fb is not None and np.isfinite(fb):
+            return float(fb), True
+
+        # 2) max |signal| over the whole segment (any polarity)
+        fb = _ic_at_max_signal(I_seg, sig_seg, direction_sign=None)
+        if fb is not None and np.isfinite(fb):
+            return float(fb), True
+
+        return np.nan, False
+
+    Ic_plus, fb_p = _resolve_ic(I_ic, sig_ic, 1, ic_span, outlier_thresh, diff_threshold)
+    Ic_minus, fb_m = _resolve_ic(I_ic, sig_ic, -1, ic_span, outlier_thresh, diff_threshold)
+
+    results['Ic+_mA'] = Ic_plus * 1000 if np.isfinite(Ic_plus) else np.nan
+    results['Ic-_mA'] = Ic_minus * 1000 if np.isfinite(Ic_minus) else np.nan
+    # Mean: use whichever side is finite
+    if np.isfinite(Ic_plus) and np.isfinite(Ic_minus):
+        results['Ic_mA'] = (Ic_plus + Ic_minus) / 2 * 1000
+    elif np.isfinite(Ic_plus):
+        results['Ic_mA'] = Ic_plus * 1000
+    elif np.isfinite(Ic_minus):
+        results['Ic_mA'] = Ic_minus * 1000
+    else:
+        results['Ic_mA'] = np.nan
+
+    results['Ic_fallback'] = {
+        'Ic+_mA': fb_p,
+        'Ic-_mA': fb_m,
+    }
+
     if is_bf:
-        # Per-branch analysis
-        fwd = branch == "forward"
-        bwd = branch == "backward"
-        
-        # Forward branch
-        Ic_plus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(fwd) else np.nan
-        Ic_minus_fwd = find_ic_in_direction(I[fwd], signal[fwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(fwd) else np.nan
-        
-        # Backward branch
-        Ic_plus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(bwd) else np.nan
-        Ic_minus_bwd = find_ic_in_direction(I[bwd], signal[bwd], direction_sign=-1, span=ic_span, outlier_threshold=outlier_thresh, diff_threshold=diff_threshold) if np.any(bwd) else np.nan
-        
-        results['Ic+_f_mA'] = Ic_plus_fwd * 1000
-        results['Ic-_f_mA'] = Ic_minus_fwd * 1000
-        results['Ic+_b_mA'] = Ic_plus_bwd * 1000
-        results['Ic-_b_mA'] = Ic_minus_bwd * 1000
+        # Per-branch analysis (same current window)
+        fwd = (branch == "forward") & ic_window
+        bwd = (branch == "backward") & ic_window
+
+        # Always call resolver (handles empty arrays)
+        Ic_plus_fwd, fb_pf = _resolve_ic(I[fwd], sig_arr[fwd], 1, ic_span, outlier_thresh, diff_threshold)
+        Ic_minus_fwd, fb_mf = _resolve_ic(I[fwd], sig_arr[fwd], -1, ic_span, outlier_thresh, diff_threshold)
+        Ic_plus_bwd, fb_pb = _resolve_ic(I[bwd], sig_arr[bwd], 1, ic_span, outlier_thresh, diff_threshold)
+        Ic_minus_bwd, fb_mb = _resolve_ic(I[bwd], sig_arr[bwd], -1, ic_span, outlier_thresh, diff_threshold)
+
+        results['Ic+_f_mA'] = Ic_plus_fwd * 1000 if np.isfinite(Ic_plus_fwd) else np.nan
+        results['Ic-_f_mA'] = Ic_minus_fwd * 1000 if np.isfinite(Ic_minus_fwd) else np.nan
+        results['Ic+_b_mA'] = Ic_plus_bwd * 1000 if np.isfinite(Ic_plus_bwd) else np.nan
+        results['Ic-_b_mA'] = Ic_minus_bwd * 1000 if np.isfinite(Ic_minus_bwd) else np.nan
+        results['Ic_fallback'].update({
+            'Ic+_f_mA': fb_pf,
+            'Ic-_f_mA': fb_mf,
+            'Ic+_b_mA': fb_pb,
+            'Ic-_b_mA': fb_mb,
+        })
     
     # Jc
     results['Jc_kA/cm2'] = results.get('Ic_mA', np.nan) / (area_um2 * 1e-2) if not np.isnan(results.get('Ic_mA', np.nan)) else np.nan
     
-    # R_N linear fits
+    # R_N linear fits — high-bias window from |I|, not |V|
+    # |I| > rn_criterion · max|I|  (same scale across temperatures/scans)
     def fit_Rn(I_seg, V_seg, criterion):
         if len(I_seg) < 5:
             return np.nan
-        V_max = np.max(np.abs(V_seg))
-        high_bias = np.abs(V_seg) > criterion * V_max
+        I_max = float(np.nanmax(np.abs(I_seg)))
+        if not np.isfinite(I_max) or I_max < 1e-30:
+            return np.nan
+        high_bias = np.abs(I_seg) > criterion * I_max
         if np.sum(high_bias) < 3:
             return np.nan
         slope, _, _, _, _ = linregress(I_seg[high_bias], V_seg[high_bias])
@@ -4413,6 +4571,168 @@ def _add_RT_parser(subparsers):
 
     return p
 
+def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
+                       T_max=None, T_round=0.5, min_points=30):
+    """Split a multi-T rack IV file into per-temperature analyze_IV_dVdI dicts.
+
+    Temperatures are grouped by rounding Tsample to the nearest multiple of
+    ``T_round`` (default 0.5 K).  Only groups with at least ``min_points``
+    rows and a non-trivial current span are kept.
+
+    Returns
+    -------
+    list of dict
+        Each dict is the output of ``analyze_IV_dVdI``-like fields plus
+        ``T_mean`` and ``T_label``.
+    """
+    df = _load_csv_rack(filepath, mode="iv",
+                        channel_dV=channel_dV, channel_dI=channel_dI)
+    if T_max is not None:
+        df = df.loc[df["Tsample"] <= float(T_max)].copy()
+
+    T_round = float(T_round) if T_round and T_round > 0 else 0.5
+    T_key = np.round(df["Tsample"].to_numpy(dtype=float) / T_round) * T_round
+    df = df.copy()
+    df["_T_key"] = T_key
+
+    datasets = []
+    for Tk in sorted(df["_T_key"].unique()):
+        if not np.isfinite(Tk):
+            continue
+        sub = df.loc[df["_T_key"] == Tk]
+        if len(sub) < min_points:
+            continue
+        I = sub["Current (A)"].to_numpy(dtype=float)
+        if np.nanmax(I) - np.nanmin(I) < 1e-9:
+            continue
+
+        V = sub["Voltage (V)"].to_numpy(dtype=float)
+        dV = sub["dV"].to_numpy(dtype=float)
+        dI = sub["dI"].to_numpy(dtype=float)
+        T = sub["Tsample"].to_numpy(dtype=float)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dVdI = np.where(np.abs(dI) > 1e-9, dV / dI, np.nan)
+
+        branch = np.full(len(I), "forward", dtype=object)
+        diffs = np.diff(I)
+        is_bf = bool(np.any(diffs < 0)) if len(diffs) else False
+        if is_bf:
+            i_turn = int(np.where(diffs < 0)[0][0]) + 1
+            branch[i_turn:] = "backward"
+
+        T_mean = float(np.nanmean(T))
+        datasets.append({
+            "I": I, "V": V, "dV": dV, "dI": dI, "dVdI": dVdI,
+            "T": T, "branch": branch, "source": "rack", "is_bf": is_bf,
+            "T_mean": T_mean,
+            "T_label": f"{T_mean:.1f}",
+        })
+    return datasets
+
+def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
+                                   T_max=None, T_round=0.5, min_points=30,
+                                   out_root="singles", figsize=(8.6, 6.0),
+                                   do_analyze=True, area_um2=1.0,
+                                   rn_criterion=0.5, ic_span=10,
+                                   outlier_thresh=5.0, diff_threshold=0.001,
+                                   advanced=False, ic_I_min=None, ic_I_max=None):
+    """Per-temperature IV diagnostics + parameter logs under ``singles/``.
+
+    Layout
+    ------
+    singles/
+      10.0K/
+        analysis.log
+        10.0K_iv.pdf
+        10.0K_dvdI.pdf
+        ...
+      10.5K/
+        ...
+    """
+    datasets = segment_multi_t_iv(
+        filepath, channel_dV=channel_dV, channel_dI=channel_dI,
+        T_max=T_max, T_round=T_round, min_points=min_points,
+    )
+    if not datasets:
+        print("  [per-T] no temperature segments found "
+              f"(T_round={T_round}, T_max={T_max}, min_points={min_points})")
+        return []
+
+    os.makedirs(out_root, exist_ok=True)
+    print(f"  [per-T] {len(datasets)} temperature segment(s) → {out_root}/")
+
+    all_params = []
+    for data in datasets:
+        T_lab = data["T_label"]
+        folder = os.path.join(out_root, f"{T_lab}K")
+        os.makedirs(folder, exist_ok=True)
+        base_name = os.path.join(folder, f"{T_lab}K")
+
+        # Diagnostic plots
+        plot_iv_diagnostics(data, base_name=base_name, figsize=figsize)
+
+        params = {}
+        if do_analyze:
+            params = compute_iv_parameters(
+                data, area_um2=area_um2, rn_criterion=rn_criterion,
+                ic_span=ic_span, outlier_thresh=outlier_thresh,
+                diff_threshold=diff_threshold, advanced=advanced,
+                figsize=figsize,
+                ic_I_min=ic_I_min, ic_I_max=ic_I_max,
+            )
+            all_params.append(params)
+
+        # Log file
+        log_path = os.path.join(folder, "analysis.log")
+        with open(log_path, "w", encoding="utf-8") as fh:
+            fh.write("IV single-T analysis (from multi-T map file)\n")
+            fh.write(f"{'='*60}\n")
+            fh.write(f"source_file : {os.path.abspath(filepath)}\n")
+            fh.write(f"T_label     : {T_lab} K\n")
+            fh.write(f"T_mean      : {data['T_mean']:.4f} K\n")
+            fh.write(f"n_points    : {len(data['I'])}\n")
+            fh.write(f"is_bf       : {data.get('is_bf')}\n")
+            fh.write(f"I range (A) : {np.nanmin(data['I']):.6g} … "
+                     f"{np.nanmax(data['I']):.6g}\n")
+            fh.write(f"\n--- input parameters ---\n")
+            fh.write(f"channel_dV     = {channel_dV}  (column R{channel_dV})\n")
+            fh.write(f"channel_dI     = {channel_dI}  (column X{channel_dI})\n")
+            fh.write(f"T_max          = {T_max}\n")
+            fh.write(f"T_round        = {T_round} K\n")
+            fh.write(f"min_points     = {min_points}\n")
+            fh.write(f"area_um2       = {area_um2}\n")
+            fh.write(f"rn_criterion   = {rn_criterion}\n")
+            fh.write(f"ic_span        = {ic_span}\n")
+            fh.write(f"outlier_thresh = {outlier_thresh}\n")
+            fh.write(f"diff_threshold = {diff_threshold}\n")
+            fh.write(f"ic_I_min (A)   = {ic_I_min}\n")
+            fh.write(f"ic_I_max (A)   = {ic_I_max}\n")
+            fh.write(f"rn_criterion   = {rn_criterion}  (|I| > crit·max|I|)\n")
+            fh.write(f"advanced       = {advanced}\n")
+            if params:
+                fh.write(f"\n--- analysis results ---\n")
+                fb = params.get("Ic_fallback") or {}
+                for k, v in params.items():
+                    if k == "Ic_fallback":
+                        continue
+                    note = ""
+                    if k in fb and fb[k]:
+                        note = "  (chosen from maximum dV/dI)"
+                    if isinstance(v, float):
+                        if np.isfinite(v):
+                            fh.write(f"{k:20s} = {v:.6g}{note}\n")
+                        else:
+                            fh.write(f"{k:20s} = nan\n")
+                    else:
+                        fh.write(f"{k:20s} = {v}{note}\n")
+            fh.write(f"\nplots saved as {base_name}_*.pdf\n")
+
+        print(f"    T = {T_lab} K  →  {folder}/")
+
+    return all_params
+
+
 def _add_IV_dVdI_parser(subparsers):
     p = subparsers.add_parser("IV", help="I(V) and dV/dI analysis")
     p.add_argument('csv_files', nargs='*', default=[], 
@@ -4434,7 +4754,14 @@ def _add_IV_dVdI_parser(subparsers):
                        help="Cross-section area in um² for Jc calculation (default=1.0)")
 
     p.add_argument('--rn-criterion', type=float, default=0.5,
-                       help="Fraction of max |V| to use for normal-state R_N linear fit (default=0.5)")
+                       help="Fraction of max |I| defining the high-bias window for "
+                            "the R_N linear fit: |I| > rn_criterion·max|I| (default=0.5)")
+    p.add_argument('--ic-I-min', type=float, default=None, metavar='A',
+                   help="Exclude the symmetric SC window |I| < ic-I-min (Amperes) "
+                        "from the Ic search. Points with |I| < ic-I-min are ignored.")
+    p.add_argument('--ic-I-max', type=float, default=None, metavar='A',
+                   help="Maximum |I| (Amperes) for the Ic search window. "
+                        "Points with |I| > ic-I-max are ignored (cuts circuit-switching artefacts).")
     p.add_argument('--analyze', action='store_true', 
                        help="Perform numerical analysis (Ic, Jc, RN, etc.) in addition to plotting")
     p.add_argument('--advanced', action='store_true', 
@@ -4454,6 +4781,21 @@ def _add_IV_dVdI_parser(subparsers):
                    help="Outlier threshold for Ic detection (default 5.0)")
     p.add_argument('--diff-threshold', type=float, default=0.001,
                    help="Minimum difference to consider in sum for Ic detection (default 0.001)")
+    p.add_argument('--T-max', type=float, default=None, metavar='K',
+                   help="Only use data with Tsample ≤ T_max (K) for multi-T map "
+                        "and optional per-T analysis.")
+    p.add_argument('--per-T-analysis', action='store_true',
+                   help="For --multi-t-file: also segment into per-temperature "
+                        "I(V)/dV/dI analyses up to T_max (if set). Writes "
+                        "singles/<T>K/ with plots and analysis.log each.")
+    p.add_argument('--T-round', type=float, default=0.5, metavar='K',
+                   help="Temperature bin width (K) when grouping a multi-T file "
+                        "into single-T segments (default: 0.5).")
+    p.add_argument('--min-points', type=int, default=30,
+                   help="Minimum points required in a temperature segment "
+                        "(default: 30).")
+    p.add_argument('--singles-dir', type=str, default='singles',
+                   help="Root folder for per-T outputs (default: singles).")
     return p
 
 def _add_Hall_MR_parser(subparsers):
@@ -5243,26 +5585,57 @@ def _run_IV_dVdI(args):
                                                outlier_thresh=args.outlier_thresh,
                                                diff_threshold=args.diff_threshold,
                                                advanced=getattr(args, 'advanced', False),
-                                               figsize=args.figsize)
+                                               figsize=args.figsize,
+                                               ic_I_min=getattr(args, 'ic_I_min', None),
+                                               ic_I_max=getattr(args, 'ic_I_max', None))
                 print(f"\n=== IV Analysis Results for {csv_file} ===")
+                fb = params.get("Ic_fallback") or {}
                 for k, v in params.items():
+                    if k == "Ic_fallback":
+                        continue
+                    note = "  (chosen from maximum dV/dI)" if fb.get(k) else ""
                     if isinstance(v, float):
-                        print(f"  {k:12s}: {v:.6g}")
+                        print(f"  {k:12s}: {v:.6g}{note}")
                     else:
-                        print(f"  {k:12s}: {v}")
+                        print(f"  {k:12s}: {v}{note}")
             
             print(f"Processed {csv_file}")
             return
     elif getattr(args, 'multi_t_file', None):
         filepath = args.multi_t_file
+        T_max = getattr(args, 'T_max', None)
         print(f"Running 2D dV/dI map from single multi-T file: {filepath}")
+        if T_max is not None:
+            print(f"  T_max = {T_max} K")
         plot_2d_dvdi_map_from_single_file(
-                                            filepath,
-                                            channel_dV=args.channel_dV,
-                                            channel_dI=args.channel_dI,
-                                            n_T_bins=args.n_T_bins,
-                                            n_I_bins=args.n_I_bins,
-                                        )
+            filepath,
+            channel_dV=args.channel_dV,
+            channel_dI=args.channel_dI,
+            n_T_bins=args.n_T_bins,
+            n_I_bins=args.n_I_bins,
+            T_max=T_max,
+        )
+        if getattr(args, 'per_T_analysis', False):
+            print("Running per-temperature single IV analysis...")
+            run_per_T_iv_from_multi_t_file(
+                filepath,
+                channel_dV=args.channel_dV,
+                channel_dI=args.channel_dI,
+                T_max=T_max,
+                T_round=getattr(args, 'T_round', 0.5),
+                min_points=getattr(args, 'min_points', 30),
+                out_root=getattr(args, 'singles_dir', 'singles'),
+                figsize=tuple(args.figsize),
+                do_analyze=True,  # always log parameters for per-T mode
+                area_um2=args.area,
+                rn_criterion=args.rn_criterion,
+                ic_span=args.ic_span,
+                outlier_thresh=args.outlier_thresh,
+                diff_threshold=args.diff_threshold,
+                advanced=getattr(args, 'advanced', False),
+                ic_I_min=getattr(args, 'ic_I_min', None),
+                ic_I_max=getattr(args, 'ic_I_max', None),
+            )
         return
 
 def _find_comments_for_csv(csv_path):
