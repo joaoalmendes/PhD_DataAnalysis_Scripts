@@ -10,6 +10,29 @@ python3 plot_csv_data.py RT 260812_RT_300to3K_001.csv --skip-points 3 --drdt --c
 
 --- I(V) & dV/dI ---
 
+::: For a single-T I(V) & dV/dI file
+
+python3 plot_csv_data.py IV 260917_IV_3K_BF_Wait5s_005.csv --area 215 --analyze --ic-I-min 2e-4 --ic-I-max 4e-4 --rn-criterion 0.65
+--advanced 
+
+python3 plot_csv_data.py IV [file] --area [JJ area] --analyze [automatically calculate relevant parameteres from the data]
+--ic-I-min [min value of the |I| window to calculate Ic from] --ic-I-max [max value of the |I| window to calculate Ic from]
+--rn-criterion [|I_max| multiplier for Rn calculation] --advanced [perform an advanced analysis parameter wise and including:
+numerical calculation of dI/dV and superconducting gap from I(V) data, Capacitance and Beta_c, and Diode efficiency]
+
+::: From single scan file with multiple-T
+
+python3 plot_csv_data.py IV   --multi-t-file 260917_IV_dVdI_map_2to50K_008.csv   --T-max 35   --per-T-analysis   --T-round 0.5   --n-T-bins 35
+--n-I-bins 170   --analyze --area 215 --ic-span 10 --outlier-thresh 15 --diff-threshold 0.001 --rn-criterion 0.75 --ic-I-min 0.00018 --ic-I-max 0.00038
+
+python3 plot_csv_data.py IV --multi-t-file [file] --T-max [maximum T to consider for analysis] --per-T-analysis [If True, runs 
+single-T analysis for every temperature of the scan] --T-round [defined the T step of the scan for the single-T analysis]
+--n-T-bins [raise for better resolution] --n-I-bins [same as last] --analyze [calculate parameteres automatically for single-T analysis]
+--area [JJ area] --ic-span [point window for Ic calculation] ---outlier-thresh [multiplier from the median of the window]
+--diff-threshold [min differences between points to consider] --rn-criterion [|I_max| multiplier for Rn calculation]
+--ic-I-min [min value of the |I| window to calculate Ic from] --ic-I-max [max value of the |I| window to calculate Ic from]
+
+
 --- MR & Hall analysis ---
 
 python3 plot_csv_data.py Hall_MR *-5to5T*.csv --bwd *5to-5T*.csv --comments *.txt  --thickness 40e-9 --show-T --current 1e-6 --check-hysteresis --zoom-Rxx -500 500
