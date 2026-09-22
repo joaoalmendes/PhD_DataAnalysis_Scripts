@@ -13,9 +13,9 @@ by the IV/dV-dI pipeline (one `analysis.log` per temperature, stored as
 
 ), builds a weighted (constant) normal-state resistance R_n, and fits the
 temperature-dependent critical current Ic(T) with the Ambegaokar-Baratoff
-(AB) relation
+(AB) relation, optionally multiplied by a dimensionless prefactor eta
 
-    Ic(T) = (pi * Delta(T)) / (2 * e * R_n) * tanh( Delta(T) / (2 * kB * T) )
+    Ic(T) = eta * (pi * Delta(T)) / (2 * e * R_n) * tanh( Delta(T) / (2 * kB * T) )
 
 using the standard BCS interpolation formula for the gap
 
@@ -25,14 +25,17 @@ using the standard BCS interpolation formula for the gap
 R_n is held fixed at the weighted average determined from all the
 individual `Rn_mean_mOhm` values (weight ~ 1/rn_criterion, since a larger
 rn_criterion means fewer points were used in that particular fit and
-should therefore contribute less). Delta0 and Tc are the free fit
-parameters.
+should therefore contribute less). By default eta is held fixed at 1
+(original AB formula); pass --fit-eta to treat eta as a free fit
+parameter. Delta0 and Tc are free (Tc may be held fixed via --Tc).
 
 Usage
 -----
     python Ic_T_fit.py
     python Ic_T_fit.py --dir /path/to/main_folder
     python Ic_T_fit.py --normalize --Tc 7.2
+    python Ic_T_fit.py --fit-eta
+    python Ic_T_fit.py --fit-eta --Tc 7.2
 
 Output
 ------
@@ -40,7 +43,8 @@ Output
     - a summary printed to stdout with:
         * weighted R_n (mOhm)
         * fitted Delta0 (meV)
-        * fitted Tc (K)
+        * fitted (or fixed) Tc (K)
+        * eta (fitted, or fixed at 1)
         * Ic(T=0) (mA)
         * R^2 of the fit
 """
@@ -188,12 +192,13 @@ def bcs_gap(T, Delta0_J, Tc):
     return Delta
 
 
-def ic_ambegaokar_baratoff(T, Delta0_meV, Tc, Rn_Ohm):
-    """Ambegaokar-Baratoff critical current, in mA.
+def ic_ambegaokar_baratoff(T, Delta0_meV, Tc, Rn_Ohm, eta=1.0):
+    """Ambegaokar-Baratoff critical current, in mA, multiplied by eta.
 
     Delta0_meV : superconducting gap at T=0, in meV
     Tc         : critical temperature, in K
     Rn_Ohm     : (fixed) normal-state resistance, in Ohm
+    eta        : dimensionless prefactor (fit parameter or fixed at 1)
     """
     T = np.atleast_1d(np.asarray(T, dtype=float))
     Delta0_J = Delta0_meV * 1e-3 * E_CHARGE
@@ -202,51 +207,85 @@ def ic_ambegaokar_baratoff(T, Delta0_meV, Tc, Rn_Ohm):
     T_safe = np.where(T > 0, T, np.nan)
     arg = np.divide(Delta_T, 2.0 * K_BOLTZ * T_safe,
                      out=np.zeros_like(Delta_T), where=T_safe > 0)
-    Ic = (np.pi * Delta_T) / (2.0 * E_CHARGE * Rn_Ohm) * np.tanh(arg)
+    Ic = eta * (np.pi * Delta_T) / (2.0 * E_CHARGE * Rn_Ohm) * np.tanh(arg)
     Ic = np.nan_to_num(Ic, nan=0.0)
     return Ic * 1e3  # A -> mA
 
 
-def ic0_from_gap(Delta0_meV, Rn_Ohm):
+def ic0_from_gap(Delta0_meV, Rn_Ohm, eta=1.0):
     """Ic(T=0) in mA, from the T -> 0 limit of the AB formula
-    (tanh(...) -> 1)."""
+    (tanh(...) -> 1), including the prefactor eta."""
     Delta0_J = Delta0_meV * 1e-3 * E_CHARGE
-    return (np.pi * Delta0_J) / (2.0 * E_CHARGE * Rn_Ohm) * 1e3
+    return eta * (np.pi * Delta0_J) / (2.0 * E_CHARGE * Rn_Ohm) * 1e3
 
 
-def fit_ic_vs_T(T, Ic, Rn_Ohm, Tc_fixed=None):
-    """Fit Delta0 (meV) [and, unless Tc_fixed is given, Tc (K)] to Ic(T)
-    data, with Rn fixed.
+def fit_ic_vs_T(T, Ic, Rn_Ohm, Tc_fixed=None, fit_eta=False):
+    """Fit Delta0 (meV) [and, unless Tc_fixed is given, Tc (K)]
+    [and, if fit_eta is True, eta] to Ic(T) data, with Rn fixed.
 
-    If `Tc_fixed` is None, both Delta0 and Tc are free fit parameters.
-    If `Tc_fixed` is given (K), Tc is held fixed at that value and only
-    Delta0 is fitted.
+    If `Tc_fixed` is None, Tc is a free fit parameter; otherwise it is
+    held fixed at that value.
+    If `fit_eta` is False (default), eta is held fixed at 1 (original
+    AB formula); if True, eta is a free fit parameter.
 
-    Returns (popt, pcov, r_squared), where popt = (Delta0_meV, Tc) in
-    both cases (Tc == Tc_fixed, with zero variance, when it was fixed).
+    Returns (popt, pcov, r_squared), where popt = (Delta0_meV, Tc, eta)
+    in all cases. Fixed parameters appear with zero variance.
     """
     Tc_guess = 1.2 * T.max() if Tc_fixed is None else Tc_fixed
     Delta0_guess = 1.764 * K_BOLTZ * Tc_guess / (1e-3 * E_CHARGE)  # BCS weak-coupling estimate, meV
+    eta_guess = 1.0
 
-    if Tc_fixed is None:
+    # Four cases: (Tc free/fixed) x (eta free/fixed)
+    if Tc_fixed is None and fit_eta:
+        # free: Delta0, Tc, eta
+        def model(T, Delta0_meV, Tc, eta):
+            return ic_ambegaokar_baratoff(T, Delta0_meV, Tc, Rn_Ohm, eta)
+
+        p0 = [Delta0_guess, Tc_guess, eta_guess]
+        bounds = ([1e-3, T.max() * 1.001, 1e-3], [50.0, 500.0, 10.0])
+        popt, pcov = curve_fit(model, T, Ic, p0=p0, bounds=bounds, maxfev=20000)
+        Ic_fit = model(T, *popt)
+
+    elif Tc_fixed is None and not fit_eta:
+        # free: Delta0, Tc;  eta fixed at 1
         def model(T, Delta0_meV, Tc):
-            return ic_ambegaokar_baratoff(T, Delta0_meV, Tc, Rn_Ohm)
+            return ic_ambegaokar_baratoff(T, Delta0_meV, Tc, Rn_Ohm, eta=1.0)
 
         p0 = [Delta0_guess, Tc_guess]
         bounds = ([1e-3, T.max() * 1.001], [50.0, 500.0])
-        popt, pcov = curve_fit(model, T, Ic, p0=p0, bounds=bounds, maxfev=20000)
-        Ic_fit = model(T, *popt)
+        popt_2d, pcov_2d = curve_fit(model, T, Ic, p0=p0, bounds=bounds,
+                                     maxfev=20000)
+        Ic_fit = model(T, *popt_2d)
+        popt = np.array([popt_2d[0], popt_2d[1], 1.0])
+        pcov = np.zeros((3, 3))
+        pcov[0:2, 0:2] = pcov_2d
+
+    elif Tc_fixed is not None and fit_eta:
+        # free: Delta0, eta;  Tc fixed
+        def model(T, Delta0_meV, eta):
+            return ic_ambegaokar_baratoff(T, Delta0_meV, Tc_fixed, Rn_Ohm, eta)
+
+        popt_2d, pcov_2d = curve_fit(model, T, Ic, p0=[Delta0_guess, eta_guess],
+                                     bounds=([1e-3, 1e-3], [50.0, 10.0]),
+                                     maxfev=20000)
+        Ic_fit = model(T, *popt_2d)
+        popt = np.array([popt_2d[0], Tc_fixed, popt_2d[1]])
+        pcov = np.zeros((3, 3))
+        pcov[0, 0] = pcov_2d[0, 0]
+        pcov[0, 2] = pcov_2d[0, 1]
+        pcov[2, 0] = pcov_2d[1, 0]
+        pcov[2, 2] = pcov_2d[1, 1]
+
     else:
+        # free: Delta0 only;  Tc fixed, eta fixed at 1
         def model(T, Delta0_meV):
-            return ic_ambegaokar_baratoff(T, Delta0_meV, Tc_fixed, Rn_Ohm)
+            return ic_ambegaokar_baratoff(T, Delta0_meV, Tc_fixed, Rn_Ohm, eta=1.0)
 
         popt_1d, pcov_1d = curve_fit(model, T, Ic, p0=[Delta0_guess],
                                      bounds=([1e-3], [50.0]), maxfev=20000)
         Ic_fit = model(T, *popt_1d)
-        # pad into the same 2-parameter shape (Delta0, Tc) used elsewhere,
-        # with Tc fixed (zero variance / covariance)
-        popt = np.array([popt_1d[0], Tc_fixed])
-        pcov = np.zeros((2, 2))
+        popt = np.array([popt_1d[0], Tc_fixed, 1.0])
+        pcov = np.zeros((3, 3))
         pcov[0, 0] = pcov_1d[0, 0]
 
     ss_res = np.sum((Ic - Ic_fit) ** 2)
@@ -260,14 +299,14 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, Tc_fixed=None):
 # Plotting
 # ----------------------------------------------------------------------
 def make_plot(T, Ic, popt, Rn_Ohm, r_squared, normalize=False, Tc_norm=None,
-              outpath="Ic_T_fit.pdf"):
+              outpath="Ic_T_fit.pdf", fit_eta=False):
     set_paper_style()
 
-    Delta0_meV, Tc_fit = popt
-    Ic0 = ic0_from_gap(Delta0_meV, Rn_Ohm)
+    Delta0_meV, Tc_fit, eta = popt
+    Ic0 = ic0_from_gap(Delta0_meV, Rn_Ohm, eta)
 
     T_fine = np.linspace(1e-3, min(T.max() * 1.05, Tc_fit * 0.999), 500)
-    Ic_fine = ic_ambegaokar_baratoff(T_fine, Delta0_meV, Tc_fit, Rn_Ohm)
+    Ic_fine = ic_ambegaokar_baratoff(T_fine, Delta0_meV, Tc_fit, Rn_Ohm, eta)
 
     fig, ax = plt.subplots(figsize=(8.6 / 2.54, 6.5 / 2.54), constrained_layout=True)
 
@@ -289,10 +328,17 @@ def make_plot(T, Ic, popt, Rn_Ohm, r_squared, normalize=False, Tc_norm=None,
     ax.plot(x_data, y_data, "ko", label="data")
     ax.plot(x_fine, y_fine, "b-", marker="none", label="AB fit")
 
-    label = (rf"$\Delta_0$ = {Delta0_meV:.3f} meV" "\n"
-              rf"$T_c$ = {Tc_fit:.2f} K" "\n"
-              rf"$R_n$ = {Rn_Ohm * 1e3:.1f} m$\Omega$" "\n"
-              rf"$R^2$ = {r_squared:.4f}")
+    label_lines = [
+        rf"$\Delta_0$ = {Delta0_meV:.3f} meV",
+        rf"$T_c$ = {Tc_fit:.2f} K",
+    ]
+    if fit_eta:
+        label_lines.append(rf"$\eta$ = {eta:.3f}")
+    label_lines.extend([
+        rf"$R_n$ = {Rn_Ohm * 1e3:.1f} m$\Omega$",
+        rf"$R^2$ = {r_squared:.4f}",
+    ])
+    label = "\n".join(label_lines)
     ax.text(0.03, 0.05, label, transform=ax.transAxes, fontsize=7,
             va="bottom", ha="left")
 
@@ -320,6 +366,10 @@ def main():
                              "points with T < Tc are used (for the Rn "
                              "average and the fit). Also used to renormalize "
                              "the x-axis when --normalize is set.")
+    parser.add_argument("--fit-eta", action="store_true",
+                        help="Treat the dimensionless prefactor eta as a free "
+                             "fit parameter. Without this flag, eta is held "
+                             "fixed at 1 (original Ambegaokar-Baratoff).")
     parser.add_argument("--out", default="Ic_T_fit.pdf",
                         help="Output plot filename (default: Ic_T_fit.pdf)")
     args = parser.parse_args()
@@ -351,16 +401,18 @@ def main():
     Rn_Ohm = Rn_avg_mOhm * 1e-3
     print(f"Weighted R_n = {Rn_avg_mOhm:.3f} +/- {Rn_std_mOhm:.3f} mOhm")
 
-    # 3. Fit (Tc is held fixed at --Tc, if given; otherwise it is fitted)
-    popt, pcov, r_squared = fit_ic_vs_T(T, Ic, Rn_Ohm, Tc_fixed=args.Tc)
-    Delta0_meV, Tc_fit = popt
+    # 3. Fit (Tc fixed via --Tc if given; eta free only if --fit-eta)
+    popt, pcov, r_squared = fit_ic_vs_T(
+        T, Ic, Rn_Ohm, Tc_fixed=args.Tc, fit_eta=args.fit_eta)
+    Delta0_meV, Tc_fit, eta = popt
     perr = np.sqrt(np.diag(pcov))
-    Ic0 = ic0_from_gap(Delta0_meV, Rn_Ohm)
+    Ic0 = ic0_from_gap(Delta0_meV, Rn_Ohm, eta)
     tc_was_fixed = args.Tc is not None
 
     # 4. Plot
     make_plot(T, Ic, popt, Rn_Ohm, r_squared,
-              normalize=args.normalize, Tc_norm=args.Tc, outpath=args.out)
+              normalize=args.normalize, Tc_norm=args.Tc, outpath=args.out,
+              fit_eta=args.fit_eta)
 
     # 5. Report
     print("\n--- Ambegaokar-Baratoff fit results ---")
@@ -370,6 +422,10 @@ def main():
         print(f"Tc (fixed, input)         = {Tc_fit:.4f} K")
     else:
         print(f"Tc (fit)                  = {Tc_fit:.4f} +/- {perr[1]:.4f} K")
+    if args.fit_eta:
+        print(f"eta (fit)                 = {eta:.4f} +/- {perr[2]:.4f}")
+    else:
+        print(f"eta (fixed)               = {eta:.4f}")
     print(f"Ic(T=0)                   = {Ic0:.4f} mA")
     print(f"R^2                       = {r_squared:.5f}")
     print(f"\nPlot saved to: {os.path.abspath(args.out)}")
