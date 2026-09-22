@@ -24,6 +24,7 @@ numerical calculation of dI/dV and superconducting gap from I(V) data, Capacitan
 
 python3 plot_csv_data.py IV   --multi-t-file 260917_IV_dVdI_map_2to50K_008.csv   --T-max 35   --per-T-analysis   --T-round 0.5   --n-T-bins 35
 --n-I-bins 170   --analyze --area 215 --ic-span 10 --outlier-thresh 15 --diff-threshold 0.001 --rn-criterion 0.75 --ic-I-min 0.00018 --ic-I-max 0.00038
+--split-sweeps
 
 python3 plot_csv_data.py IV --multi-t-file [file] --T-max [maximum T to consider for analysis] --per-T-analysis [If True, runs 
 single-T analysis for every temperature of the scan] --T-round [defined the T step of the scan for the single-T analysis]
@@ -31,6 +32,7 @@ single-T analysis for every temperature of the scan] --T-round [defined the T st
 --area [JJ area] --ic-span [point window for Ic calculation] ---outlier-thresh [multiplier from the median of the window]
 --diff-threshold [min differences between points to consider] --rn-criterion [|I_max| multiplier for Rn calculation]
 --ic-I-min [min value of the |I| window to calculate Ic from] --ic-I-max [max value of the |I| window to calculate Ic from]
+--split-sweeps [when True, splits the fwd and bwd sweeps into two combined plots]
 
 
 --- MR & Hall analysis ---
