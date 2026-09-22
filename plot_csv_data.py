@@ -4044,33 +4044,41 @@ def plot_rxx_vs_T(results_list, ax=None, figsize=None, color='tab:blue'):
     ax.legend()
     return ax
 
-def compute_T_star(results_list, y_threshold=0.95, high_T_frac=0.4):
-    """Estimate the pseudogap onset temperature T* from ρ_xx(T).
+def compute_T_star(results_list=None, T=None, rho=None,
+                   y_threshold=0.95, high_T_frac=0.4,
+                   rho_unit='Ohm_m'):
+    """Estimate the pseudogap onset temperature T* from ρ(T) or R(T).
 
-    1. Collect ρ_xx(H_ref) vs T.
-    2. Linear-fit the high-T subset: ρ = a·T + ρ₀.
-    3. y(T) = (ρ_xx − ρ₀)/(a·T)  → 1 in the T-linear regime.
-    4. Fit a *constrained log model* that encodes the expected shape:
+    Accepts either:
+      • results_list : list of Hall analyze_hall_mr dicts
+        (uses T_nominal_K, rxx_ref_Ohm_m), or
+      • T, rho       : explicit arrays (any common length).
 
-           y_fit(T) = 1                         for  T ≥ T₀
-           y_fit(T) = 1 − B·ln(T₀/T)            for  T <  T₀
+    rho_unit : {'Ohm_m', 'uOhm_cm', 'Ohm'}
+        Unit of the resistivity/resistance series.  'Ohm_m' is converted
+        to µΩ·cm for the fit display; 'Ohm' is left as resistance
+        (scale-invariant for the normalised y-curve).
 
-       with B ≥ 0.  T₀ is the temperature where y first leaves the
-       plateau at 1 — i.e. the natural definition of T*.  A dense grid
-       search over T₀ (plus an analytic best-B for each trial) is used
-       so the fit remains stable with only a handful of points.
-    5. T* is reported as T₀; an optional y_threshold crossing on the
-       fitted curve is also computed for comparison.  Uncertainty comes
-       from the residual rms propagated through the local slope.
-
-    This constrained form extrapolates more reliably than a free
-    A − B·ln(T) polynomial when data are sparse, because the high-T
-    asymptote y → 1 is built in rather than fitted.
+    Algorithm (unchanged):
+    1. Linear-fit the high-T subset: ρ = a·T + ρ₀.
+    2. y(T) = (ρ − ρ₀)/(a·T)  → 1 in the T-linear regime.
+    3. Constrained log model:
+           y = 1                     (T ≥ T₀)
+           y = 1 − B·ln(T₀/T)        (T <  T₀),  B ≥ 0
+       T* ≡ T₀.
     """
-    T   = np.array([r['T_nominal_K']   for r in results_list], dtype=float)
-    rxx = np.array([r['rxx_ref_Ohm_m'] for r in results_list], dtype=float)
-    finite = np.isfinite(T) & np.isfinite(rxx) & (T > 0)
-    T, rxx = T[finite], rxx[finite]
+    if results_list is not None:
+        T   = np.array([r['T_nominal_K']   for r in results_list], dtype=float)
+        rho = np.array([r['rxx_ref_Ohm_m'] for r in results_list], dtype=float)
+        rho_unit = 'Ohm_m'
+    else:
+        if T is None or rho is None:
+            raise ValueError("compute_T_star: pass results_list or both T and rho")
+        T   = np.asarray(T, dtype=float)
+        rho = np.asarray(rho, dtype=float)
+
+    finite = np.isfinite(T) & np.isfinite(rho) & (T > 0)
+    T, rho = T[finite], rho[finite]
 
     empty = {
         'T_star_K': np.nan, 'T_star_err_K': np.nan,
@@ -4078,14 +4086,26 @@ def compute_T_star(results_list, y_threshold=0.95, high_T_frac=0.4):
         'y': np.array([]), 'T': T, 'poly': None,
         'fit_A': np.nan, 'fit_B': np.nan, 'fit_T0': np.nan,
         'y_threshold': y_threshold, 'rxx_uOhm_cm': np.array([]),
+        'rho_unit': rho_unit,
     }
     if len(T) < 2:
-        print("  [T*] fewer than 2 finite ρ_xx(T) points — cannot estimate T*.")
+        print("  [T*] fewer than 2 finite ρ(T)/R(T) points — cannot estimate T*.")
         return empty
 
     order = np.argsort(T)
-    T, rxx = T[order], rxx[order]
-    rxx_u = rxx * _HALL_Ohm_m_to_uOhm_cm
+    T, rho = T[order], rho[order]
+
+    # Working series in "display" units (µΩ·cm for resistivity, Ohm for resistance)
+    if rho_unit == 'Ohm_m':
+        rxx_u = rho * _HALL_Ohm_m_to_uOhm_cm
+        unit_str = 'µΩ·cm'
+    elif rho_unit == 'uOhm_cm':
+        rxx_u = rho
+        unit_str = 'µΩ·cm'
+    else:  # 'Ohm' — pure resistance; y is scale-invariant
+        rxx_u = rho
+        unit_str = 'Ω'
+
 
     # ── High-T linear fit for a = dρ/dT ────────────────────────────────
     n_hi = max(2, int(np.ceil(high_T_frac * len(T))))
@@ -4188,9 +4208,9 @@ def compute_T_star(results_list, y_threshold=0.95, high_T_frac=0.4):
     cross_str = f"{T_cross:.1f} K" if np.isfinite(T_cross) else "n/a"
     print(
         f"\n  T* (pseudogap) estimate:\n"
-        f"  a = dρ/dT  = {a:.4g} ± {a_err_str}  µΩ·cm/K  "
+        f"  a = dρ/dT  = {a:.4g} ± {a_err_str}  {unit_str}/K  "
         f"(from {n_hi} high-T points)\n"
-        f"  ρ₀         = {rho0:.4g}  µΩ·cm\n"
+        f"  ρ₀ / R₀    = {rho0:.4g}  {unit_str}\n"
         f"  constrained log fit:\n"
         f"    y = 1                     (T ≥ T₀)\n"
         f"    y = 1 − B·ln(T₀/T)        (T <  T₀)\n"
@@ -4208,13 +4228,16 @@ def compute_T_star(results_list, y_threshold=0.95, high_T_frac=0.4):
         'y_fit': y_fit,
         'fit_A': A, 'fit_B': B, 'fit_T0': T0,
         'y_threshold': y_threshold, 'rxx_uOhm_cm': rxx_u,
+        'rho_unit': rho_unit, 'unit_str': unit_str,
     }
 
 
-def plot_T_star(results_list, tstar_result=None, ax=None, figsize=None,
+def plot_T_star(results_list=None, tstar_result=None, ax=None, figsize=None,
                 color='tab:purple'):
-    """Plot (ρ_xx − ρ₀)/(a T) vs T and mark T*."""
+    """Plot (ρ − ρ₀)/(a T) vs T and mark T*."""
     if tstar_result is None:
+        if results_list is None:
+            raise ValueError("plot_T_star: provide results_list or tstar_result")
         tstar_result = compute_T_star(results_list)
 
     created = ax is None
@@ -4228,8 +4251,9 @@ def plot_T_star(results_list, tstar_result=None, ax=None, figsize=None,
     if len(T) == 0:
         return ax
 
-    ax.plot(T, y, 'o', color=color, ms=4, zorder=3,
-            label=r'$(\rho_{xx}-\rho_0)/(a\,T)$')
+    unit = tstar_result.get('unit_str', 'µΩ·cm')
+    y_lbl = r'$(R-R_0)/(aT)$' if unit == 'Ω' else r'$(\rho-\rho_0)/(aT)$'
+    ax.plot(T, y, 'o', color=color, ms=4, zorder=3, label=y_lbl)
 
     y_fit = tstar_result.get('y_fit')
     T0 = tstar_result.get('fit_T0', np.nan)
@@ -4252,7 +4276,7 @@ def plot_T_star(results_list, tstar_result=None, ax=None, figsize=None,
                    label=rf"$T^*={Ts:.1f}\pm{err_str}$ K")
 
     ax.set_xlabel(r'$T$ (K)')
-    ax.set_ylabel(r'$(\rho_{xx}-\rho_0)/(a\,T)$')
+    ax.set_ylabel(y_lbl)
     ax.set_title(r'Pseudogap scaling — $T^*$')
     ax.legend()
     return ax
@@ -4292,6 +4316,115 @@ def plot_ryx_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
     ax.legend()
     if created:
         plt.tight_layout()
+    return ax
+
+# ==================================================================
+# Command-line interface
+#
+# Each plot type gets one (parser-builder, runner) pair registered in
+# PLOT_TYPES below. Adding a new measurement type later (I-V, etc.)
+# means writing its own analyze_*/plot_* functions above, plus one
+# more entry here -- main() itself never needs to change.
+# ==================================================================
+
+def rt_series_for_T_star(data, branch=None, thickness_m=None,
+                         width_m=None, length_m=None, area_m2=None,
+                         T_min=None, T_max=None):
+    """Build (T, rho_or_R, rho_unit) from an analyze_RT dict.
+
+    Geometry (optional), matching the Hall convention:
+        geom = t * (w/l)  if w and l given
+             = t          if only thickness
+             = area/l     if area (cross-section) and length given
+             = None       -> use raw R in Ohm (y-curve still valid)
+
+    branch : None | 'cooldown' | 'warmup'
+        If set and data has branches, restrict to that branch.
+    T_min, T_max : float or None
+        Inclusive temperature window (K).  Used to exclude the
+        superconducting region below Tc (and optionally a margin).
+    """
+    T = np.asarray(data['T'], dtype=float)
+    R = np.asarray(data['R'], dtype=float)
+    if branch is not None and 'branch' in data:
+        m = data['branch'] == branch
+        T, R = T[m], R[m]
+
+    finite = np.isfinite(T) & np.isfinite(R) & (T > 0)
+    T, R = T[finite], R[finite]
+    if T_min is not None:
+        m = T >= float(T_min)
+        T, R = T[m], R[m]
+    if T_max is not None:
+        m = T <= float(T_max)
+        T, R = T[m], R[m]
+
+    # Resolve geometric factor → resistivity in Ohm·m if possible
+    geom = None
+    if thickness_m is not None and width_m is not None and length_m is not None:
+        if length_m > 0:
+            geom = float(thickness_m) * (float(width_m) / float(length_m))
+    elif thickness_m is not None:
+        geom = float(thickness_m)
+    elif area_m2 is not None and length_m is not None and length_m > 0:
+        geom = float(area_m2) / float(length_m)
+
+    if geom is not None and geom > 0:
+        rho = R * geom          # Ohm * m = Ohm·m  (bar geometry)
+        return T, rho, 'Ohm_m'
+    return T, R, 'Ohm'
+
+def plot_RT_vs_T_linear(T, rho, rho_unit='Ohm', ax=None, figsize=None,
+                        color='tab:blue', label=None):
+    """R(T) or rho(T) with a high-T linear overlay (RT analogue of plot_rxx_vs_T)."""
+    created = ax is None
+    if created:
+        w = (figsize[0] if figsize else 8.6) / 2.54
+        h = (figsize[1] if figsize else 7.0) / 2.54
+        fig, ax = plt.subplots(figsize=(w, h), constrained_layout=True)
+
+    T = np.asarray(T, dtype=float)
+    rho = np.asarray(rho, dtype=float)
+    finite = np.isfinite(T) & np.isfinite(rho)
+    T, rho = T[finite], rho[finite]
+
+    if rho_unit == 'Ohm_m':
+        y = rho * _HALL_Ohm_m_to_uOhm_cm
+        ylab = r'$\rho$ ($\mu\Omega\cdot$cm)'
+        unit = 'uOhm_cm'
+        unit_disp = r'$\mu\Omega\cdot$cm'
+    elif rho_unit == 'uOhm_cm':
+        y = rho
+        ylab = r'$\rho$ ($\mu\Omega\cdot$cm)'
+        unit = 'uOhm_cm'
+        unit_disp = r'$\mu\Omega\cdot$cm'
+    else:
+        y = rho
+        ylab = r'$R$ ($\Omega$)'
+        unit = 'Ohm'
+        unit_disp = r'$\Omega$'
+
+    default_lbl = r'$\rho(T)$' if unit != 'Ohm' else r'$R(T)$'
+    ax.plot(T, y, 'o', color=color, ms=2, zorder=3,
+            label=label or default_lbl)
+
+    if len(T) >= 2:
+        coeffs, cov = np.polyfit(T, y, deg=1, cov=True)
+        A, B = float(coeffs[0]), float(coeffs[1])
+        A_err = float(np.sqrt(cov[0, 0]))
+        T_fit = np.linspace(T.min(), T.max(), 300)
+        ax.plot(T_fit, np.polyval(coeffs, T_fit), 'k--', lw=1.0,
+                label=rf'$A\cdot T+B$,  $A={A:.3g}\pm{A_err:.1g}$')
+        print(
+            f"\n  R(T)/rho(T) linear fit:\n"
+            f"  A (d/dT) = {A:.4g} ± {A_err:.2g}  {unit}/K\n"
+            f"  B (T=0)  = {B:.4g}  {unit}"
+        )
+
+    ax.set_xlabel(r'$T$ (K)')
+    ax.set_ylabel(ylab)
+    ax.set_title(r'Longitudinal $R(T)$ / $\rho(T)$')
+    ax.legend()
     return ax
 
 # ==================================================================
@@ -4569,6 +4702,46 @@ def _add_RT_parser(subparsers):
         ),
     )
 
+
+    p.add_argument(
+        '--T-star', action='store_true',
+        help='Estimate pseudogap T* from R(T) (same analysis as Hall ρ_xx) '
+             'and save R(T)/ρ(T) + T* scaling plots.',
+    )
+    p.add_argument(
+        '--T-star-branch', choices=['both', 'cooldown', 'warmup'],
+        default='both',
+        help='Which R(T) branch to use for T* (default: both).',
+    )
+    p.add_argument(
+        '--T-star-range', nargs=2, type=float, default=None,
+        metavar=('TMIN', 'TMAX'),
+        help='Explicit temperature window (K) for the T* fit. '
+             'Overrides automatic Tc-based windowing.',
+    )
+    p.add_argument(
+        '--T-star-Tc-offset', type=float, default=0.0, metavar='DK',
+        help='When auto-windowing: fit only T >= Tc + offset (K). '
+             'Default 0 (start at Tc). Typical: 5–20 K above Tc.',
+    )
+    p.add_argument(
+        '--area', type=float, default=None, metavar='UM2',
+        help='Cross-section area in µm² for converting R→ρ '
+             '(needs --length). ρ = R · (A/L).',
+    )
+    p.add_argument(
+        '--length', type=float, default=None, metavar='UM',
+        help='Voltage-lead distance in µm (with --area or Hall-like geometry).',
+    )
+    p.add_argument(
+        '--thickness', type=float, default=None, metavar='M',
+        help='Film/crystal thickness in metres for ρ = R·t·(w/l) or ρ = R·t.',
+    )
+    p.add_argument(
+        '--width', type=float, default=None, metavar='M',
+        help='Sample width in metres (with --thickness and --length).',
+    )
+
     return p
 
 def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
@@ -4731,7 +4904,6 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
         print(f"    T = {T_lab} K  →  {folder}/")
 
     return all_params
-
 
 def _add_IV_dVdI_parser(subparsers):
     p = subparsers.add_parser("IV", help="I(V) and dV/dI analysis")
@@ -5558,6 +5730,151 @@ def _run_RT(args):
             f"Saved {zoom_path}"
         )
 
+    # ================================================================
+    # Optional T* (pseudogap) analysis — same math as Hall rho_xx(T)
+    #
+    # Temperature window (normal state only), in priority order:
+    #   1. --T-star-range TMIN TMAX   (explicit)
+    #   2. auto from Tc:
+    #        Tc via --drdt  (max dR/dT)  OR  --find-tc (R criterion)
+    #        fit window [Tc + --T-star-Tc-offset, T_max]
+    #   One of --drdt / --find-tc is required for auto windowing.
+    # ================================================================
+    if getattr(args, 'T_star', False):
+        set_paper_style()
+        base, ext = os.path.splitext(args.output)
+        if not ext:
+            ext = '.pdf'
+
+        explicit_range = getattr(args, 'T_star_range', None)
+        tc_offset = float(getattr(args, 'T_star_Tc_offset', 0.0) or 0.0)
+        use_drdt = bool(getattr(args, 'drdt', False))
+        use_crit = bool(getattr(args, 'find_tc', False))
+
+        if explicit_range is None and not (use_drdt or use_crit):
+            raise ValueError(
+                "--T-star needs a temperature window:\n"
+                "  • pass --T-star-range TMIN TMAX, or\n"
+                "  • enable --drdt (Tc from max dR/dT) or --find-tc "
+                "(Tc from R criterion), optionally with "
+                "--T-star-Tc-offset DK (default 0)."
+            )
+
+        # Geometry → resistivity if requested
+        area_m2 = None
+        length_m = None
+        thickness_m = getattr(args, 'thickness', None)
+        width_m = getattr(args, 'width', None)
+        if getattr(args, 'area', None) is not None:
+            area_m2 = float(args.area) * 1e-12   # um^2 → m^2
+        if getattr(args, 'length', None) is not None:
+            length_m = float(args.length) * 1e-6  # um → m
+
+        branch_sel = getattr(args, 'T_star_branch', 'both')
+        branch_arg = None if branch_sel == 'both' else branch_sel
+
+        for ds in datasets:
+            data = ds['data']
+            label = ds.get('label', 'RT')
+
+            # ---- resolve [T_min, T_max] for this dataset ----
+            T_win_min = None
+            T_win_max = None
+            Tc_used = None
+            tc_method = None
+
+            if explicit_range is not None:
+                T_win_min = float(explicit_range[0])
+                T_win_max = float(explicit_range[1])
+                tc_method = 'explicit --T-star-range'
+            else:
+                # Prefer dR/dT if both flags are set
+                if use_drdt:
+                    drdt = ds.get('drdt')
+                    if drdt is None:
+                        drdt = analyze_dRdT_RT(data)
+                        ds['drdt'] = drdt
+                    Tc_used = drdt.get('Tc')
+                    tc_method = 'dR/dT (max)'
+                elif use_crit:
+                    tc_result = find_Tc_RT(
+                        data,
+                        criterion=args.tc_criterion,
+                        T_normal_range=(
+                            tuple(args.tc_normal_range)
+                            if args.tc_normal_range else None
+                        ),
+                    )
+                    Tc_used = tc_result.get('Tc')
+                    tc_method = (
+                        f"R criterion ({args.tc_criterion:g}·R_n)"
+                    )
+
+                if Tc_used is None or not np.isfinite(Tc_used):
+                    raise ValueError(
+                        f"[{label}] T* auto-window: could not determine Tc "
+                        f"via {tc_method}. Check --drdt / --find-tc inputs."
+                    )
+                T_win_min = float(Tc_used) + tc_offset
+                T_win_max = None  # up to end of data
+
+            T_arr, rho_arr, rho_unit = rt_series_for_T_star(
+                data, branch=branch_arg,
+                thickness_m=thickness_m, width_m=width_m,
+                length_m=length_m, area_m2=area_m2,
+                T_min=T_win_min, T_max=T_win_max,
+            )
+            if len(T_arr) < 2:
+                print(
+                    f"[{label}] T* skipped: fewer than 2 points in window "
+                    f"[{T_win_min}, {T_win_max if T_win_max is not None else 'end'}] K"
+                )
+                continue
+
+            tmax_str = (
+                f"{T_win_max:.2f}" if T_win_max is not None
+                else f"{float(np.nanmax(T_arr)):.2f}"
+            )
+            print(
+                f"\n[{label}] T* analysis\n"
+                f"  branch={branch_sel}, unit={rho_unit}, n={len(T_arr)}\n"
+                f"  window=[{T_win_min:.2f}, {tmax_str}] K"
+                + (
+                    f"  (Tc={Tc_used:.2f} K via {tc_method}, "
+                    f"offset={tc_offset:g} K)"
+                    if Tc_used is not None else
+                    f"  ({tc_method})"
+                )
+            )
+
+            fig_r, ax_r = plt.subplots(
+                figsize=(args.figsize[0] / 2.54, args.figsize[1] / 2.54),
+                constrained_layout=True,
+            )
+            plot_RT_vs_T_linear(T_arr, rho_arr, rho_unit=rho_unit, ax=ax_r,
+                                label=label)
+            if Tc_used is not None and np.isfinite(Tc_used):
+                ax_r.axvline(Tc_used, color='tab:red', ls=':', lw=0.8,
+                             label=rf'$T_c={Tc_used:.1f}$ K')
+                ax_r.axvline(T_win_min, color='tab:orange', ls='--', lw=0.8,
+                             label=rf'$T_{{\rm fit,min}}={T_win_min:.1f}$ K')
+                ax_r.legend()
+            path_r = f"{base}_Tstar_RT_{label}{ext}"
+            fig_r.savefig(path_r, dpi=300)
+            plt.close(fig_r)
+            print(f"  Saved {path_r}")
+
+            tstar = compute_T_star(T=T_arr, rho=rho_arr, rho_unit=rho_unit)
+            fig_ts, ax_ts = plt.subplots(
+                figsize=(args.figsize[0] / 2.54, args.figsize[1] / 2.54),
+                constrained_layout=True,
+            )
+            plot_T_star(results_list=None, tstar_result=tstar, ax=ax_ts)
+            path_ts = f"{base}_Tstar_{label}{ext}"
+            fig_ts.savefig(path_ts, dpi=300)
+            plt.close(fig_ts)
+            print(f"  Saved {path_ts}")
+
 def _run_IV_dVdI(args):
     set_paper_style()
     if args.multi_temp is not None:
@@ -5659,7 +5976,6 @@ def _find_comments_for_csv(csv_path):
             if 'comment' in low and name.endswith('.txt') and base[:12] in name:
                 return os.path.join(d, name)
     return None
-
 
 def _run_Hall_MR(args):
     """Execute the Hall_MR subcommand."""
