@@ -794,7 +794,122 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
         fig.tight_layout()
     return ax
 
-def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0)):
+def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
+                         figsize=None, colors=None):
+    """Two-row figure: forward (top) and backward (bottom) sweeps.
+
+    Vertical lines mark Ic+/- for each sweep (from ``ic_params`` if given,
+    otherwise computed on the fly).  Lines are drawn on *both* axes so
+    small fwd/bwd differences are easy to compare.
+
+    Returns
+    -------
+    fig, (ax_fwd, ax_bwd)
+    """
+    set_paper_style()
+    if figsize is None:
+        figsize = (8.6, 10.0)  # taller: 2 stacked panels
+    # figsize is in cm, as elsewhere
+    fig, (ax_f, ax_b) = plt.subplots(
+        2, 1, sharex=True,
+        figsize=(figsize[0] / 2.54, figsize[1] / 2.54),
+        constrained_layout=True,
+    )
+
+    if "branch" not in data or not data.get("is_bf", False):
+        # Fall back: single panel behaviour on top axis
+        plot_IV_dVdI(data, ax=ax_f, plot_type=plot_type, show_branches=True)
+        ax_b.set_visible(False)
+        return fig, (ax_f, ax_b)
+
+    I_ma = np.asarray(data["I"], dtype=float) * 1e3
+    branch = np.asarray(data["branch"])
+
+    if plot_type == "iv":
+        y = np.asarray(data["V"], dtype=float) * 1e3
+        ylabel = "Voltage (mV)"
+    elif plot_type == "dvdI":
+        y = np.asarray(data["dVdI"], dtype=float) * 1000.0
+        ylabel = r"dV/dI (m$\Omega$)"
+    elif plot_type == "dv":
+        y = np.asarray(data["dV"], dtype=float) * 1e6
+        ylabel = r"dV ($\mu$V)"
+    elif plot_type == "di":
+        y = np.asarray(data["dI"], dtype=float) * 1e3
+        ylabel = "dI (mA)"
+    elif plot_type == "t":
+        y = np.asarray(data["T"], dtype=float)
+        ylabel = "Temperature (K)"
+    else:
+        raise ValueError(f"Unknown plot_type: {plot_type}")
+
+    colors = colors or {"forward": "k", "backward": "tab:red"}
+
+    for ax, bname in ((ax_f, "forward"), (ax_b, "backward")):
+        m = branch == bname
+        if not np.any(m):
+            ax.text(0.5, 0.5, f"No {bname} data", transform=ax.transAxes,
+                    ha="center", va="center")
+        else:
+            ax.plot(I_ma[m], y[m], "o", color=colors[bname], ms=3,
+                    label=bname.capitalize())
+        ax.set_ylabel(ylabel)
+        ax.tick_params(direction="in", top=True, right=True, labelsize=8)
+        ax.legend(frameon=False, fontsize=8, loc="best")
+
+    ax_b.set_xlabel("Current (mA)")
+    ax_f.set_title(f"{plot_type}: forward (top) / backward (bottom)")
+
+    # ---- Ic vertical lines on both panels ----
+    if ic_params is None:
+        try:
+            ic_params = compute_iv_parameters(data)
+        except Exception:
+            ic_params = {}
+
+    # (key, signed current in mA, style)
+    ic_lines = [
+        ("Ic+_f_mA", +1, "k", "-",  r"$I_c^+$ fwd"),
+        ("Ic-_f_mA", -1, "k", "--", r"$I_c^-$ fwd"),
+        ("Ic+_b_mA", +1, "tab:red",  "-",  r"$I_c^+$ bwd"),
+        ("Ic-_b_mA", -1, "tab:red",  "--", r"$I_c^-$ bwd"),
+    ]
+    # Fall back to overall Ic+/- if branch-specific missing
+    fallback = {
+        "Ic+_f_mA": "Ic+_mA", "Ic-_f_mA": "Ic-_mA",
+        "Ic+_b_mA": "Ic+_mA", "Ic-_b_mA": "Ic-_mA",
+    }
+
+    drawn = set()
+    for key, sign, color, ls, lbl in ic_lines:
+        val = ic_params.get(key, np.nan)
+        if not np.isfinite(val):
+            val = ic_params.get(fallback.get(key, ""), np.nan)
+        if not np.isfinite(val):
+            continue
+        x = sign * abs(float(val))
+        # avoid duplicate labels at same x
+        tag = (round(x, 6), ls, color)
+        for ax in (ax_f, ax_b):
+            ax.axvline(
+                x, color=color, ls=ls, lw=1.0, alpha=0.85,
+                label=(lbl if tag not in drawn else None),
+            )
+        drawn.add(tag)
+
+    if drawn:
+        ax_f.legend(frameon=False, fontsize=7, loc="best")
+        ax_b.legend(frameon=False, fontsize=7, loc="best")
+
+    return fig, (ax_f, ax_b)
+
+def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0),
+                        split_sweeps=False, ic_params=None):
+    """Save standard IV diagnostic PDFs.
+
+    If ``split_sweeps`` and the data are bidirectional, also save a
+    two-row forward/backward figure per plot type (with Ic guide lines).
+    """
     set_paper_style()
     types = ['iv', 'dvdI', 'dv', 'di', 't']
     for t in types:
@@ -802,7 +917,27 @@ def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0)):
         plot_IV_dVdI(data, ax=ax, plot_type=t, show_branches=True, figsize=figsize)
         fig.savefig(f"{base_name}_{t}.pdf")
         plt.close(fig)
-    print(f"Saved diagnostic plots for {base_name}")
+
+    if split_sweeps and data.get('is_bf', False):
+        # Taller default for stacked panels
+        tall = (figsize[0], max(figsize[1] * 1.6, 10.0))
+        if ic_params is None:
+            try:
+                ic_params = compute_iv_parameters(data)
+            except Exception:
+                ic_params = {}
+        for t in types:
+            fig, _ = plot_IV_split_sweeps(
+                data, plot_type=t, ic_params=ic_params, figsize=tall,
+            )
+            path = f"{base_name}_{t}_split.pdf"
+            fig.savefig(path, dpi=300)
+            plt.close(fig)
+        print(f"Saved diagnostic + split-sweep plots for {base_name}")
+    else:
+        if split_sweeps and not data.get('is_bf', False):
+            print(f"  [split-sweeps] skipped — no backward branch in {base_name}")
+        print(f"Saved diagnostic plots for {base_name}")
 
 def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0)):
     """Create I(V) overlay and 2D dV/dI map for multiple temperatures."""
@@ -4809,7 +4944,8 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    do_analyze=True, area_um2=1.0,
                                    rn_criterion=0.5, ic_span=10,
                                    outlier_thresh=5.0, diff_threshold=0.001,
-                                   advanced=False, ic_I_min=None, ic_I_max=None):
+                                   advanced=False, ic_I_min=None, ic_I_max=None,
+                                   split_sweeps=False):
     """Per-temperature IV diagnostics + parameter logs under ``singles/``.
 
     Layout
@@ -4843,8 +4979,6 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
         base_name = os.path.join(folder, f"{T_lab}K")
 
         # Diagnostic plots
-        plot_iv_diagnostics(data, base_name=base_name, figsize=figsize)
-
         params = {}
         if do_analyze:
             params = compute_iv_parameters(
@@ -4855,6 +4989,11 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                 ic_I_min=ic_I_min, ic_I_max=ic_I_max,
             )
             all_params.append(params)
+
+        plot_iv_diagnostics(
+            data, base_name=base_name, figsize=figsize,
+            split_sweeps=split_sweeps, ic_params=params or None,
+        )
 
         # Log file
         log_path = os.path.join(folder, "analysis.log")
@@ -4936,6 +5075,9 @@ def _add_IV_dVdI_parser(subparsers):
                         "Points with |I| > ic-I-max are ignored (cuts circuit-switching artefacts).")
     p.add_argument('--analyze', action='store_true', 
                        help="Perform numerical analysis (Ic, Jc, RN, etc.) in addition to plotting")
+    p.add_argument('--split-sweeps', action='store_true',
+                   help="For bidirectional I(V): also save 2-row figures "
+                        "(forward top, backward bottom) with Ic+/- guide lines.")
     p.add_argument('--advanced', action='store_true', 
                        help="Perform advanced analysis (diode efficiency, Stewart-McCumber, gap, etc.)")
     p.add_argument('--plot-didv', action='store_true', help="Plot dI/dV and find Riedel peaks")
@@ -5893,9 +6035,10 @@ def _run_IV_dVdI(args):
         for csv_file in args.csv_files:
             data = analyze_IV_dVdI(csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI)
             base = os.path.splitext(os.path.basename(csv_file))[0]
-            plot_iv_diagnostics(data, base_name=f"{base}", figsize=args.figsize)
-
-            if getattr(args, 'analyze', False):
+            # Analyse first if requested / needed for split Ic lines
+            params = None
+            need_ic = getattr(args, 'analyze', False) or getattr(args, 'split_sweeps', False)
+            if need_ic:
                 params = compute_iv_parameters(data, area_um2=args.area, 
                                                rn_criterion=args.rn_criterion,
                                                ic_span=args.ic_span,
@@ -5905,6 +6048,14 @@ def _run_IV_dVdI(args):
                                                figsize=args.figsize,
                                                ic_I_min=getattr(args, 'ic_I_min', None),
                                                ic_I_max=getattr(args, 'ic_I_max', None))
+
+            plot_iv_diagnostics(
+                data, base_name=f"{base}", figsize=args.figsize,
+                split_sweeps=getattr(args, 'split_sweeps', False),
+                ic_params=params,
+            )
+
+            if getattr(args, 'analyze', False) and params is not None:
                 print(f"\n=== IV Analysis Results for {csv_file} ===")
                 fb = params.get("Ic_fallback") or {}
                 for k, v in params.items():
@@ -5952,6 +6103,7 @@ def _run_IV_dVdI(args):
                 advanced=getattr(args, 'advanced', False),
                 ic_I_min=getattr(args, 'ic_I_min', None),
                 ic_I_max=getattr(args, 'ic_I_max', None),
+                split_sweeps=getattr(args, 'split_sweeps', False),
             )
         return
 
