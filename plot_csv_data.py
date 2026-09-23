@@ -659,6 +659,58 @@ def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
 # I(V) and dV/dI: Loading and Plotting
 # ==================================================================
 
+
+def _label_iv_branches(I, window=3):
+    """Label each point as forward/backward from the local sign of ΔI.
+
+    Uses a moving average of ``np.diff(I)`` with the given odd window
+    (default 3).  Positive smoothed slope → "forward" (increasing I);
+    negative → "backward" (decreasing I).  Endpoints inherit the nearest
+    defined label.
+
+    Parameters
+    ----------
+    I : array-like
+        Source current (e.g. Is) in chronological order.
+    window : int
+        Smoothing length for ΔI (will be forced to ≥1 and odd).
+
+    Returns
+    -------
+    branch : ndarray of str
+    is_bf : bool
+        True if both labels appear.
+    """
+    I = np.asarray(I, dtype=float)
+    n = len(I)
+    branch = np.full(n, "forward", dtype=object)
+    if n < 2:
+        return branch, False
+
+    dI = np.diff(I)
+    w = int(window) if window is not None else 3
+    if w < 1:
+        w = 1
+    if w % 2 == 0:
+        w += 1
+
+    if w == 1 or len(dI) < w:
+        slope = dI
+    else:
+        kernel = np.ones(w, dtype=float) / w
+        # centre-aligned; edges use partial windows via 'same'
+        slope = np.convolve(dI, kernel, mode='same')
+
+    # slope[i] describes the step between I[i] and I[i+1];
+    # assign label to point i+1 from that step; point 0 from slope[0]
+    labels_steps = np.where(slope >= 0, "forward", "backward")
+    branch[0] = labels_steps[0]
+    branch[1:] = labels_steps
+
+    is_bf = bool(np.any(branch == "forward") and np.any(branch == "backward"))
+    return branch, is_bf
+
+
 def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack", current=None):
     """Extract I(V) and dV/dI data from rack CSV.
 
@@ -682,15 +734,8 @@ def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack", curr
     with np.errstate(divide='ignore', invalid='ignore'):
         dVdI = np.where(np.abs(dI) > 1e-9, dV / dI, np.nan)
 
-    # Simple branch detection (forward vs backward sweep)
-    branch = np.full(len(I), "forward", dtype=object)
-    diffs = np.diff(I)
-    if np.any(diffs < 0):
-        # has backward sweep
-        i_turn = np.where(diffs < 0)[0][0] + 1
-        branch[i_turn:] = "backward"
-
-    is_bf = np.any(diffs < 0) if 'diffs' in locals() else False
+    # Forward / backward from local sign of ΔI (smoothed)
+    branch, is_bf = _label_iv_branches(I, window=3)
 
     return {
         "I": I,
@@ -793,6 +838,7 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
     if created_fig:
         fig.tight_layout()
     return ax
+
 
 def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
                          figsize=None, colors=None):
@@ -902,6 +948,7 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
         ax_b.legend(frameon=False, fontsize=7, loc="best")
 
     return fig, (ax_f, ax_b)
+
 
 def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0),
                         split_sweeps=False, ic_params=None):
@@ -1505,72 +1552,207 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         best_idx = int(np.clip(best_idx, 0, len(I_dir) - 1))
         return abs(float(I_dir[best_idx]))
     
-    # Overall Ic+ and Ic- (restricted to absolute-current window)
-    # ic_window already excludes the symmetric SC core |I| < ic_I_min (and
-    # |I| > ic_I_max if set).  That is the "do not search near zero" window.
+    # Overall Ic+ / Ic-
+    # ic_window (ic_I_min / ic_I_max) applies only to the primary jump search.
+    # Fallbacks see the full current range so the SC region remains visible.
     sig_arr = np.asarray(signal, dtype=float)
     I_ic = I[ic_window]
     sig_ic = sig_arr[ic_window]
 
-    def _ic_at_max_signal(I_seg, sig_seg, direction_sign=None):
-        """|I| at maximum |signal| (dV/dI or |V|).
+    # Voltage series for fallback validation (same window as I / signal)
+    V_arr = np.asarray(V, dtype=float)
+    V_ic = V_arr[ic_window]
 
-        direction_sign:
-          +1 / -1 → restrict to that polarity
-          None    → use all points in the segment
+    def _mad_mask(x, outlier_threshold=5.0):
+        """Boolean mask of inliers under a MAD criterion."""
+        x = np.asarray(x, dtype=float)
+        med = np.nanmedian(x)
+        mad = np.nanmedian(np.abs(x - med))
+        if not np.isfinite(mad) or mad == 0:
+            mad = 1e-10
+        return np.isfinite(x) & (np.abs(x - med) <= outlier_threshold * mad)
+
+    def _ic_at_max_signal(I_seg, sig_seg, V_seg, direction_sign=None,
+                          n_toward_zero=10, frac_above_min=0.03,
+                          outlier_threshold=5.0):
+        """Validated max-|dV/dI| fallback for Ic.
+
+        Baseline (SC-like floor) is estimated only from the *low-|I|*
+        portion of the MAD-cleaned polarity data (lowest ~15% of |I|),
+        not from the global minimum (which is inflated when the true
+        SC region is absent or cut by ic_I_min).
+
+            baseline = median of low-|I| points
+            floor    = baseline + frac_above_min · (max − baseline)
+
+        so the floor sits 3% of the way from the low-|I| baseline
+        toward the polarity maximum — robust when baseline ≈ 0.
+
+        1. Locate max |dV/dI|; inspect up to ``n_toward_zero`` points
+           toward smaller |I|.
+        2. If any of those points lie below *both* floors, Ic is the
+           |I| of the *first* such point (nearest the peak on the SC side),
+           not the peak itself.
+        3. Otherwise: first point in increasing-|I| order leaving the floor.
+
+        Returns
+        -------
+        (Ic_abs_A, method)  'max_dvdI' | 'pct10_above_min' | None
         """
         I_seg = np.asarray(I_seg, dtype=float)
         sig_seg = np.asarray(sig_seg, dtype=float)
+        V_seg = np.asarray(V_seg, dtype=float)
         if len(I_seg) == 0:
-            return np.nan
+            return np.nan, None
+
         if direction_sign is not None:
             m = I_seg > 0 if direction_sign > 0 else I_seg < 0
             if not np.any(m):
-                return np.nan
+                return np.nan, None
             I_d = I_seg[m]
             s_d = np.abs(sig_seg[m])
+            V_d = np.abs(V_seg[m])
         else:
             I_d = I_seg
             s_d = np.abs(sig_seg)
-        finite = np.isfinite(s_d) & np.isfinite(I_d)
+            V_d = np.abs(V_seg)
+
+        finite = np.isfinite(I_d) & np.isfinite(s_d) & np.isfinite(V_d)
         if not np.any(finite):
-            return np.nan
-        I_d = I_d[finite]
-        s_d = s_d[finite]
+            return np.nan, None
+        I_d, s_d, V_d = I_d[finite], s_d[finite], V_d[finite]
+
+        # MAD clean on |signal|
+        inlier = _mad_mask(s_d, outlier_threshold=outlier_threshold)
+        if np.sum(inlier) < 3:
+            inlier = np.ones(len(I_d), dtype=bool)
+        I_d, s_d, V_d = I_d[inlier], s_d[inlier], V_d[inlier]
+        if len(I_d) == 0:
+            return np.nan, None
+
+        I_abs = np.abs(I_d)
+        max_s = float(np.nanmax(s_d))
+        max_V = float(np.nanmax(V_d))
+        if not np.isfinite(max_s) or max_s < 1e-30:
+            return np.nan, None
+        if not np.isfinite(max_V) or max_V < 1e-30:
+            max_V = 1.0
+
+        # --- low-|I| baseline (not global min) ---
+        order_I = np.argsort(I_abs)
+        n_base = max(3, int(np.ceil(0.15 * len(order_I))))
+        n_base = min(n_base, len(order_I))
+        base = order_I[:n_base]
+        base_V = float(np.nanmedian(V_d[base]))
+        base_s = float(np.nanmedian(s_d[base]))
+        if not np.isfinite(base_V):
+            base_V = 0.0
+        if not np.isfinite(base_s):
+            base_s = 0.0
+
+        # floor = baseline + 3% of (max − baseline)
+        V_floor = base_V + frac_above_min * (max_V - base_V)
+        s_floor = base_s + frac_above_min * (max_s - base_s)
+        # guard degeneracy
+        if not np.isfinite(V_floor) or V_floor <= base_V:
+            V_floor = base_V + frac_above_min * max_V
+        if not np.isfinite(s_floor) or s_floor <= base_s:
+            s_floor = base_s + frac_above_min * max_s
+
+        # --- candidate region: around max |dV/dI| ---
+        # Ic is *not* |I| at the peak; it is the first point toward smaller
+        # |I| (within n_toward_zero of the peak) that satisfies the floor
+        # criteria — i.e. the SC-side edge of the transition.
         j = int(np.argmax(s_d))
-        return abs(float(I_d[j]))
+        toward = np.where(I_abs < I_abs[j])[0]
+        if len(toward) > 0:
+            # order: closest to the peak first, then further toward zero
+            near = toward[np.argsort(I_abs[j] - I_abs[toward])[:n_toward_zero]]
+            sc_like = (V_d[near] <= V_floor) & (s_d[near] <= s_floor)
+            if np.any(sc_like):
+                # first (nearest-to-peak) point that meets the criteria
+                k = int(np.flatnonzero(sc_like)[0])
+                return abs(float(I_d[near[k]])), 'max_dvdI'
 
-    def _resolve_ic(I_seg, sig_seg, direction_sign, span, out_thr, d_thr):
-        """Jump-based Ic; if that fails, |I| at max |signal| on polarity,
-        then on the whole segment.  Almost never returns nan if any finite
-        signal exists in the considered window.
+        # --- alternative: first |I| leaving the low-|I| floor ---
+        # If the low-|I| baseline is already normal-like (dV/dI close to
+        # max), requiring *both* V and dV/dI to rise pins Ic on a residual
+        # peak and returns values that are far too high.  In that case use
+        # voltage onset alone; otherwise require both (true SC→normal).
+        I_s = I_d[order_I]
+        s_s = s_d[order_I]
+        V_s = V_d[order_I]
+        already_normal = base_s > 0.5 * max_s
+        if already_normal:
+            leave = V_s > V_floor
+        else:
+            leave = (V_s > V_floor) & (s_s > s_floor)
+        if np.any(leave):
+            k = int(np.flatnonzero(leave)[0])
+            return abs(float(I_s[k])), 'pct10_above_min'
+
+        # never left the floor → treat as ~zero Ic at lowest |I|
+        return abs(float(I_s[0])), 'pct10_above_min'
+
+    def _resolve_ic(I_win, sig_win, V_win,
+                     I_full, sig_full, V_full,
+                     direction_sign, span, out_thr, d_thr):
+        """Jump-based Ic inside the ic_I_min/max window; fallbacks use *full* data.
+
+        ``ic_I_min`` / ``ic_I_max`` apply only to the primary jump search.
+        Once that fails, max-|dV/dI| and 3%-above-min floor logic see the
+        unrestricted polarity (so the SC region below ic_I_min is visible).
+
+        Returns (Ic_abs_A, method) where method is
+          None                   — jump detector
+          'max_dvdI'             — validated peak
+          'pct10_above_min'      — first point leaving baseline floor
         """
-        I_seg = np.asarray(I_seg, dtype=float)
-        sig_seg = np.asarray(sig_seg, dtype=float)
-        if len(I_seg) == 0:
-            return np.nan, False
+        I_win = np.asarray(I_win, dtype=float)
+        sig_win = np.asarray(sig_win, dtype=float)
+        V_win = np.asarray(V_win, dtype=float)
+        I_full = np.asarray(I_full, dtype=float)
+        sig_full = np.asarray(sig_full, dtype=float)
+        V_full = np.asarray(V_full, dtype=float)
 
-        val = find_ic_in_direction(
-            I_seg, sig_seg, direction_sign=direction_sign,
-            span=span, outlier_threshold=out_thr, diff_threshold=d_thr,
+        # --- layer 1: jump search (windowed) ---
+        if len(I_win) > 0:
+            val = find_ic_in_direction(
+                I_win, sig_win, direction_sign=direction_sign,
+                span=span, outlier_threshold=out_thr, diff_threshold=d_thr,
+            )
+            if val is not None and np.isfinite(val):
+                return float(val), None
+
+        # --- layer 2+: fallbacks on unrestricted data ---
+        if len(I_full) == 0:
+            return np.nan, None
+
+        fb, method = _ic_at_max_signal(
+            I_full, sig_full, V_full, direction_sign=direction_sign,
+            outlier_threshold=out_thr,
         )
-        if val is not None and np.isfinite(val):
-            return float(val), False
-
-        # 1) max |signal| on requested polarity
-        fb = _ic_at_max_signal(I_seg, sig_seg, direction_sign=direction_sign)
         if fb is not None and np.isfinite(fb):
-            return float(fb), True
+            return float(fb), method
 
-        # 2) max |signal| over the whole segment (any polarity)
-        fb = _ic_at_max_signal(I_seg, sig_seg, direction_sign=None)
+        fb, method = _ic_at_max_signal(
+            I_full, sig_full, V_full, direction_sign=None,
+            outlier_threshold=out_thr,
+        )
         if fb is not None and np.isfinite(fb):
-            return float(fb), True
+            return float(fb), method
 
-        return np.nan, False
+        return np.nan, None
 
-    Ic_plus, fb_p = _resolve_ic(I_ic, sig_ic, 1, ic_span, outlier_thresh, diff_threshold)
-    Ic_minus, fb_m = _resolve_ic(I_ic, sig_ic, -1, ic_span, outlier_thresh, diff_threshold)
+    # Jump search: windowed.  Fallbacks: full I / signal / V (no ic_I_min/max).
+    Ic_plus, fb_p = _resolve_ic(
+        I_ic, sig_ic, V_ic, I, sig_arr, V_arr,
+        1, ic_span, outlier_thresh, diff_threshold,
+    )
+    Ic_minus, fb_m = _resolve_ic(
+        I_ic, sig_ic, V_ic, I, sig_arr, V_arr,
+        -1, ic_span, outlier_thresh, diff_threshold,
+    )
 
     results['Ic+_mA'] = Ic_plus * 1000 if np.isfinite(Ic_plus) else np.nan
     results['Ic-_mA'] = Ic_minus * 1000 if np.isfinite(Ic_minus) else np.nan
@@ -1590,15 +1772,32 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
     }
 
     if is_bf:
-        # Per-branch analysis (same current window)
-        fwd = (branch == "forward") & ic_window
-        bwd = (branch == "backward") & ic_window
+        # Per-branch: window only for jump search; full branch for fallbacks
+        fwd = branch == "forward"
+        bwd = branch == "backward"
+        fwd_win = fwd & ic_window
+        bwd_win = bwd & ic_window
 
-        # Always call resolver (handles empty arrays)
-        Ic_plus_fwd, fb_pf = _resolve_ic(I[fwd], sig_arr[fwd], 1, ic_span, outlier_thresh, diff_threshold)
-        Ic_minus_fwd, fb_mf = _resolve_ic(I[fwd], sig_arr[fwd], -1, ic_span, outlier_thresh, diff_threshold)
-        Ic_plus_bwd, fb_pb = _resolve_ic(I[bwd], sig_arr[bwd], 1, ic_span, outlier_thresh, diff_threshold)
-        Ic_minus_bwd, fb_mb = _resolve_ic(I[bwd], sig_arr[bwd], -1, ic_span, outlier_thresh, diff_threshold)
+        Ic_plus_fwd, fb_pf = _resolve_ic(
+            I[fwd_win], sig_arr[fwd_win], V_arr[fwd_win],
+            I[fwd], sig_arr[fwd], V_arr[fwd],
+            1, ic_span, outlier_thresh, diff_threshold,
+        )
+        Ic_minus_fwd, fb_mf = _resolve_ic(
+            I[fwd_win], sig_arr[fwd_win], V_arr[fwd_win],
+            I[fwd], sig_arr[fwd], V_arr[fwd],
+            -1, ic_span, outlier_thresh, diff_threshold,
+        )
+        Ic_plus_bwd, fb_pb = _resolve_ic(
+            I[bwd_win], sig_arr[bwd_win], V_arr[bwd_win],
+            I[bwd], sig_arr[bwd], V_arr[bwd],
+            1, ic_span, outlier_thresh, diff_threshold,
+        )
+        Ic_minus_bwd, fb_mb = _resolve_ic(
+            I[bwd_win], sig_arr[bwd_win], V_arr[bwd_win],
+            I[bwd], sig_arr[bwd], V_arr[bwd],
+            -1, ic_span, outlier_thresh, diff_threshold,
+        )
 
         results['Ic+_f_mA'] = Ic_plus_fwd * 1000 if np.isfinite(Ic_plus_fwd) else np.nan
         results['Ic-_f_mA'] = Ic_minus_fwd * 1000 if np.isfinite(Ic_minus_fwd) else np.nan
@@ -4462,6 +4661,7 @@ def plot_ryx_vs_T(results_list, ax=None, figsize=None, color='tab:green'):
 # more entry here -- main() itself never needs to change.
 # ==================================================================
 
+
 def rt_series_for_T_star(data, branch=None, thickness_m=None,
                          width_m=None, length_m=None, area_m2=None,
                          T_min=None, T_max=None):
@@ -4508,6 +4708,8 @@ def rt_series_for_T_star(data, branch=None, thickness_m=None,
         rho = R * geom          # Ohm * m = Ohm·m  (bar geometry)
         return T, rho, 'Ohm_m'
     return T, R, 'Ohm'
+
+
 
 def plot_RT_vs_T_linear(T, rho, rho_unit='Ohm', ax=None, figsize=None,
                         color='tab:blue', label=None):
@@ -4562,14 +4764,6 @@ def plot_RT_vs_T_linear(T, rho, rho_unit='Ohm', ax=None, figsize=None,
     ax.legend()
     return ax
 
-# ==================================================================
-# Command-line interface
-#
-# Each plot type gets one (parser-builder, runner) pair registered in
-# PLOT_TYPES below. Adding a new measurement type later (I-V, etc.)
-# means writing its own analyze_*/plot_* functions above, plus one
-# more entry here -- main() itself never needs to change.
-# ==================================================================
 
 def _add_RT_parser(subparsers):
     """Define the `RT` subcommand: arguments + help text only."""
@@ -4879,6 +5073,7 @@ def _add_RT_parser(subparsers):
 
     return p
 
+
 def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
                        T_max=None, T_round=0.5, min_points=30):
     """Split a multi-T rack IV file into per-temperature analyze_IV_dVdI dicts.
@@ -4922,12 +5117,7 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
         with np.errstate(divide='ignore', invalid='ignore'):
             dVdI = np.where(np.abs(dI) > 1e-9, dV / dI, np.nan)
 
-        branch = np.full(len(I), "forward", dtype=object)
-        diffs = np.diff(I)
-        is_bf = bool(np.any(diffs < 0)) if len(diffs) else False
-        if is_bf:
-            i_turn = int(np.where(diffs < 0)[0][0]) + 1
-            branch[i_turn:] = "backward"
+        branch, is_bf = _label_iv_branches(I, window=3)
 
         T_mean = float(np.nanmean(T))
         datasets.append({
@@ -4937,6 +5127,7 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
             "T_label": f"{T_mean:.1f}",
         })
     return datasets
+
 
 def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    T_max=None, T_round=0.5, min_points=30,
@@ -5030,7 +5221,13 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                         continue
                     note = ""
                     if k in fb and fb[k]:
-                        note = "  (chosen from maximum dV/dI)"
+                        mth = fb[k]
+                        if mth is True or mth == 'max_dvdI':
+                            note = "  (chosen from maximum dV/dI)"
+                        elif mth == 'pct10_above_min':
+                            note = "  (chosen from 3% above min V and dV/dI)"
+                        else:
+                            note = f"  (fallback: {mth})"
                     if isinstance(v, float):
                         if np.isfinite(v):
                             fh.write(f"{k:20s} = {v:.6g}{note}\n")
@@ -5043,6 +5240,7 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
         print(f"    T = {T_lab} K  →  {folder}/")
 
     return all_params
+
 
 def _add_IV_dVdI_parser(subparsers):
     p = subparsers.add_parser("IV", help="I(V) and dV/dI analysis")
@@ -6017,6 +6215,7 @@ def _run_RT(args):
             plt.close(fig_ts)
             print(f"  Saved {path_ts}")
 
+
 def _run_IV_dVdI(args):
     set_paper_style()
     if args.multi_temp is not None:
@@ -6061,7 +6260,15 @@ def _run_IV_dVdI(args):
                 for k, v in params.items():
                     if k == "Ic_fallback":
                         continue
-                    note = "  (chosen from maximum dV/dI)" if fb.get(k) else ""
+                    mth = fb.get(k)
+                    if mth is True or mth == 'max_dvdI':
+                        note = "  (chosen from maximum dV/dI)"
+                    elif mth == 'pct10_above_min':
+                        note = "  (chosen from 3% above min V and dV/dI)"
+                    elif mth:
+                        note = f"  (fallback: {mth})"
+                    else:
+                        note = ""
                     if isinstance(v, float):
                         print(f"  {k:12s}: {v:.6g}{note}")
                     else:
@@ -6128,6 +6335,7 @@ def _find_comments_for_csv(csv_path):
             if 'comment' in low and name.endswith('.txt') and base[:12] in name:
                 return os.path.join(d, name)
     return None
+
 
 def _run_Hall_MR(args):
     """Execute the Hall_MR subcommand."""
