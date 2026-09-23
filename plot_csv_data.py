@@ -776,9 +776,15 @@ def load_multi_iv_files(pattern_or_list, channel_dV=2, channel_dI=1):
     
     return datasets
 
-def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k", 
-                 marker="o", markersize=None, label=None, figsize=None, **kwargs):
-    """Plot I(V) related quantities with paper style and figsize support."""
+def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
+                 marker="o", markersize=None, label=None, figsize=None,
+                 ic_params=None, show_ic_eff=False, **kwargs):
+    """Plot I(V) related quantities with paper style and figsize support.
+
+    Forward sweep is always black; backward is tab:red when branches are shown.
+    If ``show_ic_eff`` and ``ic_params`` contain effective values, draw
+    orange (Ic_eff) and dark-blue (Ir_eff) vertical lines.
+    """
     set_paper_style()
 
     created_fig = ax is None
@@ -787,18 +793,17 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
             figsize = (8.6, 6.0)
         fig, ax = plt.subplots(figsize=(figsize[0]/2.54, figsize[1]/2.54))
 
-    # Unit scaling
-    I_ma = data["I"] * 1e3
-    V_mv = data["V"] * 1e3
-    dV_uv = data["dV"] * 1e6
-    dI_ma = data["dI"] * 1e3
+    I_ma = np.asarray(data["I"], dtype=float) * 1e3
+    V_mv = np.asarray(data["V"], dtype=float) * 1e3
+    dV_uv = np.asarray(data["dV"], dtype=float) * 1e6
+    dI_ma = np.asarray(data["dI"], dtype=float) * 1e3
 
     if plot_type == "iv":
         x, y = I_ma, V_mv
         xlabel = "Current (mA)"
         ylabel = "Voltage (mV)"
     elif plot_type == "dvdI":
-        x, y = I_ma, data["dVdI"] * 1000   # Ohm → mΩ
+        x, y = I_ma, np.asarray(data["dVdI"], dtype=float) * 1000.0
         xlabel = "Current (mA)"
         ylabel = r"dV/dI (m$\Omega$)"
     elif plot_type == "dv":
@@ -810,30 +815,41 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
         xlabel = "Current (mA)"
         ylabel = "dI (mA)"
     elif plot_type == "t":
-        x, y = I_ma, data["T"]
+        x, y = I_ma, np.asarray(data["T"], dtype=float)
         xlabel = "Current (mA)"
         ylabel = "Temperature (K)"
     else:
         raise ValueError(f"Unknown plot_type: {plot_type}")
 
+    # Forward = black, backward = red (merged plot)
     if show_branches and "branch" in data:
-        colors = {"forward": color, "backward": "tab:red"}
+        colors = {"forward": "k", "backward": "tab:red"}
         for b_name in ["forward", "backward"]:
             mask = data["branch"] == b_name
             if not np.any(mask):
                 continue
-            lbl = b_name.capitalize()
-            ax.plot(x[mask], y[mask], marker, color=colors.get(b_name, color), 
-                    ms=markersize or 3, label=lbl, **kwargs)
+            ax.plot(x[mask], y[mask], marker, color=colors[b_name],
+                    ms=markersize or 3, label=b_name.capitalize(), **kwargs)
     else:
         ax.plot(x, y, marker, color=color, ms=markersize or 3, label=label, **kwargs)
+
+    # Effective Ic (orange) / Ir (dark blue) guide lines
+    if show_ic_eff and ic_params is not None and plot_type in ("iv", "dvdI"):
+        ic_eff = ic_params.get("Ic_eff+_f_mA", np.nan)
+        ir_eff = ic_params.get("Ir_eff+_b_mA", np.nan)
+        if np.isfinite(ic_eff):
+            ax.axvline(+abs(float(ic_eff)), color="orange", ls="-", lw=1.2,
+                       alpha=0.9, label=r"$I_{c,\mathrm{eff}}$")
+        if np.isfinite(ir_eff):
+            ax.axvline(+abs(float(ir_eff)), color="darkblue", ls="-", lw=1.2,
+                       alpha=0.9, label=r"$I_{r,\mathrm{eff}}$")
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.tick_params(direction='in', top=True, right=True, labelsize=8)
     ax.xaxis.label.set_size(9)
     ax.yaxis.label.set_size(9)
-    if label or show_branches:
+    if label or show_branches or show_ic_eff:
         ax.legend(frameon=False, fontsize=8)
     if created_fig:
         fig.tight_layout()
@@ -841,21 +857,15 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
 
 
 def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
-                         figsize=None, colors=None):
-    """Two-row figure: forward (top) and backward (bottom) sweeps.
+                         figsize=None, colors=None, show_ic_eff=False):
+    """Two-row figure: forward (top, black) and backward (bottom, red).
 
-    Vertical lines mark Ic+/- for each sweep (from ``ic_params`` if given,
-    otherwise computed on the fly).  Lines are drawn on *both* axes so
-    small fwd/bwd differences are easy to compare.
-
-    Returns
-    -------
-    fig, (ax_fwd, ax_bwd)
+    Optional Ic+/- guide lines from ``ic_params``.  With ``show_ic_eff``,
+    also draw orange Ic_eff and dark-blue Ir_eff on both panels.
     """
     set_paper_style()
     if figsize is None:
-        figsize = (8.6, 10.0)  # taller: 2 stacked panels
-    # figsize is in cm, as elsewhere
+        figsize = (8.6, 10.0)
     fig, (ax_f, ax_b) = plt.subplots(
         2, 1, sharex=True,
         figsize=(figsize[0] / 2.54, figsize[1] / 2.54),
@@ -863,8 +873,8 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
     )
 
     if "branch" not in data or not data.get("is_bf", False):
-        # Fall back: single panel behaviour on top axis
-        plot_IV_dVdI(data, ax=ax_f, plot_type=plot_type, show_branches=True)
+        plot_IV_dVdI(data, ax=ax_f, plot_type=plot_type, show_branches=True,
+                     ic_params=ic_params, show_ic_eff=show_ic_eff)
         ax_b.set_visible(False)
         return fig, (ax_f, ax_b)
 
@@ -901,40 +911,29 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
                     label=bname.capitalize())
         ax.set_ylabel(ylabel)
         ax.tick_params(direction="in", top=True, right=True, labelsize=8)
-        ax.legend(frameon=False, fontsize=8, loc="best")
 
     ax_b.set_xlabel("Current (mA)")
     ax_f.set_title(f"{plot_type}: forward (top) / backward (bottom)")
 
-    # ---- Ic vertical lines on both panels ----
     if ic_params is None:
         try:
             ic_params = compute_iv_parameters(data)
         except Exception:
             ic_params = {}
 
-    # (key, signed current in mA, style)
     ic_lines = [
         ("Ic+_f_mA", +1, "k", "-",  r"$I_c^+$ fwd"),
         ("Ic-_f_mA", -1, "k", "--", r"$I_c^-$ fwd"),
-        ("Ic+_b_mA", +1, "tab:red",  "-",  r"$I_c^+$ bwd"),
+        ("Ic+_b_mA", +1, "tab:red",  "-",  r"$I_c^+$ bwd / $I_r$"),
         ("Ic-_b_mA", -1, "tab:red",  "--", r"$I_c^-$ bwd"),
     ]
-    # Fall back to overall Ic+/- if branch-specific missing
-    fallback = {
-        "Ic+_f_mA": "Ic+_mA", "Ic-_f_mA": "Ic-_mA",
-        "Ic+_b_mA": "Ic+_mA", "Ic-_b_mA": "Ic-_mA",
-    }
 
     drawn = set()
     for key, sign, color, ls, lbl in ic_lines:
         val = ic_params.get(key, np.nan)
         if not np.isfinite(val):
-            val = ic_params.get(fallback.get(key, ""), np.nan)
-        if not np.isfinite(val):
             continue
         x = sign * abs(float(val))
-        # avoid duplicate labels at same x
         tag = (round(x, 6), ls, color)
         for ax in (ax_f, ax_b):
             ax.axvline(
@@ -943,30 +942,44 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
             )
         drawn.add(tag)
 
-    if drawn:
-        ax_f.legend(frameon=False, fontsize=7, loc="best")
-        ax_b.legend(frameon=False, fontsize=7, loc="best")
+    if show_ic_eff and plot_type in ("iv", "dvdI"):
+        ic_eff = ic_params.get("Ic_eff+_f_mA", np.nan)
+        ir_eff = ic_params.get("Ir_eff+_b_mA", np.nan)
+        if np.isfinite(ic_eff):
+            for ax in (ax_f, ax_b):
+                ax.axvline(+abs(float(ic_eff)), color="orange", ls="-", lw=1.2,
+                           alpha=0.9, label=r"$I_{c,\mathrm{eff}}$")
+        if np.isfinite(ir_eff):
+            for ax in (ax_f, ax_b):
+                ax.axvline(+abs(float(ir_eff)), color="darkblue", ls="-", lw=1.2,
+                           alpha=0.9, label=r"$I_{r,\mathrm{eff}}$")
+
+    ax_f.legend(frameon=False, fontsize=7, loc="best")
+    ax_b.legend(frameon=False, fontsize=7, loc="best")
 
     return fig, (ax_f, ax_b)
 
 
 def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0),
-                        split_sweeps=False, ic_params=None):
+                        split_sweeps=False, ic_params=None, show_ic_eff=False):
     """Save standard IV diagnostic PDFs.
 
     If ``split_sweeps`` and the data are bidirectional, also save a
     two-row forward/backward figure per plot type (with Ic guide lines).
+    ``show_ic_eff`` adds effective Ic / Ir lines on iv and dvdI plots.
     """
     set_paper_style()
     types = ['iv', 'dvdI', 'dv', 'di', 't']
     for t in types:
         fig, ax = plt.subplots(figsize=(figsize[0]/2.54, figsize[1]/2.54))
-        plot_IV_dVdI(data, ax=ax, plot_type=t, show_branches=True, figsize=figsize)
+        plot_IV_dVdI(
+            data, ax=ax, plot_type=t, show_branches=True, figsize=figsize,
+            ic_params=ic_params, show_ic_eff=show_ic_eff,
+        )
         fig.savefig(f"{base_name}_{t}.pdf")
         plt.close(fig)
 
     if split_sweeps and data.get('is_bf', False):
-        # Taller default for stacked panels
         tall = (figsize[0], max(figsize[1] * 1.6, 10.0))
         if ic_params is None:
             try:
@@ -976,6 +989,7 @@ def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0),
         for t in types:
             fig, _ = plot_IV_split_sweeps(
                 data, plot_type=t, ic_params=ic_params, figsize=tall,
+                show_ic_eff=show_ic_eff,
             )
             path = f"{base_name}_{t}_split.pdf"
             fig.savefig(path, dpi=300)
@@ -1437,7 +1451,8 @@ def plot_didv(result, ax=None, show_peaks=True, xlim=None,
 
 def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
                          outlier_thresh=5.0, advanced=False, diff_threshold=0.001,
-                         figsize=None, ic_I_min=None, ic_I_max=None):
+                         figsize=None, ic_I_min=None, ic_I_max=None,
+                         rn_override_mOhm=None, rn_from_T_K=None):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data.
 
     Parameters
@@ -1573,8 +1588,8 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         return np.isfinite(x) & (np.abs(x - med) <= outlier_threshold * mad)
 
     def _ic_at_max_signal(I_seg, sig_seg, V_seg, direction_sign=None,
-                          n_toward_zero=10, frac_above_min=0.03,
-                          outlier_threshold=5.0):
+                          n_toward_zero=10, frac_above_min=0.001,
+                          outlier_threshold=5.0, force_floor_only=False):
         """Validated max-|dV/dI| fallback for Ic.
 
         Baseline (SC-like floor) is estimated only from the *low-|I|*
@@ -1585,7 +1600,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
             baseline = median of low-|I| points
             floor    = baseline + frac_above_min · (max − baseline)
 
-        so the floor sits 3% of the way from the low-|I| baseline
+        so the floor sits 0.1% of the way from the low-|I| baseline
         toward the polarity maximum — robust when baseline ≈ 0.
 
         1. Locate max |dV/dI|; inspect up to ``n_toward_zero`` points
@@ -1650,7 +1665,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         if not np.isfinite(base_s):
             base_s = 0.0
 
-        # floor = baseline + 3% of (max − baseline)
+        # floor = baseline + 10% of (max − baseline)
         V_floor = base_V + frac_above_min * (max_V - base_V)
         s_floor = base_s + frac_above_min * (max_s - base_s)
         # guard degeneracy
@@ -1669,7 +1684,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
             # order: closest to the peak first, then further toward zero
             near = toward[np.argsort(I_abs[j] - I_abs[toward])[:n_toward_zero]]
             sc_like = (V_d[near] <= V_floor) & (s_d[near] <= s_floor)
-            if np.any(sc_like):
+            if np.any(sc_like) and not force_floor_only:
                 # first (nearest-to-peak) point that meets the criteria
                 k = int(np.flatnonzero(sc_like)[0])
                 return abs(float(I_d[near[k]])), 'max_dvdI'
@@ -1700,7 +1715,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         """Jump-based Ic inside the ic_I_min/max window; fallbacks use *full* data.
 
         ``ic_I_min`` / ``ic_I_max`` apply only to the primary jump search.
-        Once that fails, max-|dV/dI| and 3%-above-min floor logic see the
+        Once that fails, max-|dV/dI| and 10%-above-min floor logic see the
         unrestricted polarity (so the SC region below ic_I_min is visible).
 
         Returns (Ic_abs_A, method) where method is
@@ -1744,35 +1759,10 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
 
         return np.nan, None
 
-    # Jump search: windowed.  Fallbacks: full I / signal / V (no ic_I_min/max).
-    Ic_plus, fb_p = _resolve_ic(
-        I_ic, sig_ic, V_ic, I, sig_arr, V_arr,
-        1, ic_span, outlier_thresh, diff_threshold,
-    )
-    Ic_minus, fb_m = _resolve_ic(
-        I_ic, sig_ic, V_ic, I, sig_arr, V_arr,
-        -1, ic_span, outlier_thresh, diff_threshold,
-    )
+    results['Ic_fallback'] = {}
 
-    results['Ic+_mA'] = Ic_plus * 1000 if np.isfinite(Ic_plus) else np.nan
-    results['Ic-_mA'] = Ic_minus * 1000 if np.isfinite(Ic_minus) else np.nan
-    # Mean: use whichever side is finite
-    if np.isfinite(Ic_plus) and np.isfinite(Ic_minus):
-        results['Ic_mA'] = (Ic_plus + Ic_minus) / 2 * 1000
-    elif np.isfinite(Ic_plus):
-        results['Ic_mA'] = Ic_plus * 1000
-    elif np.isfinite(Ic_minus):
-        results['Ic_mA'] = Ic_minus * 1000
-    else:
-        results['Ic_mA'] = np.nan
-
-    results['Ic_fallback'] = {
-        'Ic+_mA': fb_p,
-        'Ic-_mA': fb_m,
-    }
-
+    # Branch masks (full data for fallbacks / effective; window for jump)
     if is_bf:
-        # Per-branch: window only for jump search; full branch for fallbacks
         fwd = branch == "forward"
         bwd = branch == "backward"
         fwd_win = fwd & ic_window
@@ -1809,12 +1799,56 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
             'Ic+_b_mA': fb_pb,
             'Ic-_b_mA': fb_mb,
         })
-    
-    # Jc
-    results['Jc_kA/cm2'] = results.get('Ic_mA', np.nan) / (area_um2 * 1e-2) if not np.isnan(results.get('Ic_mA', np.nan)) else np.nan
-    
-    # R_N linear fits — high-bias window from |I|, not |V|
-    # |I| > rn_criterion · max|I|  (same scale across temperatures/scans)
+
+        # Effective Ic / Ir ALWAYS from floor metric (0.1%), unrestricted I
+        # Ic_eff = SC→N on forward (+); Ir_eff = N→SC on backward (+)
+        ic_eff, _ = _ic_at_max_signal(
+            I[fwd], sig_arr[fwd], V_arr[fwd], direction_sign=1,
+            frac_above_min=0.001, outlier_threshold=outlier_thresh,
+            force_floor_only=True,
+        )
+        ir_eff, _ = _ic_at_max_signal(
+            I[bwd], sig_arr[bwd], V_arr[bwd], direction_sign=1,
+            frac_above_min=0.001, outlier_threshold=outlier_thresh,
+            force_floor_only=True,
+        )
+        results['Ic_eff+_f_mA'] = ic_eff * 1000 if np.isfinite(ic_eff) else np.nan
+        results['Ir_eff+_b_mA'] = ir_eff * 1000 if np.isfinite(ir_eff) else np.nan
+    else:
+        # Uni-directional: report +/- on the single sweep as _f for convenience
+        Ic_plus, fb_p = _resolve_ic(
+            I_ic, sig_ic, V_ic, I, sig_arr, V_arr,
+            1, ic_span, outlier_thresh, diff_threshold,
+        )
+        Ic_minus, fb_m = _resolve_ic(
+            I_ic, sig_ic, V_ic, I, sig_arr, V_arr,
+            -1, ic_span, outlier_thresh, diff_threshold,
+        )
+        results['Ic+_f_mA'] = Ic_plus * 1000 if np.isfinite(Ic_plus) else np.nan
+        results['Ic-_f_mA'] = Ic_minus * 1000 if np.isfinite(Ic_minus) else np.nan
+        results['Ic+_b_mA'] = np.nan
+        results['Ic-_b_mA'] = np.nan
+        results['Ic_fallback'].update({
+            'Ic+_f_mA': fb_p, 'Ic-_f_mA': fb_m,
+        })
+        ic_eff, _ = _ic_at_max_signal(
+            I, sig_arr, V_arr, direction_sign=1,
+            frac_above_min=0.001, outlier_threshold=outlier_thresh,
+            force_floor_only=True,
+        )
+        results['Ic_eff+_f_mA'] = ic_eff * 1000 if np.isfinite(ic_eff) else np.nan
+        results['Ir_eff+_b_mA'] = np.nan
+
+    # Jc from switching current Ic+_f when available, else Ic_eff
+    ic_for_jc = results.get('Ic+_f_mA', np.nan)
+    if not np.isfinite(ic_for_jc):
+        ic_for_jc = results.get('Ic_eff+_f_mA', np.nan)
+    results['Jc_kA/cm2'] = (
+        ic_for_jc / (area_um2 * 1e-2) if np.isfinite(ic_for_jc) else np.nan
+    )
+
+    # R_N linear fits — high-bias window from |I|
+    # Optional override: Rn precomputed at T ≈ Tc−2 K (see rn_override_mOhm)
     def fit_Rn(I_seg, V_seg, criterion):
         if len(I_seg) < 5:
             return np.nan
@@ -1826,21 +1860,38 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
             return np.nan
         slope, _, _, _, _ = linregress(I_seg[high_bias], V_seg[high_bias])
         return slope
-    
-    # Positive side
-    pos = I > 0
-    results['Rn+_mOhm'] = fit_Rn(I[pos], V[pos], rn_criterion) * 1000 if np.any(pos) else np.nan
-    
-    # Negative side
-    neg = I < 0
-    results['Rn-_mOhm'] = fit_Rn(I[neg], V[neg], rn_criterion) * 1000 if np.any(neg) else np.nan
-    
-    results['Rn_mean_mOhm'] = np.nanmean([results['Rn+_mOhm'], results['Rn-_mOhm']])
-    
-    # Ic * R_N
-    results['IcRn_mV'] = results['Ic_mA'] * results['Rn_mean_mOhm'] * 1e-3 if not np.isnan(results['Ic_mA']) and not np.isnan(results['Rn_mean_mOhm']) else np.nan
-    # Jc * R_N
-    results['JcRn_V/m2'] = results['Jc_kA/cm2'] * results['Rn_mean_mOhm'] * 1e-4 if not np.isnan(results['Jc_kA/cm2']) and not np.isnan(results['Rn_mean_mOhm']) else np.nan
+
+    if rn_override_mOhm is not None and np.isfinite(rn_override_mOhm):
+        results['Rn+_mOhm'] = np.nan
+        results['Rn-_mOhm'] = np.nan
+        results['Rn_mean_mOhm'] = float(rn_override_mOhm)
+        results['Rn_from_T_K'] = rn_from_T_K
+    else:
+        pos = I > 0
+        results['Rn+_mOhm'] = (
+            fit_Rn(I[pos], V[pos], rn_criterion) * 1000 if np.any(pos) else np.nan
+        )
+        neg = I < 0
+        results['Rn-_mOhm'] = (
+            fit_Rn(I[neg], V[neg], rn_criterion) * 1000 if np.any(neg) else np.nan
+        )
+        results['Rn_mean_mOhm'] = np.nanmean(
+            [results['Rn+_mOhm'], results['Rn-_mOhm']]
+        )
+        results['Rn_from_T_K'] = results.get('T_K', np.nan)
+
+    # Ic * R_N  (use switching Ic+_f)
+    ic_sw = results.get('Ic+_f_mA', np.nan)
+    rn_m = results.get('Rn_mean_mOhm', np.nan)
+    results['IcRn_mV'] = (
+        ic_sw * rn_m * 1e-3
+        if np.isfinite(ic_sw) and np.isfinite(rn_m) else np.nan
+    )
+    results['JcRn_V/m2'] = (
+        results['Jc_kA/cm2'] * rn_m * 1e-4
+        if np.isfinite(results.get('Jc_kA/cm2', np.nan)) and np.isfinite(rn_m)
+        else np.nan
+    )
     
     # === Advanced Analysis ===
     if advanced:
@@ -5129,6 +5180,31 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
     return datasets
 
 
+
+def _pick_rn_reference_segment(datasets, tc_for_rn):
+    """Return (index, T_mean) of the first segment with T_mean <= tc_for_rn − 2.
+
+    Raises ValueError if none exists.
+    """
+    if tc_for_rn is None:
+        return None, None
+    target = float(tc_for_rn) - 2.0
+    candidates = []
+    for i, d in enumerate(datasets):
+        Tm = float(d.get('T_mean', np.nanmean(d.get('T', [np.nan]))))
+        if np.isfinite(Tm) and Tm <= target + 1e-9:
+            candidates.append((i, Tm))
+    if not candidates:
+        raise ValueError(
+            f"--tc-for-rn={tc_for_rn:g} K requires a data segment with "
+            f"T <= {target:g} K (Tc−2). None found among "
+            f"{len(datasets)} segment(s)."
+        )
+    # Prefer the highest T still <= Tc−2 (closest to the definition)
+    candidates.sort(key=lambda x: -x[1])
+    return candidates[0]
+
+
 def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    T_max=None, T_round=0.5, min_points=30,
                                    out_root="singles", figsize=(8.6, 6.0),
@@ -5136,7 +5212,8 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    rn_criterion=0.5, ic_span=10,
                                    outlier_thresh=5.0, diff_threshold=0.001,
                                    advanced=False, ic_I_min=None, ic_I_max=None,
-                                   split_sweeps=False):
+                                   split_sweeps=False, show_ic_eff=False,
+                                   tc_for_rn=None):
     """Per-temperature IV diagnostics + parameter logs under ``singles/``.
 
     Layout
@@ -5162,28 +5239,53 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
     os.makedirs(out_root, exist_ok=True)
     print(f"  [per-T] {len(datasets)} temperature segment(s) → {out_root}/")
 
+    # Rn reference at T ≈ Tc−2 (if requested)
+    rn_override = None
+    rn_from_T = None
+    rn_ref_idx = None
+    if tc_for_rn is not None and do_analyze:
+        rn_ref_idx, rn_from_T = _pick_rn_reference_segment(datasets, tc_for_rn)
+        ref = datasets[rn_ref_idx]
+        ref_params = compute_iv_parameters(
+            ref, area_um2=area_um2, rn_criterion=rn_criterion,
+            ic_span=ic_span, outlier_thresh=outlier_thresh,
+            diff_threshold=diff_threshold, advanced=False,
+            figsize=figsize, ic_I_min=ic_I_min, ic_I_max=ic_I_max,
+        )
+        rn_override = ref_params.get('Rn_mean_mOhm', np.nan)
+        if not np.isfinite(rn_override):
+            raise ValueError(
+                f"Rn fit failed on reference segment T={rn_from_T:.2f} K "
+                f"(tc_for_rn={tc_for_rn:g})."
+            )
+        print(f"  [Rn] reference T={rn_from_T:.2f} K  "
+              f"Rn_mean={rn_override:.6g} mOhm  (Tc={tc_for_rn:g}, Tc−2)")
+
     all_params = []
-    for data in datasets:
+    for i, data in enumerate(datasets):
         T_lab = data["T_label"]
         folder = os.path.join(out_root, f"{T_lab}K")
         os.makedirs(folder, exist_ok=True)
         base_name = os.path.join(folder, f"{T_lab}K")
 
-        # Diagnostic plots
         params = {}
         if do_analyze:
+            use_override = rn_override is not None and i != rn_ref_idx
             params = compute_iv_parameters(
                 data, area_um2=area_um2, rn_criterion=rn_criterion,
                 ic_span=ic_span, outlier_thresh=outlier_thresh,
                 diff_threshold=diff_threshold, advanced=advanced,
                 figsize=figsize,
                 ic_I_min=ic_I_min, ic_I_max=ic_I_max,
+                rn_override_mOhm=(rn_override if use_override else None),
+                rn_from_T_K=(rn_from_T if use_override else None),
             )
             all_params.append(params)
 
         plot_iv_diagnostics(
             data, base_name=base_name, figsize=figsize,
             split_sweeps=split_sweeps, ic_params=params or None,
+            show_ic_eff=show_ic_eff,
         )
 
         # Log file
@@ -5216,18 +5318,35 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             if params:
                 fh.write(f"\n--- analysis results ---\n")
                 fb = params.get("Ic_fallback") or {}
-                for k, v in params.items():
-                    if k == "Ic_fallback":
-                        continue
+                # Preferred key order for readability
+                preferred = [
+                    'T_K', 'is_bf',
+                    'Ic+_f_mA', 'Ic-_f_mA', 'Ic+_b_mA', 'Ic-_b_mA',
+                    'Ic_eff+_f_mA', 'Ir_eff+_b_mA',
+                    'Rn+_mOhm', 'Rn-_mOhm', 'Rn_mean_mOhm', 'Rn_from_T_K',
+                    'Jc_kA/cm2', 'IcRn_mV', 'JcRn_V/m2',
+                ]
+                keys = [k for k in preferred if k in params] + [
+                    k for k in params
+                    if k not in preferred and k != 'Ic_fallback'
+                ]
+                for k in keys:
+                    v = params[k]
                     note = ""
                     if k in fb and fb[k]:
                         mth = fb[k]
                         if mth is True or mth == 'max_dvdI':
                             note = "  (chosen from maximum dV/dI)"
                         elif mth == 'pct10_above_min':
-                            note = "  (chosen from 3% above min V and dV/dI)"
+                            note = "  (chosen from 0.1% above min V and dV/dI)"
                         else:
                             note = f"  (fallback: {mth})"
+                    if k in ('Ic_eff+_f_mA', 'Ir_eff+_b_mA'):
+                        note = "  (0.1% above min V & dV/dI, always)"
+                    if k == 'Rn_mean_mOhm' and params.get('Rn_from_T_K') is not None:
+                        rt = params['Rn_from_T_K']
+                        if np.isfinite(rt) and abs(rt - params.get('T_K', rt)) > 0.05:
+                            note = f"  (calculated from {rt:.2f} K data)"
                     if isinstance(v, float):
                         if np.isfinite(v):
                             fh.write(f"{k:20s} = {v:.6g}{note}\n")
@@ -5276,6 +5395,12 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument('--split-sweeps', action='store_true',
                    help="For bidirectional I(V): also save 2-row figures "
                         "(forward top, backward bottom) with Ic+/- guide lines.")
+    p.add_argument('--ic-eff', action='store_true',
+                   help="Draw effective Ic (orange) and Ir (dark blue) lines "
+                        "on I(V) and dV/dI plots (merged and split).")
+    p.add_argument('--tc-for-rn', type=float, default=None, metavar='K',
+                   help="Tc (K) for Rn: fit Rn on the first segment with "
+                        "T <= Tc−2 K, then reuse that Rn for all temperatures.")
     p.add_argument('--advanced', action='store_true', 
                        help="Perform advanced analysis (diode efficiency, Stewart-McCumber, gap, etc.)")
     p.add_argument('--plot-didv', action='store_true', help="Plot dI/dV and find Riedel peaks")
@@ -6236,22 +6361,40 @@ def _run_IV_dVdI(args):
             base = os.path.splitext(os.path.basename(csv_file))[0]
             # Analyse first if requested / needed for split Ic lines
             params = None
-            need_ic = getattr(args, 'analyze', False) or getattr(args, 'split_sweeps', False)
+            need_ic = (
+                getattr(args, 'analyze', False)
+                or getattr(args, 'split_sweeps', False)
+                or getattr(args, 'ic_eff', False)
+            )
             if need_ic:
-                params = compute_iv_parameters(data, area_um2=args.area, 
-                                               rn_criterion=args.rn_criterion,
-                                               ic_span=args.ic_span,
-                                               outlier_thresh=args.outlier_thresh,
-                                               diff_threshold=args.diff_threshold,
-                                               advanced=getattr(args, 'advanced', False),
-                                               figsize=args.figsize,
-                                               ic_I_min=getattr(args, 'ic_I_min', None),
-                                               ic_I_max=getattr(args, 'ic_I_max', None))
+                # Single-file Rn at Tc−2 if --tc-for-rn given
+                rn_ov = None
+                rn_T = None
+                tc_rn = getattr(args, 'tc_for_rn', None)
+                if tc_rn is not None:
+                    Tm = float(np.nanmean(data.get('T', [np.nan])))
+                    if not (np.isfinite(Tm) and Tm <= float(tc_rn) - 2.0 + 1e-9):
+                        raise ValueError(
+                            f"--tc-for-rn={tc_rn:g}: this file has T≈{Tm:.2f} K, "
+                            f"need T <= {float(tc_rn)-2:g} K to define Rn."
+                        )
+                params = compute_iv_parameters(
+                    data, area_um2=args.area,
+                    rn_criterion=args.rn_criterion,
+                    ic_span=args.ic_span,
+                    outlier_thresh=args.outlier_thresh,
+                    diff_threshold=args.diff_threshold,
+                    advanced=getattr(args, 'advanced', False),
+                    figsize=args.figsize,
+                    ic_I_min=getattr(args, 'ic_I_min', None),
+                    ic_I_max=getattr(args, 'ic_I_max', None),
+                )
 
             plot_iv_diagnostics(
                 data, base_name=f"{base}", figsize=args.figsize,
                 split_sweeps=getattr(args, 'split_sweeps', False),
                 ic_params=params,
+                show_ic_eff=getattr(args, 'ic_eff', False),
             )
 
             if getattr(args, 'analyze', False) and params is not None:
@@ -6264,7 +6407,7 @@ def _run_IV_dVdI(args):
                     if mth is True or mth == 'max_dvdI':
                         note = "  (chosen from maximum dV/dI)"
                     elif mth == 'pct10_above_min':
-                        note = "  (chosen from 3% above min V and dV/dI)"
+                        note = "  (chosen from 0.1% above min V and dV/dI)"
                     elif mth:
                         note = f"  (fallback: {mth})"
                     else:
@@ -6311,6 +6454,8 @@ def _run_IV_dVdI(args):
                 ic_I_min=getattr(args, 'ic_I_min', None),
                 ic_I_max=getattr(args, 'ic_I_max', None),
                 split_sweeps=getattr(args, 'split_sweeps', False),
+                show_ic_eff=getattr(args, 'ic_eff', False),
+                tc_for_rn=getattr(args, 'tc_for_rn', None),
             )
         return
 
