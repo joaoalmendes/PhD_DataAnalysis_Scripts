@@ -25,17 +25,23 @@ Supported models
                             * tanh( Delta(T) / (2 * kB * T) )
            Free parameters: Delta0, [Tc], [eta].
 
-  d-wave   Paper Eqs. (1)+(4) with zeta = 1, written with the five global
-           free-fitting parameters of Eq. (7a):
-               y0, eta, Delta0, Tc, (Delta C_el / gamma Tc)
-           Gap (paper Eq. 4, zeta fixed to 1):
+  d-wave   Paper d-wave form (zeta = 1).  Two variants:
+
+           * Smooth (default, Eq. 7a) — free params:
+                 y0 (>=0), eta, Delta0, Tc, DeltaC_el/gammaTc
+               Ic(T) = y0 + eta * (pi Delta(T))/(2 e Rn)
+                            * tanh(Delta(T)/(2 kB Tc))
+
+           * Piecewise (--piecewise, Eq. 7) — for data with a low-T
+             inflection.  Requires --Tc (held fixed).  Five free params:
+                 Delta0, eta, DeltaC_el/gammaTc, Tm, k
+               Ic(T) = H(Tm-T)*(a + k*T) + H(T-Tm)*AB(T)
+               with a chosen for continuity at Tm.
+
+           Gap (Eq. 4, zeta = 1) in both cases:
                Delta(T) = Delta0 * tanh(
-                   (pi * kB * Tc / Delta0)
+                   (pi kB Tc / Delta0)
                    * sqrt( (DeltaC_el/gamma Tc) * (Tc/T - 1) ) )
-           Current (paper Eq. 1 / 7a; tanh uses Tc as written there):
-               Ic(T) = y0 + eta * (pi * Delta(T)) / (2 * e * Rn)
-                            * tanh( Delta(T) / (2 * kB * Tc) )
-           Free parameters: Delta0, [Tc], [eta], DeltaC_el/gammaTc, [y0].
 
 R_n is taken once from the first usable analysis.log (the pipeline
 stores the same Rn_mean_mOhm in every log, evaluated near Tc; the
@@ -359,48 +365,122 @@ def ic_ab_classic(T, Delta0_meV, Tc, Rn_Ohm, eta=1.0):
     return Ic * 1e3  # A -> mA
 
 
+def _ab_core_mA(Delta_T, Tc, Rn_Ohm, eta):
+    """Shared AB core: eta * (pi Delta) / (2 e Rn) * tanh(Delta/(2 kB Tc)), in mA.
+
+    Matches paper Eq. (1): tanh argument uses Tc.
+    """
+    if Tc <= 0:
+        return np.zeros_like(Delta_T)
+    arg = Delta_T / (2.0 * K_BOLTZ * Tc)
+    Ic_A = eta * (np.pi * Delta_T) / (2.0 * E_CHARGE * Rn_Ohm) * np.tanh(arg)
+    return np.nan_to_num(Ic_A, nan=0.0) * 1e3  # A -> mA
+
+
 def ic_ab_dwave(T, Delta0_meV, Tc, Rn_Ohm, eta=1.0, dCel=0.95, y0=0.0):
-    """d-wave Ambegaokar-Baratoff Ic in mA (paper Eqs. 1 + 4 / 7a).
+    """d-wave AB without inflection (paper Eqs. 1 + 4 / 7a), Ic in mA.
 
     Gap: paper Eq. (4) with zeta = 1.
-    Current: paper Eq. (1) / (7a) form
+    Current:
         Ic = y0 + eta * (pi * Delta(T)) / (2 e Rn)
                    * tanh( Delta(T) / (2 kB Tc) )
-    Note the tanh argument uses Tc (as written in the paper), not T.
 
-    The five global free-fitting parameters of Eq. (7a) are:
-        y0, eta, Delta0, Tc, dCel (= Delta C_el / gamma Tc).
+    Free parameters of Eq. (7a): y0, eta, Delta0, Tc, dCel.
     """
     T = np.atleast_1d(np.asarray(T, dtype=float))
     Delta0_J = Delta0_meV * 1e-3 * E_CHARGE
     Delta_T = bcs_gap_dwave(T, Delta0_J, Tc, dCel)
+    return y0 + _ab_core_mA(Delta_T, Tc, Rn_Ohm, eta)
 
-    # paper Eq. (1): tanh argument is Delta / (2 kB Tc)
-    if Tc <= 0:
-        return np.zeros_like(T)
-    arg = Delta_T / (2.0 * K_BOLTZ * Tc)
-    Ic = y0 + eta * (np.pi * Delta_T) / (2.0 * E_CHARGE * Rn_Ohm) * np.tanh(arg)
-    Ic = np.nan_to_num(Ic, nan=0.0)
-    return Ic * 1e3  # A -> mA
+
+def ic_ab_dwave_piecewise(T, Delta0_meV, Tc, Rn_Ohm, eta=1.0, dCel=0.95,
+                          Tm=None, k=0.0):
+    """d-wave AB with low-T linear inflection (paper Eq. 7), Ic in mA.
+
+        Ic(T) = H(Tm - T) * (a + k * T)
+              + H(T - Tm) * AB(T)
+
+    where AB is the standard paper Eq. (1) form (no y0), and continuity
+    at T = Tm fixes
+        a = AB(Tm) - k * Tm
+
+    Free parameters (as used by Talantsev for Zhao et al. data):
+        k, Tm, eta, Delta0, dCel  (+ Tc always free in this script).
+
+    k has units of mA/K when fitting Ic; if the user plots Rn*Ic the
+    displayed slope is k * Rn * 1e3 (mV/K).
+    """
+    T = np.atleast_1d(np.asarray(T, dtype=float))
+    if Tm is None:
+        Tm = 0.4 * Tc
+    Delta0_J = Delta0_meV * 1e-3 * E_CHARGE
+    Delta_T = bcs_gap_dwave(T, Delta0_J, Tc, dCel)
+    AB = _ab_core_mA(Delta_T, Tc, Rn_Ohm, eta)
+
+    # AB value at Tm for continuity
+    Delta_Tm = bcs_gap_dwave(np.array([Tm]), Delta0_J, Tc, dCel)
+    AB_Tm = float(_ab_core_mA(Delta_Tm, Tc, Rn_Ohm, eta)[0])
+    a = AB_Tm - k * Tm
+
+    linear = a + k * T
+    out = np.where(T < Tm, linear, AB)
+    # at exactly Tm both sides agree
+    out = np.where(np.isclose(T, Tm), AB_Tm, out)
+    return np.nan_to_num(out, nan=0.0)
 
 
 def ic0_from_gap(Delta0_meV, Rn_Ohm, eta=1.0):
-    """Ic(T -> 0) in mA (tanh -> 1), ignoring any offset y0."""
+    """Classic AB Ic(T->0) in mA: tanh(Delta/(2 kB T)) -> 1."""
     Delta0_J = Delta0_meV * 1e-3 * E_CHARGE
     return eta * (np.pi * Delta0_J) / (2.0 * E_CHARGE * Rn_Ohm) * 1e3
+
+
+def ic0_from_model(popt, Rn_Ohm):
+    """Ic(T=0) = value of the fitted curve at T = 0 (mA).
+
+    Uses the exact same model function as the plot, evaluated at T=0.
+    """
+    Delta0 = popt["Delta0_meV"]
+    Tc = popt["Tc"]
+    eta = popt.get("eta", 1.0)
+    model = popt.get("model", "ab")
+    piecewise = popt.get("piecewise", False)
+    T0 = np.array([0.0])
+
+    if model == "ab":
+        # classic AB is singular at T=0 in tanh(Delta/(2kT)); use T->0 limit
+        return float(ic_ab_classic(np.array([1e-9]), Delta0, Tc, Rn_Ohm,
+                                   eta=eta)[0])
+
+    dCel = popt.get("dCel", 0.95)
+    if piecewise:
+        return float(ic_ab_dwave_piecewise(
+            T0, Delta0, Tc, Rn_Ohm,
+            eta=eta, dCel=dCel,
+            Tm=popt["Tm"], k=popt["k"])[0])
+
+    # smooth d-wave Eq. (7a)
+    y0 = popt.get("y0", 0.0)
+    return float(ic_ab_dwave(T0, Delta0, Tc, Rn_Ohm,
+                             eta=eta, dCel=dCel, y0=y0)[0])
 
 
 # ----------------------------------------------------------------------
 # Fitting
 # ----------------------------------------------------------------------
 def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
-                fit_y0=False):
+                fit_y0=False, piecewise=False):
     """Fit Ic(T) for the chosen model.
 
     model : 'ab' | 'd-wave'
+    piecewise : if True and model=='d-wave', use paper Eq. (7) (linear
+                low-T + AB above Tm) instead of Eq. (7a).
+                Requires Tc_guess: Tc is held fixed so the five free
+                parameters are Delta0, eta, dCel, Tm, k.
 
-    Tc is always a free fit parameter.  Tc_guess (if given) is only used
-    as the initial value / lower-bound hint; it does not fix Tc.
+    For classic AB (--model ab), if Tc_guess is given then Tc is held
+    fixed.  For smooth d-wave (Eq. 7a) Tc is always free; Tc_guess is
+    only an initial value / lower-bound hint.
 
     Returns
         popt        dict of best-fit (and fixed) parameters
@@ -408,29 +488,52 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
         free_names  list of names of free parameters
         r_squared
     """
-    if Tc_guess is None:
-        Tc_guess = 1.2 * float(T.max())
+    if piecewise and model == "d-wave":
+        if Tc_guess is None:
+            raise ValueError(
+                "Piecewise Eq. (7) requires --Tc <value>: Tc is held fixed "
+                "so there are exactly five free parameters "
+                "(Delta0, eta, dCel, Tm, k)."
+            )
+        Tc_fixed = float(Tc_guess)
+        Tc_for_guess = Tc_fixed
+    elif model == "ab" and Tc_guess is not None:
+        # classic AB: --Tc holds Tc fixed (data cut + fixed parameter)
+        Tc_fixed = float(Tc_guess)
+        Tc_for_guess = Tc_fixed
     else:
-        Tc_guess = float(Tc_guess)
+        Tc_fixed = None
+        Tc_for_guess = (1.2 * float(T.max()) if Tc_guess is None
+                        else float(Tc_guess))
+
     # weak-coupling Delta0 estimates (meV)
     if model == "d-wave":
-        # 2 Delta / kB Tc ~ 4.28 for d-wave
-        Delta0_guess = (4.28 / 2.0) * K_BOLTZ * Tc_guess / (1e-3 * E_CHARGE)
+        Delta0_guess = (4.28 / 2.0) * K_BOLTZ * Tc_for_guess / (1e-3 * E_CHARGE)
         dCel_guess = 0.95
     else:
-        # 2 Delta / kB Tc ~ 3.53 for s-wave
-        Delta0_guess = (3.53 / 2.0) * K_BOLTZ * Tc_guess / (1e-3 * E_CHARGE)
+        Delta0_guess = (3.53 / 2.0) * K_BOLTZ * Tc_for_guess / (1e-3 * E_CHARGE)
         dCel_guess = None
     eta_guess = 1.0
     y0_guess = 0.0
+    # piecewise: Tm ~ mid-range of data, k near 0 (mA/K)
+    Tm_guess = 0.5 * (float(T.min()) + float(T.max()))
+    k_guess = 0.0
 
-    # Tc is always free
-    free_names = ["Delta0_meV", "Tc"]
-    p0 = [Delta0_guess, Tc_guess]
-    lo = [1e-3, float(T.max()) * 1.001]
-    hi = [50.0, 500.0]
+    free_names = ["Delta0_meV"]
+    p0 = [Delta0_guess]
+    lo = [1e-3]
+    hi = [50.0]
 
-    if fit_eta:
+    if Tc_fixed is None:
+        # non-piecewise: Tc is free
+        free_names.append("Tc")
+        p0.append(Tc_for_guess)
+        lo.append(float(T.max()) * 1.001)
+        hi.append(500.0)
+
+    # piecewise always fits eta (one of the five Eq. 7 parameters);
+    # otherwise only if --fit-eta
+    if piecewise or fit_eta:
         free_names.append("eta")
         p0.append(eta_guess)
         lo.append(1e-3)
@@ -442,23 +545,43 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
         lo.append(0.01)
         hi.append(5.0)
 
-    if fit_y0:
-        free_names.append("y0")
-        p0.append(y0_guess)
-        span = float(np.max(np.abs(Ic))) if len(Ic) else 1.0
-        lo.append(-span)
-        hi.append(span)
+        if piecewise:
+            # Eq. (7): free Tm and k (Tc fixed) → five free params total
+            free_names.append("Tm")
+            p0.append(Tm_guess)
+            lo.append(float(T.min()) * 0.5)
+            hi.append(min(float(T.max()) * 0.99, Tc_fixed * 0.99))
+
+            free_names.append("k")
+            p0.append(k_guess)
+            span = float(np.max(np.abs(Ic))) if len(Ic) else 1.0
+            Tspan = max(float(T.max()) - float(T.min()), 1.0)
+            lo.append(-2.0 * span / Tspan)
+            hi.append(2.0 * span / Tspan)
+        elif fit_y0:
+            # Eq. (7a): optional positive offset only
+            free_names.append("y0")
+            p0.append(y0_guess)
+            span = float(np.max(np.abs(Ic))) if len(Ic) else 1.0
+            lo.append(0.0)          # y0 >= 0
+            hi.append(span)
 
     def model_fn(T_arr, *params):
         kw = dict(zip(free_names, params))
         Delta0 = kw["Delta0_meV"]
-        Tc = kw["Tc"]
+        Tc = kw.get("Tc", Tc_fixed)
         eta = kw.get("eta", 1.0)
-        y0 = kw.get("y0", 0.0)
         if model == "d-wave":
             dCel = kw["dCel"]
-            return ic_ab_dwave(T_arr, Delta0, Tc, Rn_Ohm,
-                              eta=eta, dCel=dCel, y0=y0)
+            if piecewise:
+                return ic_ab_dwave_piecewise(
+                    T_arr, Delta0, Tc, Rn_Ohm,
+                    eta=eta, dCel=dCel,
+                    Tm=kw["Tm"], k=kw["k"])
+            else:
+                y0 = kw.get("y0", 0.0)
+                return ic_ab_dwave(T_arr, Delta0, Tc, Rn_Ohm,
+                                  eta=eta, dCel=dCel, y0=y0)
         else:
             return ic_ab_classic(T_arr, Delta0, Tc, Rn_Ohm, eta=eta)
 
@@ -471,15 +594,23 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
     r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
     popt = dict(zip(free_names, popt_arr))
+    if "Tc" not in popt:
+        popt["Tc"] = Tc_fixed
     if "eta" not in popt:
         popt["eta"] = 1.0
     if "dCel" not in popt:
         popt["dCel"] = None
     if "y0" not in popt:
         popt["y0"] = 0.0
+    if "Tm" not in popt:
+        popt["Tm"] = None
+    if "k" not in popt:
+        popt["k"] = None
     popt["model"] = model
+    popt["piecewise"] = bool(piecewise and model == "d-wave")
 
     return popt, pcov, free_names, r_squared
+
 
 
 # ----------------------------------------------------------------------
@@ -493,29 +624,47 @@ def make_plot(T, Ic, Ir, popt, Rn_Ohm, r_squared, free_names,
     fig, ax = plt.subplots(figsize=(8.6 / 2.54, 6.5 / 2.54),
                            constrained_layout=True)
 
+    # only non-negative currents are plotted (physical Ic, Ir >= 0)
+    pos = np.isfinite(Ic) & (Ic >= 0)
+    T_pos, Ic_pos = T[pos], Ic[pos]
+
     if plot_icrn:
-        y_data = Ic * Rn_Ohm * 1e3   # mA * Ohm * 1e3 -> mV
+        # log convention: IcRn_mV = Ic_mA * Rn_mean_mOhm * 1e-3
+        # (mA * mOhm = uV; * 1e-3 -> mV)
+        Rn_mOhm = Rn_Ohm * 1e3
+        y_data = Ic_pos * Rn_mOhm * 1e-3
         y_label = r"$R_n I_c$ (mV)"
         if Ir is not None and np.any(np.isfinite(Ir)):
-            y_Ir = Ir * Rn_Ohm * 1e3
+            ir_pos = np.isfinite(Ir) & (Ir >= 0)
+            y_Ir = np.where(ir_pos, Ir * Rn_mOhm * 1e-3, np.nan)
+            T_Ir = T
         else:
             y_Ir = None
+            T_Ir = None
     else:
-        y_data = Ic
-        y_label = r"$I_c$ (mA)"
-        y_Ir = Ir if (Ir is not None and np.any(np.isfinite(Ir))) else None
+        y_data = Ic_pos
+        # when no-fit and Ir is shown, use generic I; otherwise Ic
+        y_label = r"$I$ (mA)" if no_fit else r"$I_c$ (mA)"
+        if Ir is not None and np.any(np.isfinite(Ir)):
+            ir_pos = np.isfinite(Ir) & (Ir >= 0)
+            y_Ir = np.where(ir_pos, Ir, np.nan)
+            T_Ir = T
+        else:
+            y_Ir = None
+            T_Ir = None
 
     if normalize and Tc_norm is not None:
-        x_data = T / Tc_norm
+        x_data = T_pos / Tc_norm
         ax.set_xlabel(r"$T / T_c$")
     else:
-        x_data = T
+        x_data = T_pos
         ax.set_xlabel(r"$T$ (K)")
 
     ax.plot(x_data, y_data, "ko",
             label=r"$I_c$" if not plot_icrn else r"$R_n I_c$")
     if no_fit and y_Ir is not None:
-        ax.plot(x_data, y_Ir, "ks", mfc="none",
+        x_Ir = (T_Ir / Tc_norm) if (normalize and Tc_norm is not None) else T_Ir
+        ax.plot(x_Ir, y_Ir, "ks", mfc="none",
                 label=r"$I_r$" if not plot_icrn else r"$R_n I_r$")
 
     if not no_fit and popt is not None:
@@ -524,17 +673,29 @@ def make_plot(T, Ic, Ir, popt, Rn_Ohm, r_squared, free_names,
         eta = popt["eta"]
         dCel = popt.get("dCel")
         y0 = popt.get("y0", 0.0)
+        piecewise = popt.get("piecewise", False)
+        Tm = popt.get("Tm")
+        k = popt.get("k")
 
         T_fine = np.linspace(1e-3, min(float(T.max()) * 1.05,
                                        Tc_fit * 0.999), 500)
         if model == "d-wave":
-            Ic_fine = ic_ab_dwave(T_fine, Delta0, Tc_fit, Rn_Ohm,
-                                 eta=eta, dCel=dCel, y0=y0)
+            if piecewise:
+                Ic_fine = ic_ab_dwave_piecewise(
+                    T_fine, Delta0, Tc_fit, Rn_Ohm,
+                    eta=eta, dCel=dCel, Tm=Tm, k=k)
+            else:
+                Ic_fine = ic_ab_dwave(T_fine, Delta0, Tc_fit, Rn_Ohm,
+                                     eta=eta, dCel=dCel, y0=y0)
         else:
             Ic_fine = ic_ab_classic(T_fine, Delta0, Tc_fit, Rn_Ohm, eta=eta)
 
+        # never draw negative fit values
+        Ic_fine = np.maximum(Ic_fine, 0.0)
+
         if plot_icrn:
-            y_fine = Ic_fine * Rn_Ohm * 1e3
+            Rn_mOhm = Rn_Ohm * 1e3
+            y_fine = Ic_fine * Rn_mOhm * 1e-3   # mA * mOhm * 1e-3 = mV
         else:
             y_fine = Ic_fine
 
@@ -544,7 +705,7 @@ def make_plot(T, Ic, Ir, popt, Rn_Ohm, r_squared, free_names,
             x_fine = T_fine
 
         if normalize and not plot_icrn:
-            Ic0 = ic0_from_gap(Delta0, Rn_Ohm, eta)
+            Ic0 = ic0_from_model(popt, Rn_Ohm)
             if Ic0 != 0:
                 ax.clear()
                 ax.plot(x_data, y_data / Ic0, "ko", label="data")
@@ -568,10 +729,19 @@ def make_plot(T, Ic, Ir, popt, Rn_Ohm, r_squared, free_names,
         if model == "d-wave" and dCel is not None:
             label_lines.append(
                 rf"$\Delta C_{{\rm el}}/\gamma T_c$ = {dCel:.3f}")
-            label_lines.append(r"$\zeta$ = 1 (d-wave)")
+            if piecewise:
+                if Tm is not None:
+                    label_lines.append(rf"$T_m$ = {Tm:.2f} K")
+                if k is not None:
+                    if plot_icrn:
+                        # k [mA/K] * Rn [mOhm] * 1e-3 = mV/K
+                        Rn_mOhm = Rn_Ohm * 1e3
+                        label_lines.append(
+                            rf"$k$ = {k * Rn_mOhm * 1e-3:.3g} mV/K")
+                    else:
+                        label_lines.append(rf"$k$ = {k:.4g} mA/K")
         if "y0" in free_names:
             label_lines.append(rf"$y_0$ = {y0:.4f} mA")
-        label_lines.append(rf"$R_n$ = {Rn_Ohm * 1e3:.1f} m$\Omega$")
         if r_squared is not None:
             label_lines.append(rf"$R^2$ = {r_squared:.4f}")
         ax.text(0.03, 0.05, "\n".join(label_lines),
@@ -617,17 +787,21 @@ Argument summary
                        available it is plotted as open squares.
     --model {ab,d-wave}
                        ab     = classic AB (s-wave weak-coupling, Eq. 2)
-                       d-wave = paper Eqs. (1)+(4)/(7a) with zeta = 1
-                                (five-parameter form: y0, eta, Delta0, Tc,
-                                 DeltaC_el/gammaTc)
+                       d-wave = paper d-wave form with zeta = 1
                        (default: ab)
+    --piecewise        For --model d-wave only: use paper Eq. (7) with a
+                       low-T linear segment instead of smooth Eq. (7a).
+                       Requires --Tc (held fixed).  Five free parameters:
+                       Delta0, eta, dCel, Tm, k.
     --fit-eta          Let the dimensionless prefactor eta vary; without
-                       this flag eta is fixed at 1.
-    --fit-y0           Also fit a constant offset y0 (mA).  This is one of
-                       the five global parameters in Talantsev Eq. (7a).
-    --Tc FLOAT         Only keep data with T <= Tc (K).  Tc itself remains
-                       a free fit parameter; this value is only a data cut
-                       and an initial guess for the fit.
+                       this flag eta is fixed at 1.  (Always free under
+                       --piecewise.)
+    --fit-y0           Also fit a constant offset y0 >= 0 (mA).  Only for
+                       non-piecewise d-wave (Eq. 7a).
+    --Tc FLOAT         Only keep data with T <= Tc (K).
+                       ab: also holds Tc fixed in the fit.
+                       d-wave --piecewise: required and held fixed.
+                       d-wave (Eq. 7a): data cut + initial guess (Tc free).
 
   Plot options
     --icrn             Plot Rn*Ic (mV) instead of Ic (mA).
@@ -652,17 +826,24 @@ Argument summary
     parser.add_argument("--model", choices=("ab", "d-wave"),
                         default="ab",
                         help="Gap / AB model: ab = classic s-wave AB; "
-                             "d-wave = paper Eq. (7a) form (default: ab)")
+                             "d-wave = paper d-wave form (default: ab)")
+    parser.add_argument("--piecewise", action="store_true",
+                        help="For d-wave only: use paper Eq. (7) with low-T "
+                             "linear inflection (Tm, k) instead of smooth "
+                             "Eq. (7a). Requires --Tc (held fixed). Five free "
+                             "params: Delta0, eta, dCel, Tm, k.")
     parser.add_argument("--fit-eta", action="store_true",
                         help="Treat eta as a free fit parameter "
                              "(default: eta = 1 fixed)")
     parser.add_argument("--fit-y0", action="store_true",
-                        help="Also fit a constant offset y0 (mA); one of the "
-                             "five global parameters in Eq. (7a)")
+                        help="Also fit a constant offset y0 >= 0 (mA); only "
+                             "for non-piecewise d-wave (Eq. 7a)")
     parser.add_argument("--Tc", type=float, default=None,
                         help="Only analyse temperatures T <= Tc (K). "
-                             "Tc remains a free fit parameter; this value "
-                             "is a data cut and an initial guess.")
+                             "For --model ab: also holds Tc fixed in the fit. "
+                             "For --piecewise: required and held fixed. "
+                             "For smooth d-wave (Eq. 7a): data cut + initial "
+                             "guess only (Tc remains free).")
     parser.add_argument("--normalize", action="store_true",
                         help="Normalise axes to T/Tc and Ic/Ic(0); needs --Tc")
     parser.add_argument("--icrn", action="store_true",
@@ -673,6 +854,14 @@ Argument summary
 
     if args.normalize and args.Tc is None:
         parser.error("--normalize requires --Tc <value>")
+    if args.piecewise and args.model != "d-wave":
+        parser.error("--piecewise only applies with --model d-wave")
+    if args.piecewise and args.fit_y0:
+        parser.error("--fit-y0 is for Eq. (7a) only; do not combine with "
+                     "--piecewise (Eq. 7 uses Tm, k instead of y0)")
+    if args.piecewise and args.Tc is None:
+        parser.error("--piecewise requires --Tc <value> (Tc is held fixed; "
+                     "the five free parameters are Delta0, eta, dCel, Tm, k)")
 
     # ------------------------------------------------------------------
     # 1. Collect data
@@ -733,6 +922,7 @@ Argument summary
             Tc_guess=args.Tc,          # initial guess only; Tc stays free
             fit_eta=args.fit_eta,
             fit_y0=args.fit_y0,
+            piecewise=args.piecewise,
         )
         perr = np.sqrt(np.diag(pcov))
         err_map = dict(zip(free_names, perr))
@@ -751,7 +941,10 @@ Argument summary
     # 5. Report
     # ------------------------------------------------------------------
     print("\n--- Ambegaokar-Baratoff fit results ---")
-    print(f"Model                       = {args.model}")
+    model_label = args.model
+    if args.model == "d-wave":
+        model_label += " piecewise Eq.(7)" if args.piecewise else " Eq.(7a)"
+    print(f"Model                       = {model_label}")
     if Rn_from_T is not None:
         print(f"R_n (fixed)                 = {Rn_mOhm:.3f} mOhm "
               f"(from T = {Rn_from_T:.4g} K)")
@@ -767,10 +960,13 @@ Argument summary
               + (f" +/- {err_map['Delta0_meV']:.4f}"
                  if "Delta0_meV" in err_map else "")
               + " meV")
-        print(f"Tc (fit)                    = {Tc_fit:.4f}"
-              + (f" +/- {err_map['Tc']:.4f}" if "Tc" in err_map else "")
-              + " K")
-        if args.fit_eta:
+        if args.piecewise or (args.model == "ab" and args.Tc is not None):
+            print(f"Tc (fixed, input)           = {Tc_fit:.4f} K")
+        else:
+            print(f"Tc (fit)                    = {Tc_fit:.4f}"
+                  + (f" +/- {err_map['Tc']:.4f}" if "Tc" in err_map else "")
+                  + " K")
+        if args.fit_eta or args.piecewise:
             print(f"eta (fit)                   = {eta:.4f}"
                   + (f" +/- {err_map['eta']:.4f}" if "eta" in err_map else ""))
         else:
@@ -783,11 +979,24 @@ Argument summary
             kB_meV = K_BOLTZ / E_CHARGE * 1e3
             bcs_ratio = 2.0 * Delta0 / (kB_meV * Tc_fit)
             print(f"2 Delta0 / (kB Tc)          = {bcs_ratio:.3f}")
+        if args.piecewise:
+            Tm = popt.get("Tm")
+            k = popt.get("k")
+            if Tm is not None:
+                print(f"Tm (fit)                    = {Tm:.4f}"
+                      + (f" +/- {err_map['Tm']:.4f}" if "Tm" in err_map
+                         else "")
+                      + " K")
+            if k is not None:
+                print(f"k (fit)                     = {k:.6g}"
+                      + (f" +/- {err_map['k']:.6g}" if "k" in err_map
+                         else "")
+                      + " mA/K")
         if args.fit_y0:
             print(f"y0 (fit)                    = {popt['y0']:.4f}"
                   + (f" +/- {err_map['y0']:.4f}" if "y0" in err_map else "")
                   + " mA")
-        Ic0 = ic0_from_gap(Delta0, Rn_Ohm, eta)
+        Ic0 = ic0_from_model(popt, Rn_Ohm)
         print(f"Ic(T=0)                     = {Ic0:.4f} mA")
         print(f"R^2                         = {r_squared:.5f}")
     print(f"\nPlot saved to: {os.path.abspath(args.out)}")
