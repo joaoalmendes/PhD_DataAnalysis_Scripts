@@ -563,19 +563,30 @@ def analyze_RT(data_source, bridge=1, area_correction=1.0,
     return result
 
 def _draw_RT(ax, T, R, dR, show_errorbars, color, marker, markersize,
-             label, **kwargs):
+             label, plot_points_line=False, **kwargs):
     """Low-level draw step shared by both branches/no-branches cases."""
-    ms = markersize if markersize is not None else plt.rcParams["lines.markersize"]
-    if show_errorbars:
-        ax.errorbar(T, R, yerr=dR, fmt=marker, color=color, ms=ms,
-                    label=label, **kwargs)
+    base_ms = markersize if markersize is not None else plt.rcParams["lines.markersize"]
+    if plot_points_line:
+        ms = 0.7 * float(base_ms)
+        fmt = "o-"
+        lw = kwargs.pop("lw", 0.8)
+        if show_errorbars:
+            ax.errorbar(T, R, yerr=dR, fmt=fmt, color=color, ms=ms, lw=lw,
+                        label=label, **kwargs)
+        else:
+            ax.plot(T, R, fmt, color=color, ms=ms, lw=lw, label=label, **kwargs)
     else:
-        ax.plot(T, R, marker, color=color, ms=ms, label=label, **kwargs)
+        ms = base_ms
+        if show_errorbars:
+            ax.errorbar(T, R, yerr=dR, fmt=marker, color=color, ms=ms,
+                        label=label, **kwargs)
+        else:
+            ax.plot(T, R, marker, color=color, ms=ms, label=label, **kwargs)
 
 def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
             normalized=False, color="k", branch_colors=None, marker="o",
             markersize=None, label=None, xlabel=r"Temperature (K)",
-            ylabel=None, legend=None, **kwargs):
+            ylabel=None, legend=None, plot_points_line=False, **kwargs):
     """Plot R(T) data produced by `analyze_RT`.
 
     Parameters
@@ -647,10 +658,11 @@ def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
             lbl = f"{label} ({branch_name})" if label else branch_name.capitalize()
             _draw_RT(ax, data["T"][mask], data[R_key][mask], data[dR_key][mask],
                       show_errorbars, colors[branch_name], marker, markersize,
-                      lbl, **kwargs)
+                      lbl, plot_points_line=plot_points_line, **kwargs)
     else:
         _draw_RT(ax, data["T"], data[R_key], data[dR_key], show_errorbars,
-                  color, marker, markersize, label, **kwargs)
+                  color, marker, markersize, label,
+                  plot_points_line=plot_points_line, **kwargs)
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -694,13 +706,23 @@ def _label_iv_branches(I, window=3, points_per_sweep=None):
 
     n_fwd = int(points_per_sweep) if points_per_sweep is not None else 0
     if n_fwd > 0:
-        # Fixed-length sweeps: [0, n_fwd) forward, [n_fwd, n) backward
+        # Fixed-length with shared turnaround: F=[0,N), B starts at N-1.
+        # In a single flat array we cannot duplicate the shared sample, so
+        # index N-1 stays labelled forward and [N, end) is backward.
+        # (segment_multi_t_iv duplicates the shared row into both branches.)
         if n_fwd >= n:
-            # only one sweep present
             branch[:] = "forward"
             return branch, False
         branch[:n_fwd] = "forward"
         branch[n_fwd:] = "backward"
+        d_mean = float(np.nanmean(np.diff(I[:n_fwd]))) if n_fwd > 1 else 0.0
+        if d_mean < 0:
+            import warnings
+            warnings.warn(
+                "First points_per_sweep block has mean ΔI < 0 (current decreasing). "
+                "Labels still follow file order (first=forward, rest=backward).",
+                UserWarning, stacklevel=2,
+            )
         return branch, True
 
     # --- legacy: sign of smoothed ΔI ---
@@ -812,7 +834,8 @@ def load_multi_iv_files(pattern_or_list, channel_dV=2, channel_dI=1):
 
 def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
                  marker="o", markersize=None, label=None, figsize=None,
-                 ic_params=None, show_ic_eff=False, **kwargs):
+                 ic_params=None, show_ic_eff=False, show_ic_lines=False,
+                 plot_points_line=False, **kwargs):
     """Plot I(V) related quantities with paper style and figsize support.
 
     Forward sweep is always black; backward is tab:red when branches are shown.
@@ -860,37 +883,53 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
         raise ValueError(f"Unknown plot_type: {plot_type}")
 
     # Forward = black, backward = red (merged plot)
+    base_ms = markersize if markersize is not None else 3
+    if plot_points_line:
+        ms = 0.7 * float(base_ms)
+        fmt = "o-"
+        lw = kwargs.pop("lw", 0.8)
+    else:
+        ms = base_ms
+        fmt = marker
+        lw = kwargs.pop("lw", None)
+
+    def _plt(xx, yy, c, lbl):
+        kw = dict(kwargs)
+        if lw is not None:
+            kw["lw"] = lw
+        ax.plot(xx, yy, fmt, color=c, ms=ms, label=lbl, **kw)
+
     if show_branches and "branch" in data:
         colors = {"forward": "k", "backward": "tab:red"}
         for b_name in ["forward", "backward"]:
             mask = data["branch"] == b_name
             if not np.any(mask):
                 continue
-            ax.plot(x[mask], y[mask], marker, color=colors[b_name],
-                    ms=markersize or 3, label=b_name.capitalize(), **kwargs)
+            _plt(x[mask], y[mask], colors[b_name], b_name.capitalize())
     else:
-        ax.plot(x, y, marker, color=color, ms=markersize or 3, label=label, **kwargs)
+        _plt(x, y, color, label)
 
-    # Switching / retrapping Ic lines (merged plot) + optional effective
+    # Optional Ic+/− F/B lines (--ic-lines) and effective (--ic-eff)
     if ic_params is not None and plot_type in ("iv", "dvdI", "phase"):
-        ic_lines = [
-            ("Ic+_f_mA", +1, "k", "-",  r"$I_c^+$ F"),
-            ("Ic-_f_mA", -1, "k", "--", r"$I_c^-$ F"),
-            ("Ic+_b_mA", +1, "tab:red",  "-",  r"$I_c^+$ B"),
-            ("Ic-_b_mA", -1, "tab:red",  "--", r"$I_c^-$ B"),
-        ]
-        drawn = set()
-        for key, sign, color, ls, lbl in ic_lines:
-            val = ic_params.get(key, np.nan)
-            if not np.isfinite(val):
-                continue
-            xline = sign * abs(float(val))
-            tag = (round(xline, 6), ls, color)
-            ax.axvline(
-                xline, color=color, ls=ls, lw=1.0, alpha=0.85,
-                label=(lbl if tag not in drawn else None),
-            )
-            drawn.add(tag)
+        if show_ic_lines:
+            ic_lines = [
+                ("Ic+_f_mA", +1, "k", "-",  r"$I_c^+$ F"),
+                ("Ic-_f_mA", -1, "k", "--", r"$I_c^-$ F"),
+                ("Ic+_b_mA", +1, "tab:red",  "-",  r"$I_c^+$ B"),
+                ("Ic-_b_mA", -1, "tab:red",  "--", r"$I_c^-$ B"),
+            ]
+            drawn = set()
+            for key, sign, color, ls, lbl in ic_lines:
+                val = ic_params.get(key, np.nan)
+                if not np.isfinite(val):
+                    continue
+                xline = sign * abs(float(val))
+                tag = (round(xline, 6), ls, color)
+                ax.axvline(
+                    xline, color=color, ls=ls, lw=1.0, alpha=0.85,
+                    label=(lbl if tag not in drawn else None),
+                )
+                drawn.add(tag)
 
         if show_ic_eff:
             ic_eff = ic_params.get("Ic_eff+_f_mA", np.nan)
@@ -907,7 +946,7 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
     ax.tick_params(direction='in', top=True, right=True, labelsize=8)
     ax.xaxis.label.set_size(9)
     ax.yaxis.label.set_size(9)
-    if label or show_branches or show_ic_eff or ic_params is not None:
+    if label or show_branches or show_ic_eff or show_ic_lines:
         ax.legend(
             frameon=False, fontsize=8,
             loc="center left", bbox_to_anchor=(1.02, 0.5),
@@ -919,7 +958,8 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
 
 
 def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
-                         figsize=None, colors=None, show_ic_eff=False):
+                         figsize=None, colors=None, show_ic_eff=False,
+                         show_ic_lines=False, plot_points_line=False):
     """Two-row figure: forward (top, black) and backward (bottom, red).
 
     Optional Ic+/- guide lines from ``ic_params``.  With ``show_ic_eff``,
@@ -936,7 +976,9 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
 
     if "branch" not in data or not data.get("is_bf", False):
         plot_IV_dVdI(data, ax=ax_f, plot_type=plot_type, show_branches=True,
-                     ic_params=ic_params, show_ic_eff=show_ic_eff)
+                     ic_params=ic_params, show_ic_eff=show_ic_eff,
+                     show_ic_lines=show_ic_lines,
+                     plot_points_line=plot_points_line)
         ax_b.set_visible(False)
         return fig, (ax_f, ax_b)
 
@@ -965,6 +1007,10 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
         raise ValueError(f"Unknown plot_type: {plot_type}")
 
     colors = colors or {"forward": "k", "backward": "tab:red"}
+    if plot_points_line:
+        fmt, ms, lw = "o-", 2.1, 0.8
+    else:
+        fmt, ms, lw = "o", 3, None
 
     for ax, bname in ((ax_f, "forward"), (ax_b, "backward")):
         m = branch == bname
@@ -972,8 +1018,10 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
             ax.text(0.5, 0.5, f"No {bname} data", transform=ax.transAxes,
                     ha="center", va="center")
         else:
-            ax.plot(I_ma[m], y[m], "o", color=colors[bname], ms=3,
-                    label=bname.capitalize())
+            kw = {"ms": ms, "label": bname.capitalize()}
+            if lw is not None:
+                kw["lw"] = lw
+            ax.plot(I_ma[m], y[m], fmt, color=colors[bname], **kw)
         ax.set_ylabel(ylabel)
         ax.tick_params(direction="in", top=True, right=True, labelsize=8)
 
@@ -986,27 +1034,28 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
         except Exception:
             ic_params = {}
 
-    # Switching / retrapping Ic lines only on iv & dvdI (not T, dV, dI)
+    # Optional Ic+/− F/B (--ic-lines) and effective (--ic-eff)
     if plot_type in ("iv", "dvdI", "phase"):
-        ic_lines = [
-            ("Ic+_f_mA", +1, "k", "-",  r"$I_c^+$ F"),
-            ("Ic-_f_mA", -1, "k", "--", r"$I_c^-$ F"),
-            ("Ic+_b_mA", +1, "tab:red",  "-",  r"$I_c^+$ B"),
-            ("Ic-_b_mA", -1, "tab:red",  "--", r"$I_c^-$ B"),
-        ]
-        drawn = set()
-        for key, sign, color, ls, lbl in ic_lines:
-            val = ic_params.get(key, np.nan)
-            if not np.isfinite(val):
-                continue
-            x = sign * abs(float(val))
-            tag = (round(x, 6), ls, color)
-            for ax in (ax_f, ax_b):
-                ax.axvline(
-                    x, color=color, ls=ls, lw=1.0, alpha=0.85,
-                    label=(lbl if tag not in drawn else None),
-                )
-            drawn.add(tag)
+        if show_ic_lines:
+            ic_lines = [
+                ("Ic+_f_mA", +1, "k", "-",  r"$I_c^+$ F"),
+                ("Ic-_f_mA", -1, "k", "--", r"$I_c^-$ F"),
+                ("Ic+_b_mA", +1, "tab:red",  "-",  r"$I_c^+$ B"),
+                ("Ic-_b_mA", -1, "tab:red",  "--", r"$I_c^-$ B"),
+            ]
+            drawn = set()
+            for key, sign, color, ls, lbl in ic_lines:
+                val = ic_params.get(key, np.nan)
+                if not np.isfinite(val):
+                    continue
+                x = sign * abs(float(val))
+                tag = (round(x, 6), ls, color)
+                for ax in (ax_f, ax_b):
+                    ax.axvline(
+                        x, color=color, ls=ls, lw=1.0, alpha=0.85,
+                        label=(lbl if tag not in drawn else None),
+                    )
+                drawn.add(tag)
 
         if show_ic_eff:
             ic_eff = ic_params.get("Ic_eff+_f_mA", np.nan)
@@ -1043,7 +1092,8 @@ def plot_IV_split_sweeps(data, plot_type="iv", ic_params=None,
 
 def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0),
                         split_sweeps=False, ic_params=None, show_ic_eff=False,
-                        include_phase=False):
+                        show_ic_lines=False, include_phase=False,
+                        plot_points_line=False):
     """Save standard IV diagnostic PDFs.
 
     If ``split_sweeps`` and the data are bidirectional, also save a
@@ -1060,6 +1110,8 @@ def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0),
         plot_IV_dVdI(
             data, ax=ax, plot_type=t, show_branches=True, figsize=figsize,
             ic_params=ic_params, show_ic_eff=show_ic_eff,
+            show_ic_lines=show_ic_lines,
+            plot_points_line=plot_points_line,
         )
         fig.savefig(f"{base_name}_{t}.pdf", bbox_inches="tight")
         plt.close(fig)
@@ -1074,7 +1126,8 @@ def plot_iv_diagnostics(data, base_name="", figsize=(8.6, 6.0),
         for t in types:
             fig, _ = plot_IV_split_sweeps(
                 data, plot_type=t, ic_params=ic_params, figsize=tall,
-                show_ic_eff=show_ic_eff,
+                show_ic_eff=show_ic_eff, show_ic_lines=show_ic_lines,
+                plot_points_line=plot_points_line,
             )
             path = f"{base_name}_{t}_split.pdf"
             fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -1152,124 +1205,221 @@ def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0))
         fig.savefig(f"{output_prefix}_IV_backward.pdf")
         plt.close(fig)
     
-    # 2. 2D dV/dI intensity map
-    fig, ax = plt.subplots(figsize=figsize)
-    I_ma = datasets[0]["I"] * 1e3   # mA
-    T_values = np.array([d['T_mean'] for d in datasets])
-    dVdI_grid = np.zeros((len(T_values), len(I_ma)))
-    for i, d in enumerate(datasets):
-        dVdI_grid[i] = d["dVdI"]  # Ohm
-    
-    im = ax.pcolormesh(I_ma, T_values, dVdI_grid, shading='auto', cmap='plasma')
-    fig.colorbar(im, ax=ax, label=r'dV/dI ($\Omega$)')
-    ax.set_xlabel("Current (mA)")
-    ax.set_ylabel("Temperature (K)")
-    ax.set_title("dV/dI Intensity Map")
-    fig.tight_layout()
-    fig.savefig(f"{output_prefix}_dVdI_map.pdf")
-    plt.close(fig)
-    
+    # 2. 2D dV/dI intensity map — filled T strips (no white gaps)
+    Ts = np.array([
+        float(d.get("T_setpoint", d.get("T_mean", np.nan))) for d in datasets
+    ], dtype=float)
+    Ts_v = Ts[np.isfinite(Ts)]
+    dT = float(np.median(np.diff(np.unique(Ts_v)))) if len(Ts_v) >= 2 else 0.5
+    if not np.isfinite(dT) or dT <= 0:
+        dT = 0.5
+
+    strips, all_Z = [], []
+    for d in datasets:
+        I = np.asarray(d["I"], dtype=float) * 1e3
+        Z = np.asarray(d["dVdI"], dtype=float)
+        Tset = float(d.get("T_setpoint", d.get("T_mean", np.nan)))
+        m = np.isfinite(I) & np.isfinite(Z)
+        if np.count_nonzero(m) < 2 or not np.isfinite(Tset):
+            continue
+        I, Z = I[m], Z[m]
+        order = np.argsort(I)
+        strips.append((I[order], Z[order], Tset))
+        all_Z.append(Z[order])
+    if strips:
+        all_Z = np.concatenate(all_Z)
+        vmin, vmax = np.nanpercentile(all_Z, [2, 98])
+        fig, ax = plt.subplots(figsize=(8.6 / 2.54, 6.0 / 2.54),
+                                constrained_layout=True)
+        cmap = plt.get_cmap("viridis")
+
+        def _i_edges(I, I_lo=None, I_hi=None):
+            if len(I) == 1:
+                w = 1e-3
+                left, right = I[0] - w, I[0] + w
+                mid = np.array([])
+            else:
+                mid = 0.5 * (I[:-1] + I[1:])
+                left = I[0] - (mid[0] - I[0])
+                right = I[-1] + (I[-1] - mid[-1])
+            if I_lo is not None:
+                left = min(left, float(I_lo))
+            if I_hi is not None:
+                right = max(right, float(I_hi))
+            if len(I) == 1:
+                return np.array([left, right])
+            return np.concatenate([[left], mid, [right]])
+
+        I_global_min = float(min(np.min(I) for I, _, _ in strips))
+        I_global_max = float(max(np.max(I) for I, _, _ in strips))
+
+        im = None
+        for I, Z, Tset in strips:
+            im = ax.pcolormesh(
+                _i_edges(I, I_lo=I_global_min, I_hi=I_global_max),
+                np.array([Tset - 0.5 * dT, Tset + 0.5 * dT]),
+                Z.reshape(1, -1),
+                cmap=cmap, vmin=vmin, vmax=vmax,
+                shading="flat", rasterized=True,
+            )
+        if im is not None:
+            fig.colorbar(im, ax=ax, label=r"dV/dI ($\Omega$)")
+        ax.set_xlabel("Current (mA)")
+        ax.set_ylabel("Temperature (K)")
+        ax.set_title("dV/dI Intensity Map")
+        ax.set_xlim(I_global_min, I_global_max)
+        ax.set_ylim(float(np.nanmin(Ts_v)) - 0.5 * dT,
+                    float(np.nanmax(Ts_v)) + 0.5 * dT)
+        ax.margins(0)
+        fig.savefig(f"{output_prefix}_dVdI_map.pdf", dpi=300)
+        plt.close(fig)
+
     print(f"Saved multi-T plots: {output_prefix}_*.pdf")
 
-def plot_2d_dvdi_map_from_single_file(filepath, channel_dV=2, channel_dI=1,
-                                       n_T_bins=100, n_I_bins=200,
-                                       clim_pct=(2, 98), T_max=None, di_sense_R=1e3):
-    """Load a multi-T rack IV file and produce a 2D dV/dI colour map.
+def plot_2d_dvdi_map_from_single_file(
+        filepath, channel_dV=2, channel_dI=1,
+        clim_pct=(2, 98), T_max=None, di_sense_R=1e3,
+        T_step=None, T_initial=None, T_final=None,
+        points_per_sweep=301, phase_channel="theta2",
+        n_T_bins=None, n_I_bins=None,  # CLI compat; ignored
+        ):
+    """2D dV/dI intensity map from a multi-T rack IV file.
 
-    Uses 2D binning (not a pivot) so it works correctly even when T drifts
-    continuously during the current sweep, giving nearly-unique (T, I) pairs
-    rather than a clean regular grid.
+    Uses the same temperature-grid + fixed-sweep segmentation as per-T
+    analysis (``segment_multi_t_iv``).  **Every** measured point is used
+    (no averaging / binning of dV/dI).
 
-    Parameters
-    ----------
-    T_max : float or None
-        If set, only rows with Tsample <= T_max are used.
+    Each setpoint ``T_k`` is drawn as a filled horizontal strip spanning
+    ``[T_k - ΔT/2, T_k + ΔT/2]`` (ΔT = temperature step) so there are no
+    white gaps between discrete temperatures — same visual style as a
+    MATLAB ``pcolor`` / ``imagesc`` map.
     """
-    from scipy.stats import binned_statistic_2d
-
-    print("Loading multi-T file...")
-    df = _load_csv_rack(filepath, mode="iv",
-                        channel_dV=channel_dV, channel_dI=channel_dI)
-    if T_max is not None:
-        n_before = len(df)
-        df = df.loc[df["Tsample"] <= float(T_max)].copy()
-        print(f"  T_max = {T_max} K → kept {len(df):,}/{n_before:,} rows "
-              f"(Tsample ≤ {T_max})")
-    print(f"  {len(df):,} rows, "
-          f"{df['Tsample'].nunique()} unique temperatures, "
-          f"{df['Current (A)'].nunique()} unique currents")
-
-    # ---- 1. Vectorised dV/dI (dI LIA voltage → current via sense R) --------
-    R_s = float(di_sense_R) if di_sense_R is not None else 1e3
-    if R_s <= 0:
-        raise ValueError(f"di_sense_R must be > 0 (got {R_s})")
-    dI_A = df["dI"].to_numpy(dtype=float) / R_s  # V / Ohm → A
-    valid = (
-        (np.abs(dI_A) > 1e-15)
-        & df["dV"].notna()
-        & np.isfinite(dI_A)
+    print("Loading multi-T file (grid segmentation, all points)...")
+    datasets = segment_multi_t_iv(
+        filepath,
+        channel_dV=channel_dV,
+        channel_dI=channel_dI,
+        T_max=T_max,
+        T_step=T_step,
+        T_initial=T_initial,
+        T_final=T_final,
+        points_per_sweep=points_per_sweep,
+        phase_channel=phase_channel,
+        di_sense_R=di_sense_R,
+        min_points=3,
     )
-    n_dropped = int((~valid).sum())
-    if n_dropped:
-        print(f"  Dropped {n_dropped:,} rows with |dI| ≈ 0 or NaN")
-    df = df.loc[valid].copy()
-    dI_A = dI_A[valid]
-    df["dVdI"] = df["dV"].to_numpy(dtype=float) / dI_A  # Ohm
-    print(f"  dI sense R = {R_s:g} Ω  (dV/dI in Ohm)")
+    if not datasets:
+        print("  No temperature segments — map not produced.")
+        return
 
-    T_vals    = df["Tsample"].values
-    I_vals_mA = df["Current (A)"].values * 1e3   # mA for display
-    dVdI_vals = df["dVdI"].values
+    # Resolve ΔT for strip height
+    Ts = np.array([
+        float(d.get("T_setpoint", d.get("T_mean", np.nan)))
+        for d in datasets
+    ], dtype=float)
+    Ts_valid = Ts[np.isfinite(Ts)]
+    if T_step is not None and float(T_step) > 0:
+        dT = float(T_step)
+    elif len(Ts_valid) >= 2:
+        dT = float(np.median(np.diff(np.unique(Ts_valid))))
+    else:
+        dT = 0.5
+    if not np.isfinite(dT) or dT <= 0:
+        dT = 0.5
 
-    # ---- 2. 2D binning (replaces pivot_table) --------------------------------
-    # pivot_table only fills cells that have an exact (T, I) match; when T
-    # drifts continuously, every row has a unique pair, giving a grid that is
-    # >99.9% NaN.  binned_statistic_2d aggregates nearby points into shared
-    # bins, giving a dense, displayable grid.
-    print(f"Binning into {n_T_bins} T × {n_I_bins} I grid...")
-    Z, T_edges, I_edges, _ = binned_statistic_2d(
-        T_vals, I_vals_mA, dVdI_vals,
-        statistic="mean",
-        bins=[n_T_bins, n_I_bins],
-    )
-    T_centers = 0.5 * (T_edges[:-1] + T_edges[1:])
-    I_centers = 0.5 * (I_edges[:-1] + I_edges[1:])
+    # Collect all dVdI for colour limits
+    all_Z = []
+    strips = []  # (I_mA sorted, Z sorted, T_set)
+    for d in datasets:
+        I = np.asarray(d["I"], dtype=float) * 1e3
+        Z = np.asarray(d["dVdI"], dtype=float)
+        Tset = float(d.get("T_setpoint", d.get("T_mean", np.nan)))
+        m = np.isfinite(I) & np.isfinite(Z)
+        if np.count_nonzero(m) < 2 or not np.isfinite(Tset):
+            continue
+        I, Z = I[m], Z[m]
+        order = np.argsort(I)
+        I, Z = I[order], Z[order]
+        strips.append((I, Z, Tset))
+        all_Z.append(Z)
 
-    nan_frac = np.isnan(Z).mean()
-    print(f"  NaN fraction in grid: {nan_frac:.1%}  "
-          f"(if still high, reduce n_T_bins / n_I_bins)")
+    if not strips:
+        print("  No finite dV/dI points — map not produced.")
+        return
 
-    vmin, vmax = np.nanpercentile(dVdI_vals, list(clim_pct))
+    all_Z = np.concatenate(all_Z)
+    n_pts = int(all_Z.size)
+    print(f"  {n_pts:,} points from {len(strips)} temperature strip(s)  "
+          f"(no binning, ΔT strip = {dT:g} K)")
+    print(f"  dI sense R = {float(di_sense_R) if di_sense_R else 1e3:g} Ω  "
+          f"(dV/dI in Ohm)")
+
+    vmin, vmax = np.nanpercentile(all_Z, list(clim_pct))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = float(np.nanmin(all_Z)), float(np.nanmax(all_Z))
     print(f"  dV/dI colour range "
-          f"({clim_pct[0]}–{clim_pct[1]}th pct): {vmin:.3f} – {vmax:.3f} mΩ")
+          f"({clim_pct[0]}–{clim_pct[1]}th pct): "
+          f"{vmin:.3f} – {vmax:.3f} Ω")
 
-    # ---- 3. Plot ------------------------------------------------------------
     set_paper_style()
     fig, ax = plt.subplots(figsize=(8.6 / 2.54, 6 / 2.54),
                             constrained_layout=True)
+    cmap = plt.get_cmap("viridis")
 
-    # Build a masked array so NaN cells are transparent, not white
-    Z_masked = np.ma.masked_invalid(Z)
+    def _i_edges(I, I_lo=None, I_hi=None):
+        """Cell edges along current for pcolormesh (flat shading).
 
-    cmap = plt.get_cmap("viridis").copy()
-    cmap.set_bad(color="white")          # NaN → white (matches paper background)
+        Outer edges snap to the global current range so the strip fills
+        the full horizontal width (no white left/right borders).
+        """
+        if len(I) == 1:
+            w = 1e-3
+            left, right = I[0] - w, I[0] + w
+            mid = np.array([])
+        else:
+            mid = 0.5 * (I[:-1] + I[1:])
+            left = I[0] - (mid[0] - I[0])
+            right = I[-1] + (I[-1] - mid[-1])
+        if I_lo is not None:
+            left = min(left, float(I_lo))
+        if I_hi is not None:
+            right = max(right, float(I_hi))
+        if len(I) == 1:
+            return np.array([left, right])
+        return np.concatenate([[left], mid, [right]])
 
-    im = ax.pcolormesh(
-        I_centers, T_centers, Z_masked,
-        cmap=cmap,
-        vmin=vmin, vmax=vmax,
-        rasterized=True,                 # bitmap inside PDF → small file
-        shading="nearest",
-    )
-    fig.colorbar(im, ax=ax, label=r"dV/dI ($\Omega$)")
+    # Global current span → every T strip covers the full plot width
+    I_global_min = float(min(np.min(I) for I, _, _ in strips))
+    I_global_max = float(max(np.max(I) for I, _, _ in strips))
+
+    im = None
+    for I, Z, Tset in strips:
+        I_e = _i_edges(I, I_lo=I_global_min, I_hi=I_global_max)
+        T_e = np.array([Tset - 0.5 * dT, Tset + 0.5 * dT])
+        im = ax.pcolormesh(
+            I_e, T_e, Z.reshape(1, -1),
+            cmap=cmap, vmin=vmin, vmax=vmax,
+            shading="flat", rasterized=True,
+        )
+
+    if im is not None:
+        fig.colorbar(im, ax=ax, label=r"dV/dI ($\Omega$)")
     ax.set_xlabel(r"Current (mA)")
     ax.set_ylabel("Temperature (K)")
+    T_lo = float(np.nanmin(Ts_valid)) - 0.5 * dT
+    T_hi = float(np.nanmax(Ts_valid)) + 0.5 * dT
+    ax.set_xlim(I_global_min, I_global_max)
+    ax.set_ylim(T_lo, T_hi)
+    ax.margins(0)
+    ax.set_axisbelow(False)
 
     base = os.path.splitext(os.path.basename(filepath))[0]
     out = f"{base}_dVdI_map.pdf"
     fig.savefig(out, dpi=300)
     plt.close(fig)
     print(f"Saved: {out}")
+
+
 
 # ==================================================================
 # I(V) and dV/dI: Data Analysis and Numerical Calculations
@@ -5021,6 +5171,11 @@ def _add_RT_parser(subparsers):
         action="store_true",
         help="Plot with error bars (default: off)",
     )
+    p.add_argument(
+        "--plot-points-line",
+        action="store_true",
+        help="Plot half-size circles connected by a line",
+    )
 
     p.add_argument(
         "--branches",
@@ -5304,72 +5459,205 @@ def _add_RT_parser(subparsers):
     return p
 
 
-def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
-                       T_max=None, T_round=0.5, min_points=30,
-                       phase_channel="theta2", di_sense_R=1e3,
-                       points_per_sweep=301):
-    """Split a multi-T rack IV file into per-temperature analyze_IV_dVdI dicts.
 
-    Temperatures are grouped by rounding Tsample to the nearest multiple of
-    ``T_round`` (default 0.5 K).  Only groups with at least ``min_points``
-    rows and a non-trivial current span are kept.
+def _parse_iv_temp_grid_from_filename(filepath):
+    """Extract T_initial, T_final, T_step from a multi-T IV filename.
+
+    Recognises patterns such as:
+        2to35K, 2to35k, 2.5to40K
+        0.5Kstep, 0.5kstep, 1Kstep
+
+    Returns
+    -------
+    dict with optional keys 'T_initial', 'T_final', 'T_step' (floats, K).
+    """
+    import re
+    name = os.path.basename(str(filepath))
+    out = {}
+    m = re.search(r'(?i)(\d+(?:\.\d+)?)\s*to\s*(\d+(?:\.\d+)?)\s*k', name)
+    if m:
+        out['T_initial'] = float(m.group(1))
+        out['T_final'] = float(m.group(2))
+    m = re.search(r'(?i)(\d+(?:\.\d+)?)\s*k\s*step', name)
+    if m:
+        out['T_step'] = float(m.group(1))
+    return out
+
+
+def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
+                       T_max=None, T_step=None, T_initial=None, T_final=None,
+                       min_points=30, phase_channel="theta2", di_sense_R=1e3,
+                       points_per_sweep=301, T_round=None):
+    """Split a multi-T rack IV file into per-temperature F+B datasets.
+
+    Data placement does **not** use measured Tsample rounding.  Instead:
+
+    1. Resolve the temperature grid:
+       ``T_k = T_initial + k * T_step``, k = 0, 1, ... until ``T_final``
+       (and/or ``T_max`` if given).
+       Missing values are filled from the filename
+       (e.g. ``2to35K_0.5Kstep`` → 2, 35, 0.5).
+       ``T_round`` is accepted only as a deprecated alias of ``T_step``.
+
+    2. Walk the file chronologically.  Each temperature uses
+       ``2N - 1`` samples with a **shared turnaround** point:
+       F = N points, B = N points, last F ≡ first B (not stored twice).
+
+    3. Assign consecutive (F, B) pairs to setpoints ``T_k``.
+
+    Measured Tsample is still stored for diagnostics but does not decide
+    which points belong to which temperature.
 
     Returns
     -------
     list of dict
-        Each dict is the output of ``analyze_IV_dVdI``-like fields plus
-        ``T_mean`` and ``T_label``.
     """
+    # --- resolve temperature grid ---
+    meta = _parse_iv_temp_grid_from_filename(filepath)
+    if T_step is None and T_round is not None:
+        T_step = T_round  # backward-compatible alias
+    if T_step is None:
+        T_step = meta.get('T_step')
+    if T_initial is None:
+        T_initial = meta.get('T_initial')
+    if T_final is None:
+        T_final = meta.get('T_final')
+
+    if T_step is None or T_step <= 0:
+        raise ValueError(
+            "Temperature step unknown. Pass --T-step (K) or encode it in the "
+            "filename as e.g. '0.5Kstep'."
+        )
+    if T_initial is None:
+        raise ValueError(
+            "T_initial unknown. Pass --T-initial (K) or encode it in the "
+            "filename as e.g. '2to35K'."
+        )
+
+    T_step = float(T_step)
+    T_initial = float(T_initial)
+    T_final_f = float(T_final) if T_final is not None else None
+    T_max_f = float(T_max) if T_max is not None else None
+    # Inclusive upper bound for setpoints
+    T_stop = T_final_f
+    if T_max_f is not None:
+        T_stop = T_max_f if T_stop is None else min(T_stop, T_max_f)
+
+    # Build setpoint list: T_initial, T_initial+step, ... <= T_stop (if set)
+    setpoints = []
+    k = 0
+    while True:
+        Tk = T_initial + k * T_step
+        # numerical safety
+        Tk = float(np.round(Tk / T_step) * T_step) if T_step >= 0.01 else Tk
+        if T_stop is not None and Tk > T_stop + 1e-9:
+            break
+        setpoints.append(Tk)
+        k += 1
+        if T_stop is None and k > 10000:
+            break
+        if T_stop is not None and k > 10000:
+            break
+
+    n_pps = int(points_per_sweep) if points_per_sweep is not None else 0
+    if n_pps <= 0:
+        raise ValueError(
+            "points_per_sweep must be > 0 for grid-based multi-T segmentation."
+        )
+
     df = _load_csv_rack(filepath, mode="iv",
                         channel_dV=channel_dV, channel_dI=channel_dI,
                         phase_channel=phase_channel)
-    if T_max is not None:
-        df = df.loc[df["Tsample"] <= float(T_max)].copy()
+    df = df.copy().reset_index(drop=True)
+    n_total = len(df)
+    R_s = float(di_sense_R) if di_sense_R is not None else 1e3
 
-    T_round = float(T_round) if T_round and T_round > 0 else 0.5
-    T_key = np.round(df["Tsample"].to_numpy(dtype=float) / T_round) * T_round
-    df = df.copy()
-    df["_T_key"] = T_key
+    print(
+        f"  [segment] T grid: {T_initial:g} → "
+        f"{(T_stop if T_stop is not None else T_final_f or '?')} K  "
+        f"step={T_step:g} K  ({len(setpoints)} setpoints)  "
+        f"N_sweep={n_pps}  file_rows={n_total}"
+    )
 
-    datasets = []
-    for Tk in sorted(df["_T_key"].unique()):
-        if not np.isfinite(Tk):
-            continue
-        sub = df.loc[df["_T_key"] == Tk]
-        if len(sub) < min_points:
-            continue
+    def _pack(sub, branch, is_bf, T_set):
         I = sub["Current (A)"].to_numpy(dtype=float)
-        if np.nanmax(I) - np.nanmin(I) < 1e-9:
-            continue
-
+        if len(I) < min_points or (np.nanmax(I) - np.nanmin(I) < 1e-9):
+            return None
         V = sub["Voltage (V)"].to_numpy(dtype=float)
         dV = sub["dV"].to_numpy(dtype=float)
-        dI_V = sub["dI"].to_numpy(dtype=float)  # LIA voltage (V)
+        dI_V = sub["dI"].to_numpy(dtype=float)
         T = sub["Tsample"].to_numpy(dtype=float)
         phase = (
             sub["phase"].to_numpy(dtype=float)
             if "phase" in sub.columns
             else np.full(len(I), np.nan)
         )
-
-        R_s = float(di_sense_R) if di_sense_R is not None else 1e3
-        dI = dI_V / R_s  # physical current (A)
+        dI = dI_V / R_s
         with np.errstate(divide='ignore', invalid='ignore'):
             dVdI = np.where(np.abs(dI) > 1e-15, dV / dI, np.nan)
-
-        branch, is_bf = _label_iv_branches(
-            I, window=3, points_per_sweep=points_per_sweep,
-        )
-
-        T_mean = float(np.nanmean(T))
-        datasets.append({
+        return {
             "I": I, "V": V, "dV": dV, "dI": dI, "dI_V": dI_V, "dVdI": dVdI,
             "T": T, "phase": phase, "phase_channel": phase_channel,
             "di_sense_R": R_s,
             "branch": branch, "source": "rack", "is_bf": is_bf,
-            "T_mean": T_mean,
-            "T_label": f"{T_mean:.1f}",
-        })
+            "T_mean": float(T_set),
+            "T_setpoint": float(T_set),
+            "T_label": f"{float(T_set):.1f}",
+            "n_forward": int(np.sum(branch == "forward")),
+            "n_backward": int(np.sum(branch == "backward")),
+        }
+
+    datasets = []
+    # Shared turnaround: the last sample of F is the first sample of B
+    # (instrument does not record that point twice).  Per temperature:
+    #   F = rows [i0, i0+N)
+    #   B = rows [i0+N-1, i0+N-1+N)   # includes shared endpoint
+    #   stride = 2N - 1
+    # Using stride 2N was stealing one point per T and shifting all later
+    # temperatures (missing +I on B, extra point on next T's −I side).
+    stride = 2 * n_pps - 1
+    print(f"  [segment] shared turnaround: stride={stride} rows/T  "
+          f"(F={n_pps}, B={n_pps}, 1 shared)")
+    for k, T_set in enumerate(setpoints):
+        i0 = k * stride
+        if i0 >= n_total:
+            import warnings
+            warnings.warn(
+                f"File ended before setpoint T={T_set:g} K "
+                f"(need row {i0}, have {n_total}).",
+                UserWarning, stacklevel=2,
+            )
+            break
+
+        i_f1 = min(i0 + n_pps, n_total)
+        i_b0 = i_f1 - 1 if i_f1 > i0 else i_f1   # shared last-F / first-B
+        i_b1 = min(i_b0 + n_pps, n_total)
+        fwd = df.iloc[i0:i_f1]
+        bwd = df.iloc[i_b0:i_b1] if i_b0 < n_total else df.iloc[0:0]
+
+        if len(bwd) >= max(min_points, n_pps // 2):
+            # concat keeps the shared row in both branches (duplicate index ok)
+            sub = pd.concat([fwd, bwd], axis=0)
+            branch = np.array(
+                ["forward"] * len(fwd) + ["backward"] * len(bwd),
+                dtype=object,
+            )
+            is_bf = True
+        else:
+            sub = fwd
+            branch = np.full(len(fwd), "forward", dtype=object)
+            is_bf = False
+            import warnings
+            warnings.warn(
+                f"T={T_set:g} K: incomplete backward sweep "
+                f"({len(bwd)} pts, expected {n_pps}).",
+                UserWarning, stacklevel=2,
+            )
+
+        packed = _pack(sub, branch, is_bf, T_set)
+        if packed is not None:
+            datasets.append(packed)
+
     return datasets
 
 
@@ -5399,7 +5687,8 @@ def _pick_rn_reference_segment(datasets, tc_for_rn):
 
 
 def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
-                                   T_max=None, T_round=0.5, min_points=30,
+                                   T_max=None, T_step=None, T_initial=None,
+                                   T_final=None, min_points=30,
                                    out_root="singles", figsize=(8.6, 6.0),
                                    do_analyze=True, area_um2=1.0,
                                    rn_criterion=0.5, ic_span=10,
@@ -5408,7 +5697,8 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    split_sweeps=False, show_ic_eff=False,
                                    tc_for_rn=None, include_phase=False,
                                    phase_channel="theta2", di_sense_R=1e3,
-                                   points_per_sweep=301):
+                                   points_per_sweep=301, plot_points_line=False,
+                                   show_ic_lines=False):
     """Per-temperature IV diagnostics + parameter logs under ``singles/``.
 
     Layout
@@ -5424,13 +5714,15 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
     """
     datasets = segment_multi_t_iv(
         filepath, channel_dV=channel_dV, channel_dI=channel_dI,
-        T_max=T_max, T_round=T_round, min_points=min_points,
+        T_max=T_max, T_step=T_step, T_initial=T_initial, T_final=T_final,
+        min_points=min_points,
         phase_channel=phase_channel, di_sense_R=di_sense_R,
         points_per_sweep=points_per_sweep,
     )
     if not datasets:
         print("  [per-T] no temperature segments found "
-              f"(T_round={T_round}, T_max={T_max}, min_points={min_points})")
+              f"(T_step={T_step}, T_initial={T_initial}, T_max={T_max}, "
+              f"min_points={min_points})")
         return []
 
     os.makedirs(out_root, exist_ok=True)
@@ -5485,7 +5777,9 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
         plot_iv_diagnostics(
             data, base_name=base_name, figsize=figsize,
             split_sweeps=split_sweeps, ic_params=params or None,
-            show_ic_eff=show_ic_eff, include_phase=include_phase,
+            show_ic_eff=show_ic_eff, show_ic_lines=show_ic_lines,
+            include_phase=include_phase,
+            plot_points_line=plot_points_line,
         )
 
         # Log file
@@ -5505,7 +5799,9 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             fh.write(f"channel_dI     = {channel_dI}  (column X{channel_dI})\n")
             fh.write(f"di_sense_R    = {di_sense_R} Ohm  (dI_A = V_LIA / R; dV/dI in Ohm)\n")
             fh.write(f"T_max          = {T_max}\n")
-            fh.write(f"T_round        = {T_round} K\n")
+            fh.write(f"T_step         = {T_step} K\n")
+            fh.write(f"T_initial      = {T_initial} K\n")
+            fh.write(f"T_final        = {T_final} K\n")
             fh.write(f"min_points     = {min_points}\n")
             fh.write(f"area_um2       = {area_um2}\n")
             fh.write(f"rn_criterion   = {rn_criterion}\n")
@@ -5627,6 +5923,8 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument('--split-sweeps', action='store_true',
                    help="For bidirectional I(V): also save 2-row figures "
                         "(forward top, backward bottom) with Ic+/- guide lines.")
+    p.add_argument('--ic-lines', action='store_true',
+                   help="Draw vertical lines for Ic+/− F and B on I(V)/dV/dI/phase plots.")
     p.add_argument('--ic-eff', action='store_true',
                    help="Draw effective Ic (orange) and Ir (dark blue) lines "
                         "on I(V), dV/dI, and phase plots (merged and split).")
@@ -5643,6 +5941,9 @@ def _add_IV_dVdI_parser(subparsers):
                    help="Number of samples in the forward sweep; the rest of "
                         "the segment is labelled backward. Default: 301. "
                         "Set <=0 to fall back to ΔI-sign labelling.")
+    p.add_argument('--plot-points-line', action='store_true',
+                   help="Plot data as half-size circles connected by lines "
+                        "(R(T) and I(V) diagnostic plots).")
     p.add_argument('--tc-for-rn', type=float, default=None, metavar='K',
                    help="Tc (K) for Rn: fit Rn on the first segment with "
                         "T <= Tc−2 K, then reuse that Rn for all temperatures.")
@@ -5670,9 +5971,19 @@ def _add_IV_dVdI_parser(subparsers):
                    help="For --multi-t-file: also segment into per-temperature "
                         "I(V)/dV/dI analyses up to T_max (if set). Writes "
                         "singles/<T>K/ with plots and analysis.log each.")
-    p.add_argument('--T-round', type=float, default=0.5, metavar='K',
-                   help="Temperature bin width (K) when grouping a multi-T file "
-                        "into single-T segments (default: 0.5).")
+    p.add_argument('--T-step', type=float, default=None, metavar='K',
+                   help="Temperature step (K) between successive F+B pairs in a "
+                        "multi-T IV file. If omitted, parsed from the filename "
+                        "(e.g. '0.5Kstep').")
+    p.add_argument('--T-initial', type=float, default=None, metavar='K',
+                   help="First temperature setpoint (K). If omitted, parsed from "
+                        "the filename (e.g. '2to35K' → 2).")
+    p.add_argument('--T-final', type=float, default=None, metavar='K',
+                   help="Last temperature setpoint (K) on the grid. If omitted, "
+                        "parsed from the filename (e.g. '2to35K' → 35). "
+                        "--T-max still truncates the analysed range inclusively.")
+    p.add_argument('--T-round', type=float, default=None, metavar='K',
+                   help="Deprecated alias of --T-step.")
     p.add_argument('--min-points', type=int, default=30,
                    help="Minimum points required in a temperature segment "
                         "(default: 30).")
@@ -6018,6 +6329,7 @@ def _run_RT(args):
                     normalized=args.normalized,
                     label=label,
                     color=color,
+                    plot_points_line=getattr(args, "plot_points_line", False),
                 )
 
                 # ----------------------------------------------------
@@ -6192,6 +6504,7 @@ def _run_RT(args):
                 normalized=args.normalized,
                 label=label,
                 color=color,
+                plot_points_line=getattr(args, "plot_points_line", False),
             )
 
             # --------------------------------------------------------
@@ -6647,7 +6960,9 @@ def _run_IV_dVdI(args):
                 split_sweeps=getattr(args, 'split_sweeps', False),
                 ic_params=params,
                 show_ic_eff=getattr(args, 'ic_eff', False),
+                show_ic_lines=getattr(args, 'ic_lines', False),
                 include_phase=getattr(args, 'phase', False),
+                plot_points_line=getattr(args, 'plot_points_line', False),
             )
 
             if getattr(args, 'analyze', False) and params is not None:
@@ -6682,10 +6997,13 @@ def _run_IV_dVdI(args):
             filepath,
             channel_dV=args.channel_dV,
             channel_dI=args.channel_dI,
-            n_T_bins=args.n_T_bins,
-            n_I_bins=args.n_I_bins,
             T_max=T_max,
             di_sense_R=getattr(args, 'di_sense_R', 1e3),
+            T_step=getattr(args, 'T_step', None) or getattr(args, 'T_round', None),
+            T_initial=getattr(args, 'T_initial', None),
+            T_final=getattr(args, 'T_final', None),
+            points_per_sweep=getattr(args, 'points_per_sweep', 301),
+            phase_channel=getattr(args, 'phase_channel', 'theta2'),
         )
         if getattr(args, 'per_T_analysis', False):
             print("Running per-temperature single IV analysis...")
@@ -6694,7 +7012,9 @@ def _run_IV_dVdI(args):
                 channel_dV=args.channel_dV,
                 channel_dI=args.channel_dI,
                 T_max=T_max,
-                T_round=getattr(args, 'T_round', 0.5),
+                T_step=getattr(args, 'T_step', None) or getattr(args, 'T_round', None),
+                T_initial=getattr(args, 'T_initial', None),
+                T_final=getattr(args, 'T_final', None),
                 min_points=getattr(args, 'min_points', 30),
                 out_root=getattr(args, 'singles_dir', 'singles'),
                 figsize=tuple(args.figsize),
@@ -6714,6 +7034,8 @@ def _run_IV_dVdI(args):
                 phase_channel=getattr(args, 'phase_channel', 'theta2'),
                 di_sense_R=getattr(args, 'di_sense_R', 1e3),
                 points_per_sweep=getattr(args, 'points_per_sweep', 301),
+                plot_points_line=getattr(args, 'plot_points_line', False),
+                show_ic_lines=getattr(args, 'ic_lines', False),
             )
         return
 
