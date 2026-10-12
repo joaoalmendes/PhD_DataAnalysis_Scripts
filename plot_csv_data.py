@@ -40,6 +40,10 @@ from scipy.ndimage import median_filter
 from scipy.signal import find_peaks, savgol_filter
 from scipy.stats import linregress
 
+# Samples per sweep direction in the rack I(V) files (one temperature = one
+# forward + one backward sweep sharing the turnaround point -> 2N-1 rows).
+DEFAULT_POINTS_PER_SWEEP = 201
+
 # ==================================================================
 # Style / display helpers
 # (the only section that should contain rcParams, default colors,
@@ -673,7 +677,7 @@ def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
 
     draw_legend = legend if legend is not None else bool(label) or show_branches
     if draw_legend:
-        ax.legend()
+        ax.legend(loc="upper right")
 
     if created_fig:
         fig.tight_layout()
@@ -688,7 +692,7 @@ def plot_RT(data, ax=None, show_errorbars=False, show_branches=False,
 def _label_iv_branches(I, window=3, points_per_sweep=None):
     """Label each point as forward or backward.
 
-    Preferred mode (``points_per_sweep`` set, e.g. 301):
+    Preferred mode (``points_per_sweep`` set, e.g. 201):
         First ``points_per_sweep`` samples → "forward";
         the remainder → "backward".  This matches fixed-length
         instrument sweeps and avoids ΔI mis-labelling.
@@ -752,7 +756,7 @@ def _label_iv_branches(I, window=3, points_per_sweep=None):
 
 def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack",
                     current=None, phase_channel="theta2", di_sense_R=1e3,
-                    points_per_sweep=301):
+                    points_per_sweep=DEFAULT_POINTS_PER_SWEEP):
     """Extract I(V) and dV/dI data from rack CSV.
 
     The lock-in dI channel is recorded as a *voltage* (V) across a sense
@@ -1268,7 +1272,7 @@ def plot_2d_dvdi_map_from_single_file(
         filepath, channel_dV=2, channel_dI=1,
         clim_pct=(2, 98), T_max=None, di_sense_R=1e3,
         T_step=None, T_initial=None, T_final=None,
-        points_per_sweep=301, phase_channel="theta2",
+        points_per_sweep=DEFAULT_POINTS_PER_SWEEP, phase_channel="theta2",
         map_J=False, area_um2=None,
         ):
     """2D dV/dI intensity map from a multi-T rack IV file.
@@ -2522,14 +2526,16 @@ def plot_dRdT_RT(
     handles2, labels2 = ax_drdt.get_legend_handles_labels()
 
     if handles1 or handles2:
-        ax.legend(
+        # one combined legend on the twin axis (drawn above the dR/dT curve);
+        # drop the R(T)-only legend so the two do not overlap
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        ax_drdt.legend(
             handles1 + handles2,
             labels1 + labels2,
-            loc="center left",
-            bbox_to_anchor=(1.12, 0.5),
+            loc="upper right",
             frameon=False,
             fontsize=7,
-            borderaxespad=0.0,
         )
 
     return ax_drdt
@@ -4886,7 +4892,7 @@ def plot_RT_vs_T_linear(T, rho, rho_unit='Ohm', ax=None, figsize=None,
     ax.set_xlabel(r'$T$ (K)')
     ax.set_ylabel(ylab)
     ax.set_title(r'Longitudinal $R(T)$ / $\rho(T)$')
-    ax.legend()
+    ax.legend(loc="upper right")
     return ax
 
 
@@ -5228,10 +5234,74 @@ def _parse_iv_temp_grid_from_filename(filepath):
     return out
 
 
+def _check_grid_fit(n_total, n_pps, n_grid=None):
+    """Warn when the number of file rows does not fit the temperature grid.
+
+    One temperature uses stride = 2N-1 rows (forward + backward sharing the
+    turnaround point).  If the grid end (T_final) is known the file must hold
+    exactly n_grid · stride rows; otherwise the row count must at least be a
+    multiple of stride.  When a different points-per-sweep would make the file
+    fit exactly, that value is suggested.
+    """
+    stride = 2 * n_pps - 1
+    if n_grid is not None:
+        if n_total == n_grid * stride:
+            return True
+        msg = (f"file has {n_total} rows but the grid expects {n_grid} setpoints "
+               f"× {stride} rows = {n_grid * stride} (points_per_sweep={n_pps}).")
+        N_imp = (n_total / n_grid + 1.0) / 2.0
+        if N_imp > 1 and abs(N_imp - round(N_imp)) < 1e-9 and int(round(N_imp)) != n_pps:
+            msg += (f" The file fits the grid exactly with "
+                    f"--points-per-sweep {int(round(N_imp))}.")
+        else:
+            msg += (f" That is {n_total / stride:.2f} complete temperatures: either the "
+                    "measurement is incomplete or --T-initial/--T-final/--T-step/"
+                    "--points-per-sweep do not match the file.")
+    else:
+        if n_total % stride == 0:
+            return True
+        msg = (f"file has {n_total} rows, not a multiple of {stride} rows/T "
+               f"(points_per_sweep={n_pps}); last temperature is incomplete or "
+               "--points-per-sweep is wrong.")
+    print(f"  [segment] ⚠ WARNING: row count does not fit the grid: {msg}")
+    return False
+
+
+def _fmt_T_list(Ts, max_items=6):
+    items = [f"{t:g}" for t in Ts]
+    if len(items) <= max_items:
+        return ", ".join(items)
+    return ", ".join(items[:3]) + " … " + ", ".join(items[-2:]) + f"  ({len(items)} setpoints)"
+
+
+def _report_segment_issues(n_setpoints, n_usable, missing, fwd_only, dropped,
+                           off_grid, tol_T, n_pps):
+    """One clear per-temperature data-quality summary after segmentation."""
+    if n_usable == n_setpoints and not (fwd_only or dropped or off_grid):
+        print(f"  [segment] data check: all {n_setpoints} setpoints complete "
+              f"(F+B, Tsample within ±{tol_T:g} K of setpoint)")
+        return
+    print(f"  [segment] data check: {n_usable}/{n_setpoints} setpoints usable")
+    if missing:
+        print(f"    ⚠ no data (file ended before): {_fmt_T_list(missing)} K")
+    if fwd_only:
+        print(f"    ⚠ forward sweep only (backward incomplete): "
+              f"{_fmt_T_list(fwd_only)} K  → no Ir_eff, β_c, split-sweep plots")
+    if dropped:
+        print(f"    ⚠ dropped (too few points / no current range): "
+              f"{_fmt_T_list(dropped)} K")
+    if off_grid:
+        worst = max(off_grid, key=lambda x: abs(x[1]))
+        print(f"    ⚠ mean Tsample differs from the setpoint by > {tol_T:g} K in "
+              f"{len(off_grid)} segment(s) (worst: {worst[1]:+.2f} K at "
+              f"{worst[0]:g} K) → segments are probably misaligned; check "
+              f"--points-per-sweep (now {n_pps}), --T-initial and --T-step")
+
+
 def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
                        T_max=None, T_step=None, T_initial=None, T_final=None,
                        min_points=30, phase_channel="theta2", di_sense_R=1e3,
-                       points_per_sweep=301, T_round=None):
+                       points_per_sweep=DEFAULT_POINTS_PER_SWEEP, T_round=None):
     """Split a multi-T rack IV file into per-temperature F+B datasets.
 
     Data placement does **not** use measured Tsample rounding.  Instead:
@@ -5307,6 +5377,13 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
     df = df.copy().reset_index(drop=True)
     n_total = len(df)
     R_s = float(di_sense_R) if di_sense_R is not None else 1e3
+    stride = 2 * n_pps - 1
+    if T_final_f is not None:      # full grid of the measurement (before --T-max)
+        n_grid = int(np.floor((T_final_f - T_initial) / T_step + 1e-9)) + 1
+        _check_grid_fit(n_total, n_pps, n_grid)
+    else:
+        _check_grid_fit(n_total, n_pps)
+        setpoints = setpoints[:int(np.ceil(n_total / stride))]
 
     print(
         f"  [segment] T grid: {T_initial:g} → "
@@ -5349,19 +5426,14 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
     #   F = rows [i0, i0+N)
     #   B = rows [i0+N-1, i0+N-1+N)   # includes shared endpoint
     #   stride = 2N - 1
-    # Using stride 2N was stealing one point per T and shifting all later
-    # temperatures (missing +I on B, extra point on next T's −I side).
-    stride = 2 * n_pps - 1
     print(f"  [segment] shared turnaround: stride={stride} rows/T  "
           f"(F={n_pps}, B={n_pps}, 1 shared)")
+    tol_T = max(0.25 * T_step, 0.05)
+    missing, fwd_only, dropped, off_grid = [], [], [], []
     for k, T_set in enumerate(setpoints):
         i0 = k * stride
         if i0 >= n_total:
-            warnings.warn(
-                f"File ended before setpoint T={T_set:g} K "
-                f"(need row {i0}, have {n_total}).",
-                UserWarning, stacklevel=2,
-            )
+            missing = list(setpoints[k:])
             break
 
         i_f1 = min(i0 + n_pps, n_total)
@@ -5382,19 +5454,21 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
             sub = fwd
             branch = np.full(len(fwd), "forward", dtype=object)
             is_bf = False
-            warnings.warn(
-                f"T={T_set:g} K: incomplete backward sweep "
-                f"({len(bwd)} pts, expected {n_pps}).",
-                UserWarning, stacklevel=2,
-            )
+            fwd_only.append(T_set)
 
         packed = _pack(sub, branch, is_bf, T_set)
-        if packed is not None:
-            datasets.append(packed)
+        if packed is None:
+            dropped.append(T_set)
+            continue
+        dev = float(np.nanmean(packed["T"]) - T_set) if np.any(np.isfinite(packed["T"])) else np.nan
+        packed["T_dev_K"] = dev
+        if np.isfinite(dev) and abs(dev) > tol_T:
+            off_grid.append((T_set, dev))
+        datasets.append(packed)
 
+    _report_segment_issues(len(setpoints), len(datasets), missing, fwd_only,
+                           dropped, off_grid, tol_T, n_pps)
     return datasets
-
-
 
 
 def _pick_rn_reference_segment(datasets, tc_for_rn):
@@ -5418,7 +5492,16 @@ def _pick_rn_reference_segment(datasets, tc_for_rn):
         )
     # Prefer the highest T still <= Tc−2 (closest to the definition)
     candidates.sort(key=lambda x: -x[1])
-    return candidates[0]
+    i_best, T_best = candidates[0]
+    Ts_all = np.unique([float(d.get('T_mean', np.nan)) for d in datasets])
+    Ts_all = Ts_all[np.isfinite(Ts_all)]
+    dT = float(np.median(np.diff(Ts_all))) if len(Ts_all) >= 2 else 1.0
+    if target - T_best > 1.5 * dT:
+        print(f"  [Rn] ⚠ WARNING: no segment near Tc−2 = {target:g} K; using the "
+              f"nearest lower temperature {T_best:g} K ({target - T_best:.2f} K below). "
+              f"Data above {float(np.max(Ts_all)):g} K are missing or the segmentation "
+              f"is misaligned (see the [segment] data check).")
+    return i_best, T_best
 
 
 _IV_ADVANCED_KEYS = {
@@ -5507,7 +5590,7 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    split_sweeps=False, show_ic_eff=False,
                                    tc_for_rn=None, include_phase=False,
                                    phase_channel="theta2", di_sense_R=1e3,
-                                   points_per_sweep=301, plot_points_line=False,
+                                   points_per_sweep=DEFAULT_POINTS_PER_SWEEP, plot_points_line=False,
                                    show_ic_lines=False,
                                    ic_rho_frac=0.03, datasets=None):
     """Per-temperature IV diagnostics + parameter logs under ``singles/``.
@@ -5568,6 +5651,9 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
     all_params = []
     for i, data in enumerate(datasets):
         T_lab = data["T_label"]
+        if not data.get("is_bf", False):
+            print(f"    ⚠ T = {T_lab} K: forward sweep only (n_backward = "
+                  f"{data.get('n_backward', 0)}) — no Ir_eff, β_c or split-sweep plots")
         folder = os.path.join(out_root, f"{T_lab}K")
         os.makedirs(folder, exist_ok=True)
         base_name = os.path.join(folder, f"{T_lab}K")
@@ -5606,6 +5692,9 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             fh.write(f"T_mean      : {data['T_mean']:.4f} K\n")
             fh.write(f"n_points    : {len(data['I'])}\n")
             fh.write(f"is_bf       : {data.get('is_bf')}\n")
+            fh.write("data_status : " + ("complete (F+B)" if data.get('is_bf') else
+                     f"forward only, n_backward = {data.get('n_backward', 0)}") + "\n")
+            fh.write(f"T_dev (mean Tsample − setpoint) : {data.get('T_dev_K', float('nan')):+.3f} K\n")
             fh.write(f"I range (A) : {np.nanmin(data['I']):.6g} … "
                      f"{np.nanmax(data['I']):.6g}\n")
             fh.write("\n--- input parameters ---\n")
@@ -5686,9 +5775,9 @@ def _add_IV_dVdI_parser(subparsers):
                    help="Sense resistance (Ohm) for the dI LIA voltage channel. "
                         "Physical dI = V_LIA / R. Default: 1000 (1 kΩ). "
                         "dV/dI is reported in Ω.")
-    p.add_argument('--points-per-sweep', type=int, default=301, metavar='N',
+    p.add_argument('--points-per-sweep', type=int, default=DEFAULT_POINTS_PER_SWEEP, metavar='N',
                    help="Number of samples in the forward sweep; the rest of "
-                        "the segment is labelled backward. Default: 301. "
+                        f"the segment is labelled backward. Default: {DEFAULT_POINTS_PER_SWEEP}. "
                         "Set <=0 to fall back to ΔI-sign labelling.")
     p.add_argument('--plot-points-line', action='store_true',
                    help="Plot data as half-size circles connected by lines "
@@ -6034,7 +6123,7 @@ def _run_RT(args):
                     ),
                 )
 
-        ax.legend()
+        ax.legend(loc="upper right")
 
     # ================================================================
     # dR/dT on main panel
@@ -6179,6 +6268,7 @@ def _run_RT(args):
                             f"{ds['label']} linear fit"
                         ),
                     )
+            zoom_ax.legend(loc="upper right")   # refresh: include the fit labels
 
         # ------------------------------------------------------------
         # dR/dT on zoom
@@ -6401,7 +6491,7 @@ def _run_IV_dVdI(args):
                 csv_file, channel_dV=args.channel_dV, channel_dI=args.channel_dI,
                 phase_channel=getattr(args, 'phase_channel', 'theta2'),
                 di_sense_R=getattr(args, 'di_sense_R', 1e3),
-                points_per_sweep=getattr(args, 'points_per_sweep', 301),
+                points_per_sweep=getattr(args, 'points_per_sweep', DEFAULT_POINTS_PER_SWEEP),
             )
             base = os.path.splitext(os.path.basename(csv_file))[0]
             # Analyse first if requested / needed for split Ic lines
@@ -6469,7 +6559,7 @@ def _run_IV_dVdI(args):
             T_step=getattr(args, 'T_step', None) or getattr(args, 'T_round', None),
             T_initial=getattr(args, 'T_initial', None),
             T_final=getattr(args, 'T_final', None),
-            points_per_sweep=getattr(args, 'points_per_sweep', 301),
+            points_per_sweep=getattr(args, 'points_per_sweep', DEFAULT_POINTS_PER_SWEEP),
             phase_channel=getattr(args, 'phase_channel', 'theta2'),
             map_J=getattr(args, 'map_J', False),
             area_um2=getattr(args, 'area', None),
@@ -6502,7 +6592,7 @@ def _run_IV_dVdI(args):
                 include_phase=getattr(args, 'phase', False),
                 phase_channel=getattr(args, 'phase_channel', 'theta2'),
                 di_sense_R=getattr(args, 'di_sense_R', 1e3),
-                points_per_sweep=getattr(args, 'points_per_sweep', 301),
+                points_per_sweep=getattr(args, 'points_per_sweep', DEFAULT_POINTS_PER_SWEEP),
                 plot_points_line=getattr(args, 'plot_points_line', False),
                 show_ic_lines=getattr(args, 'ic_lines', False),
                 ic_rho_frac=getattr(args, 'ic_rho_frac', 0.03),
