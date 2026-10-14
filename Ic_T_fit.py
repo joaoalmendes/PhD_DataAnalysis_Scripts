@@ -89,7 +89,7 @@ import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, brentq
 
 # ----------------------------------------------------------------------
 # Physical constants (SI)
@@ -824,8 +824,30 @@ def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
             ta, ia = anchor
             da = bcs_gap_dwave(np.array([ta]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
             y0 = ia - float(_ab_core_mA(da, Tc, Rn_Ohm, eta)[0])
+        # For fits after the highest-temperature segment, report the zero-
+        # current temperature of that segment's shifted AB branch. This is
+        # the root of y0 + AB(T) = 0 on the AB branch T in [Tm, Tc].
+        # It may not exist in that interval; in that case report None.
+        Tc_expected = None
+        if i > 0:
+            def _ab_zero_function(temp):
+                delta_temp = bcs_gap_dwave(
+                    np.array([temp]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
+                return float(y0 + _ab_core_mA(delta_temp, Tc, Rn_Ohm, eta)[0])
+
+            t_left = float(np.clip(Tm, 0.0, Tc))
+            f_left = _ab_zero_function(t_left)
+            f_right = _ab_zero_function(float(Tc))
+            if abs(f_right) < 1e-12:
+                Tc_expected = float(Tc)
+            elif f_left == 0.0:
+                Tc_expected = t_left
+            elif f_left * f_right < 0.0:
+                Tc_expected = float(brentq(_ab_zero_function, t_left, float(Tc)))
+
         popt = {"Delta0_meV": Delta0, "eta": eta, "dCel": dCel,
                 "Tm": Tm, "k": k, "y0": y0, "a0_mA": fit["a0_mA"], "Tc": float(Tc),
+                "Tc_expected": Tc_expected,
                 "model": "d-wave", "piecewise": True, "segment": i + 1,
                 "splits": boundaries}
         results.append({"popt": popt, "pcov": fit["pcov"],
@@ -1311,6 +1333,11 @@ Argument summary
                 print(f"  Tm                        = {p['Tm']:.4f}"
                       + (f" +/- {em['Tm']:.4f}" if "Tm" in em else "")
                       + " K")
+            if i > 1:
+                if p.get("Tc_expected") is None:
+                    print("  Tc_expected               = no zero crossing on AB branch")
+                else:
+                    print(f"  Tc_expected               = {p['Tc_expected']:.4f} K")
             if p.get("k") is not None:
                 k_uA = p["k"] * 1e3
                 k_err = em["k"] * 1e3 if "k" in em else None
