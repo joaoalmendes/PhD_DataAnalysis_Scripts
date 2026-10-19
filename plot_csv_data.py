@@ -1273,7 +1273,7 @@ def plot_2d_dvdi_map_from_single_file(
         clim_pct=(2, 98), T_max=None, di_sense_R=1e3,
         T_step=None, T_initial=None, T_final=None,
         points_per_sweep=DEFAULT_POINTS_PER_SWEEP, phase_channel="theta2",
-        map_J=False, area_um2=None,
+        map_J=False, area_um2=None, iv_bf=False,
         ):
     """2D dV/dI intensity map from a multi-T rack IV file.
 
@@ -1291,7 +1291,7 @@ def plot_2d_dvdi_map_from_single_file(
         filepath, channel_dV=channel_dV, channel_dI=channel_dI,
         T_max=T_max, T_step=T_step, T_initial=T_initial, T_final=T_final,
         points_per_sweep=points_per_sweep, phase_channel=phase_channel,
-        di_sense_R=di_sense_R, min_points=3,
+        di_sense_R=di_sense_R, min_points=3, iv_bf=iv_bf,
     )
     if not datasets:
         print("  No temperature segments — map not produced.")
@@ -1591,7 +1591,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
                          figsize=None, ic_I_min=None, ic_I_max=None,
                          rn_override_mOhm=None, rn_from_T_K=None,
                          advanced_outdir=None, advanced_quiet=False,
-                         ic_rho_frac=0.03, rho_k_noise=3.0, rho_smooth=5,
+                         ic_rho_frac=0.03, rho_k_noise=3.0, rho_smooth=1,
                          rho_persist=3, rho_imin_frac=0.02):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data.
  
@@ -5234,7 +5234,7 @@ def _parse_iv_temp_grid_from_filename(filepath):
     return out
 
 
-def _check_grid_fit(n_total, n_pps, n_grid=None):
+def _check_grid_fit(n_total, n_pps, n_grid=None, iv_bf=True):
     """Warn when the number of file rows does not fit the temperature grid.
 
     One temperature uses stride = 2N-1 rows (forward + backward sharing the
@@ -5243,13 +5243,13 @@ def _check_grid_fit(n_total, n_pps, n_grid=None):
     multiple of stride.  When a different points-per-sweep would make the file
     fit exactly, that value is suggested.
     """
-    stride = 2 * n_pps - 1
+    stride = (2 * n_pps - 1) if iv_bf else n_pps
     if n_grid is not None:
         if n_total == n_grid * stride:
             return True
         msg = (f"file has {n_total} rows but the grid expects {n_grid} setpoints "
                f"× {stride} rows = {n_grid * stride} (points_per_sweep={n_pps}).")
-        N_imp = (n_total / n_grid + 1.0) / 2.0
+        N_imp = (n_total / n_grid + 1.0) / 2.0 if iv_bf else n_total / n_grid
         if N_imp > 1 and abs(N_imp - round(N_imp)) < 1e-9 and int(round(N_imp)) != n_pps:
             msg += (f" The file fits the grid exactly with "
                     f"--points-per-sweep {int(round(N_imp))}.")
@@ -5301,7 +5301,7 @@ def _report_segment_issues(n_setpoints, n_usable, missing, fwd_only, dropped,
 def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
                        T_max=None, T_step=None, T_initial=None, T_final=None,
                        min_points=30, phase_channel="theta2", di_sense_R=1e3,
-                       points_per_sweep=DEFAULT_POINTS_PER_SWEEP, T_round=None):
+                       points_per_sweep=DEFAULT_POINTS_PER_SWEEP, T_round=None, iv_bf=False):
     """Split a multi-T rack IV file into per-temperature F+B datasets.
 
     Data placement does **not** use measured Tsample rounding.  Instead:
@@ -5377,12 +5377,12 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
     df = df.copy().reset_index(drop=True)
     n_total = len(df)
     R_s = float(di_sense_R) if di_sense_R is not None else 1e3
-    stride = 2 * n_pps - 1
+    stride = (2 * n_pps - 1) if iv_bf else n_pps
     if T_final_f is not None:      # full grid of the measurement (before --T-max)
         n_grid = int(np.floor((T_final_f - T_initial) / T_step + 1e-9)) + 1
-        _check_grid_fit(n_total, n_pps, n_grid)
+        _check_grid_fit(n_total, n_pps, n_grid, iv_bf)
     else:
-        _check_grid_fit(n_total, n_pps)
+        _check_grid_fit(n_total, n_pps, None, iv_bf)
         setpoints = setpoints[:int(np.ceil(n_total / stride))]
 
     print(
@@ -5426,8 +5426,11 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
     #   F = rows [i0, i0+N)
     #   B = rows [i0+N-1, i0+N-1+N)   # includes shared endpoint
     #   stride = 2N - 1
-    print(f"  [segment] shared turnaround: stride={stride} rows/T  "
-          f"(F={n_pps}, B={n_pps}, 1 shared)")
+    if iv_bf:
+        print(f"  [segment] IV-BF: shared turnaround, stride={stride} rows/T  "
+              f"(F={n_pps}, B={n_pps}, 1 shared)")
+    else:
+        print(f"  [segment] forward-only IV: stride={stride} rows/T")
     tol_T = max(0.25 * T_step, 0.05)
     missing, fwd_only, dropped, off_grid = [], [], [], []
     for k, T_set in enumerate(setpoints):
@@ -5440,9 +5443,10 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
         i_b0 = i_f1 - 1 if i_f1 > i0 else i_f1   # shared last-F / first-B
         i_b1 = min(i_b0 + n_pps, n_total)
         fwd = df.iloc[i0:i_f1]
-        bwd = df.iloc[i_b0:i_b1] if i_b0 < n_total else df.iloc[0:0]
+        bwd = (df.iloc[i_b0:i_b1] if (iv_bf and i_b0 < n_total)
+               else df.iloc[0:0])
 
-        if len(bwd) >= max(min_points, n_pps // 2):
+        if iv_bf and len(bwd) >= max(min_points, n_pps // 2):
             # concat keeps the shared row in both branches (duplicate index ok)
             sub = pd.concat([fwd, bwd], axis=0)
             branch = np.array(
@@ -5454,7 +5458,8 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
             sub = fwd
             branch = np.full(len(fwd), "forward", dtype=object)
             is_bf = False
-            fwd_only.append(T_set)
+            if iv_bf:
+                fwd_only.append(T_set)
 
         packed = _pack(sub, branch, is_bf, T_set)
         if packed is None:
@@ -5496,7 +5501,7 @@ def _pick_rn_reference_segment(datasets, tc_for_rn):
     Ts_all = np.unique([float(d.get('T_mean', np.nan)) for d in datasets])
     Ts_all = Ts_all[np.isfinite(Ts_all)]
     dT = float(np.median(np.diff(Ts_all))) if len(Ts_all) >= 2 else 1.0
-    if target - T_best > 1.5 * dT:
+    if "T_setpoint" in datasets[i_best] and target - T_best > 1.5 * dT:
         print(f"  [Rn] ⚠ WARNING: no segment near Tc−2 = {target:g} K; using the "
               f"nearest lower temperature {T_best:g} K ({target - T_best:.2f} K below). "
               f"Data above {float(np.max(Ts_all)):g} K are missing or the segmentation "
@@ -5592,7 +5597,9 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    phase_channel="theta2", di_sense_R=1e3,
                                    points_per_sweep=DEFAULT_POINTS_PER_SWEEP, plot_points_line=False,
                                    show_ic_lines=False,
-                                   ic_rho_frac=0.03, datasets=None):
+                                   ic_rho_frac=0.03, datasets=None,
+                                   label_key="T_label", label_suffix="K",
+                                   extra_log=None, iv_bf=False):
     """Per-temperature IV diagnostics + parameter logs under ``singles/``.
 
     Layout
@@ -5612,7 +5619,7 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             T_max=T_max, T_step=T_step, T_initial=T_initial, T_final=T_final,
             min_points=min_points,
             phase_channel=phase_channel, di_sense_R=di_sense_R,
-            points_per_sweep=points_per_sweep,
+            points_per_sweep=points_per_sweep, iv_bf=iv_bf,
         )
     else:  # reuse the map segmentation (it used min_points=3)
         datasets = [d for d in datasets if len(d["I"]) >= min_points]
@@ -5650,13 +5657,13 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
 
     all_params = []
     for i, data in enumerate(datasets):
-        T_lab = data["T_label"]
-        if not data.get("is_bf", False):
+        T_lab = data[label_key]
+        if iv_bf and not data.get("is_bf", False):
             print(f"    ⚠ T = {T_lab} K: forward sweep only (n_backward = "
                   f"{data.get('n_backward', 0)}) — no Ir_eff, β_c or split-sweep plots")
-        folder = os.path.join(out_root, f"{T_lab}K")
+        folder = os.path.join(out_root, f"{T_lab}{label_suffix}")
         os.makedirs(folder, exist_ok=True)
-        base_name = os.path.join(folder, f"{T_lab}K")
+        base_name = os.path.join(folder, f"{T_lab}{label_suffix}")
 
         params = {}
         if do_analyze:
@@ -5688,8 +5695,10 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             fh.write("IV single-T analysis (from multi-T map file)\n")
             fh.write(f"{'='*60}\n")
             fh.write(f"source_file : {os.path.abspath(filepath)}\n")
-            fh.write(f"T_label     : {T_lab} K\n")
+            fh.write(f"{label_key:12s}: {T_lab}{' K' if label_suffix == 'K' else ''}\n")
             fh.write(f"T_mean      : {data['T_mean']:.4f} K\n")
+            if extra_log is not None:
+                extra_log(fh, data)
             fh.write(f"n_points    : {len(data['I'])}\n")
             fh.write(f"is_bf       : {data.get('is_bf')}\n")
             fh.write("data_status : " + ("complete (F+B)" if data.get('is_bf') else
@@ -5722,9 +5731,459 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             if advanced and params.get("didv_plot"):
                 fh.write(f"dI/dV gap plot : {params['didv_plot']}\n")
 
-        print(f"    T = {T_lab} K  →  {folder}/")
+        print(f"    {label_key.split('_')[0]} = {T_lab}{label_suffix}  →  {folder}/")
 
     return all_params
+
+
+# ==================================================================
+# Fraunhofer pattern: multi-H IV files  (IV mode, --multi-h-file)
+#
+# File layout assumed (same convention as the multi-T files):
+#   * one IV loop per field value, 2N-1 rows with a shared turnaround
+#     (N = --points-per-sweep): current forward (N rows) + backward (N rows)
+#   * H is stepped from H0 to H1 in steps of --H-step.  With --BF the
+#     file continues with the backward H sweep H1 -> H0 (same H values,
+#     reversed order, H1 measured again).
+# The "Hsample" channel is NOT used as the field value when --H-range is
+# given (too noisy); it is only used to estimate the field error/noise.
+# ==================================================================
+
+_OE_TO_MT = 0.1  # 1 Oe = 1e-4 T = 0.1 mT (same convention as the Hall code)
+
+
+def _edges_from_centers(c, fallback_width=1.0):
+    """Cell edges for pcolormesh from sorted cell centres."""
+    c = np.asarray(c, dtype=float)
+    if len(c) == 1:
+        w = float(fallback_width) if fallback_width and fallback_width > 0 else 1.0
+        return np.array([c[0] - 0.5 * w, c[0] + 0.5 * w])
+    mid = 0.5 * (c[:-1] + c[1:])
+    return np.concatenate([[c[0] - (mid[0] - c[0])], mid,
+                           [c[-1] + (c[-1] - mid[-1])]])
+
+
+def _detect_H_turnaround(H_means, min_frac=0.25):
+    """Index of the last forward segment if the H trend reverses, else None."""
+    H = np.asarray(H_means, dtype=float)
+    n = len(H)
+    if n < 6 or not np.any(np.isfinite(H)):
+        return None
+    k = max(2, n // 5)
+    s = np.sign(np.nanmedian(np.diff(H[:k + 1])))
+    if s == 0 or not np.isfinite(s):
+        return None
+    i = int(np.nanargmax(s * H))
+    span = s * (H[i] - H[0])
+    drop = s * (H[i] - H[-1])
+    if i < n - 1 and span > 0 and drop > min_frac * span:
+        return i
+    return None
+
+
+def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
+                       H_range=None, H_max=None, BF=False, min_points=30,
+                       phase_channel="theta2", di_sense_R=1e3,
+                       points_per_sweep=DEFAULT_POINTS_PER_SWEEP, iv_bf=False):
+    """Split a multi-H rack IV file into one F+B (current) dataset per field.
+
+    Returns a list of dicts compatible with ``compute_iv_parameters`` /
+    ``plot_iv_diagnostics`` plus the H bookkeeping keys:
+        H_x_Oe        field used for plotting (nominal if --H-range else mean Hsample)
+        H_nominal_Oe  intended field (NaN without --H-range)
+        H_mean_Oe, H_std_Oe, H_sem_Oe, H_dev_Oe (mean - nominal),
+        H_min_Oe, H_max_Oe, n_H_pts, H_branch ('fwd'/'bwd'), H_label, seg_index
+    """
+    n_pps = int(points_per_sweep) if points_per_sweep is not None else 0
+    if n_pps <= 0:
+        raise ValueError("points_per_sweep must be > 0 for multi-H segmentation.")
+    if H_range is not None:
+        if len(H_range) != 2:
+            raise ValueError("--H-range takes exactly two values (Oe).")
+        if H_step is None or float(H_step) <= 0:
+            raise ValueError("--H-range requires --H-step > 0 (Oe).")
+    stride = (2 * n_pps - 1) if iv_bf else n_pps
+
+    df = _load_csv_rack(filepath, mode="iv", channel_dV=channel_dV,
+                        channel_dI=channel_dI, phase_channel=phase_channel)
+    df = df.copy().reset_index(drop=True)
+    H_raw = pd.read_csv(filepath, usecols=["Hsample"])["Hsample"].to_numpy(dtype=float)
+    n_total = len(df)
+    if len(H_raw) != n_total:
+        raise ValueError("Row count mismatch between IV columns and Hsample.")
+    n_seg = n_total // stride
+    if n_seg == 0:
+        raise ValueError(f"File has {n_total} rows; need at least {stride} "
+                         f"for one IV loop (iv_bf={iv_bf}).")
+    leftover = n_total - n_seg * stride
+    R_s = float(di_sense_R) if di_sense_R else 1e3
+
+    print(f"  [segment-H] file_rows={n_total}  N_sweep={n_pps}  "
+          f"IV-BF={iv_bf}  stride={stride}  -> {n_seg} IV loop(s)"
+          + (f"  ({leftover} leftover rows ignored)" if leftover else ""))
+
+    H_mean_all = np.array([np.nanmean(H_raw[k * stride:(k + 1) * stride])
+                           for k in range(n_seg)])
+    H_nom = np.full(n_seg, np.nan)
+    hbranch = np.full(n_seg, "ign", dtype=object)
+
+    if H_range is not None:
+        H0, H1 = float(H_range[0]), float(H_range[1])
+        step = float(H_step)
+        n_H = int(round(abs(H1 - H0) / step)) + 1
+        sgn = 1.0 if H1 >= H0 else -1.0
+        fwd_vals = H0 + sgn * step * np.arange(n_H)
+        if abs(fwd_vals[-1] - H1) > 0.01 * step:
+            print(f"  [segment-H] WARNING: (H1-H0) = {H1 - H0:g} Oe is not a "
+                  f"multiple of H-step={step:g}; last nominal point = "
+                  f"{fwd_vals[-1]:g} Oe")
+        n_f = min(n_seg, n_H)
+        n_b = max(0, min(n_seg - n_H, n_H))
+        hbranch[:n_f] = "fwd"
+        H_nom[:n_f] = fwd_vals[:n_f]
+        if n_b:
+            hbranch[n_H:n_H + n_b] = "bwd"
+            H_nom[n_H:n_H + n_b] = fwd_vals[::-1][:n_b]
+        n_extra = n_seg - n_H - n_b
+        print(f"  [segment-H] H-range {H0:g} -> {H1:g} Oe, step {step:g} Oe "
+              f"-> {n_H} points per sweep")
+        if n_f < n_H:
+            print(f"  [segment-H] WARNING: forward sweep incomplete "
+                  f"({n_f}/{n_H} loops in file).")
+        if n_extra > 0:
+            print(f"  [segment-H] WARNING: {n_extra} extra loop(s) beyond "
+                  f"2 x {n_H} ignored.")
+    else:
+        i_turn = _detect_H_turnaround(H_mean_all)
+        if i_turn is not None:
+            hbranch[:i_turn + 1] = "fwd"
+            hbranch[i_turn + 1:] = "bwd"
+        elif BF:
+            half = n_seg // 2
+            hbranch[:half] = "fwd"
+            hbranch[half:] = "bwd"
+            print("  [segment-H] WARNING: no H turnaround detected in "
+                  "Hsample; --BF splits the file in two equal halves.")
+        else:
+            hbranch[:] = "fwd"
+
+    has_bwd = bool(np.any(hbranch == "bwd"))
+    n_bwd = int(np.sum(hbranch == "bwd"))
+    if has_bwd and not BF:
+        print(f"  [segment-H] NOTE: a backward H-sweep measurement exists in "
+              f"this file ({n_bwd} IV loops). Only the forward H sweep is "
+              f"analysed/plotted; use --BF to include the backward sweep.")
+    if BF and not has_bwd:
+        print("  [segment-H] WARNING: --BF set but no backward H sweep was "
+              "found in the file.")
+
+    datasets = []
+    n_skip_hmax = 0
+    for k in range(n_seg):
+        b = hbranch[k]
+        if b == "ign" or (b == "bwd" and not BF):
+            continue
+        i0 = k * stride
+        Hs = H_raw[i0:i0 + stride]
+        Hs_f = Hs[np.isfinite(Hs)]
+        H_mean = float(np.mean(Hs_f)) if len(Hs_f) else np.nan
+        H_std = float(np.std(Hs_f, ddof=1)) if len(Hs_f) > 1 else np.nan
+        H_sem = H_std / np.sqrt(len(Hs_f)) if np.isfinite(H_std) else np.nan
+        H_nominal = float(H_nom[k])
+        H_x = H_nominal if H_range is not None else H_mean
+        if not np.isfinite(H_x):
+            continue
+        if H_max is not None and abs(H_x) > float(H_max) + 1e-9:
+            n_skip_hmax += 1
+            continue
+
+        fwd = df.iloc[i0:i0 + n_pps]
+        bwd = (df.iloc[i0 + n_pps - 1:i0 + stride] if iv_bf
+               else df.iloc[0:0])
+        if iv_bf and len(bwd) >= max(min_points, n_pps // 2):
+            sub = pd.concat([fwd, bwd], axis=0)
+            branch = np.array(["forward"] * len(fwd) + ["backward"] * len(bwd),
+                              dtype=object)
+            is_bf = True
+        else:
+            sub = fwd
+            branch = np.full(len(fwd), "forward", dtype=object)
+            is_bf = False
+
+        I = sub["Current (A)"].to_numpy(dtype=float)
+        if len(I) < min_points or (np.nanmax(I) - np.nanmin(I) < 1e-9):
+            continue
+        V = sub["Voltage (V)"].to_numpy(dtype=float)
+        dV = sub["dV"].to_numpy(dtype=float)
+        dI_V = sub["dI"].to_numpy(dtype=float)
+        T = sub["Tsample"].to_numpy(dtype=float)
+        phase = (sub["phase"].to_numpy(dtype=float) if "phase" in sub.columns
+                 else np.full(len(I), np.nan))
+        dI = dI_V / R_s
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dVdI = np.where(np.abs(dI) > 1e-15, dV / dI, np.nan)
+        T_mean = float(np.nanmean(T))
+        lab = f"H{H_x:+.1f}Oe"
+        if BF:
+            lab += "_Hfwd" if b == "fwd" else "_Hbwd"
+        datasets.append({
+            "I": I, "V": V, "dV": dV, "dI": dI, "dI_V": dI_V, "dVdI": dVdI,
+            "T": T, "phase": phase, "phase_channel": phase_channel,
+            "di_sense_R": R_s, "branch": branch, "source": "rack",
+            "is_bf": is_bf,
+            "T_mean": T_mean, "T_label": f"{T_mean:.1f}",
+            "n_forward": int(np.sum(branch == "forward")),
+            "n_backward": int(np.sum(branch == "backward")),
+            # --- H bookkeeping ---
+            "H_x_Oe": float(H_x), "H_nominal_Oe": H_nominal,
+            "H_mean_Oe": H_mean, "H_std_Oe": H_std, "H_sem_Oe": H_sem,
+            "H_dev_Oe": (H_mean - H_nominal) if np.isfinite(H_nominal) else np.nan,
+            "H_min_Oe": float(np.min(Hs_f)) if len(Hs_f) else np.nan,
+            "H_max_Oe": float(np.max(Hs_f)) if len(Hs_f) else np.nan,
+            "n_H_pts": int(len(Hs_f)),
+            "H_branch": str(b), "H_label": lab, "seg_index": k,
+            "H_from_range": H_range is not None,
+        })
+
+    if n_skip_hmax:
+        print(f"  [segment-H] --H-max={H_max:g} Oe: skipped {n_skip_hmax} loop(s)")
+    print(f"  [segment-H] {len(datasets)} IV loop(s) kept "
+          f"(forward: {sum(d['H_branch'] == 'fwd' for d in datasets)}, "
+          f"backward: {sum(d['H_branch'] == 'bwd' for d in datasets)})")
+    return datasets
+
+
+def _format_H_noise_report(datasets):
+    """Human-readable summary of the Hsample noise (terminal / general analysis)."""
+    lines = ["  [H-noise] estimated from the 'Hsample' channel "
+             "(all points of each IV loop):"]
+    for br, name in (("fwd", "forward"), ("bwd", "backward")):
+        sub = [d for d in datasets if d["H_branch"] == br]
+        if not sub:
+            continue
+        std = np.array([d["H_std_Oe"] for d in sub], dtype=float)
+        dev = np.array([d["H_dev_Oe"] for d in sub], dtype=float)
+        ptp = np.array([d["H_max_Oe"] - d["H_min_Oe"] for d in sub], dtype=float)
+        lines.append(f"    {name} sweep ({len(sub)} loops)")
+        lines.append(f"      within-loop std : mean {np.nanmean(std):.3g} Oe, "
+                     f"max {np.nanmax(std):.3g} Oe  "
+                     f"({np.nanmean(std) * _OE_TO_MT:.3g} mT mean)")
+        lines.append(f"      within-loop p-p : mean {np.nanmean(ptp):.3g} Oe, "
+                     f"max {np.nanmax(ptp):.3g} Oe")
+        if np.any(np.isfinite(dev)):
+            lines.append(f"      <Hsample> - H_nominal : mean {np.nanmean(dev):.3g} Oe, "
+                         f"rms {np.sqrt(np.nanmean(dev ** 2)):.3g} Oe, "
+                         f"max |.| {np.nanmax(np.abs(dev)):.3g} Oe")
+    return "\n".join(lines)
+
+
+def _write_H_log_block(fh, d):
+    """Extra block for analysis.log of every single-H IV analysis."""
+    fh.write("\n--- H-field info (multi-H file) ---\n")
+    fh.write(f"H_branch        : {d['H_branch']}  (field sweep direction)\n")
+    src = ("nominal from --H-range/--H-step" if d.get("H_from_range")
+           else "mean of Hsample")
+    fh.write(f"H_used          : {d['H_x_Oe']:.4f} Oe = "
+             f"{d['H_x_Oe'] * _OE_TO_MT:.4f} mT  ({src})\n")
+    if np.isfinite(d["H_nominal_Oe"]):
+        fh.write(f"H_nominal       : {d['H_nominal_Oe']:.4f} Oe\n")
+    fh.write(f"Hsample_mean    : {d['H_mean_Oe']:.4f} Oe\n")
+    fh.write(f"Hsample_std     : {d['H_std_Oe']:.4g} Oe  "
+             f"({d['H_std_Oe'] * _OE_TO_MT:.4g} mT)  [field noise within loop]\n")
+    fh.write(f"Hsample_sem     : {d['H_sem_Oe']:.4g} Oe  (std/sqrt(n))\n")
+    fh.write(f"Hsample_min/max : {d['H_min_Oe']:.4f} / {d['H_max_Oe']:.4f} Oe\n")
+    if np.isfinite(d["H_dev_Oe"]):
+        fh.write(f"Hsample-H_nom   : {d['H_dev_Oe']:.4g} Oe  [offset of measured vs intended field]\n")
+    fh.write(f"n_Hsample_pts   : {d['n_H_pts']}\n")
+
+
+def plot_Fraunhofer_dvdi_map(datasets, output, BF=False, full_I=False,
+                             figsize=(8.6, 6.0), clim_pct=(2, 98),
+                             params_list=None, show_ic_eff=False,
+                             H_step=None):
+    """Intensity map: x = mu0 H (mT), y = current (uA), colour = dV/dI (Ohm).
+
+    For each field the *forward current sweep* is used (one value per I).
+    Only I > 0 is drawn unless ``full_I``.  With ``BF`` two stacked panels
+    (forward H sweep on top, backward H sweep below) share the x axis and
+    the colour scale.
+    """
+    set_paper_style()
+    branches = ["fwd", "bwd"] if BF else ["fwd"]
+    cols = {}
+    for b in branches:
+        idx = [i for i, d in enumerate(datasets) if d["H_branch"] == b]
+        if idx:
+            cols[b] = idx
+    if not cols:
+        print("  [map-H] no data to plot.")
+        return
+
+    def _get_IZ(d):
+        m = (np.asarray(d["branch"]) == "forward")
+        I = np.asarray(d["I"], dtype=float)[m] * 1e6          # uA
+        Z = np.asarray(d["dVdI"], dtype=float)[m]             # Ohm
+        keep = np.isfinite(I) & np.isfinite(Z)
+        if not full_I:
+            keep &= I > 0
+        return I[keep], Z[keep]
+
+    used = [i for idx in cols.values() for i in idx]
+    I_all, Z_all = [], []
+    for i in used:
+        I, Z = _get_IZ(datasets[i])
+        I_all.append(I)
+        Z_all.append(Z)
+    I_ref = max(I_all, key=len)
+    I_ref = np.unique(np.round(I_ref, 6))
+    if len(I_ref) < 2:
+        print("  [map-H] fewer than 2 current points - map not produced.")
+        return
+    I_edges = _edges_from_centers(I_ref)
+    Zc = np.concatenate(Z_all)
+    vmin, vmax = np.nanpercentile(Zc, list(clim_pct))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = float(np.nanmin(Zc)), float(np.nanmax(Zc))
+    print(f"  [map-H] {Zc.size:,} points; dV/dI colour range "
+          f"({clim_pct[0]}-{clim_pct[1]}th pct): {vmin:.3f} - {vmax:.3f} Ohm")
+
+    nrow = len(cols)
+    w, h = figsize[0] / 2.54, figsize[1] / 2.54
+    fig, axes = plt.subplots(nrow, 1, sharex=True, constrained_layout=True,
+                             figsize=(w, h * (1.0 if nrow == 1 else 1.6)))
+    axes = np.atleast_1d(axes)
+    cmap = plt.get_cmap("viridis")
+    x_lo, x_hi = np.inf, -np.inf
+    im = None
+    fallback_w = (float(H_step) * _OE_TO_MT) if H_step else 1.0
+
+    for ax, (b, idx) in zip(axes, cols.items()):
+        x = np.array([datasets[i]["H_x_Oe"] for i in idx]) * _OE_TO_MT   # mT
+        order = np.argsort(x)
+        idx = [idx[o] for o in order]
+        x = x[order]
+        grid = np.full((len(I_ref), len(idx)), np.nan)
+        for j, i in enumerate(idx):
+            I, Z = _get_IZ(datasets[i])
+            if len(I) == 0:
+                continue
+            ii = np.digitize(I, I_edges) - 1
+            ok = (ii >= 0) & (ii < len(I_ref))
+            grid[ii[ok], j] = Z[ok]
+        H_edges = _edges_from_centers(x, fallback_w)
+        im = ax.pcolormesh(H_edges, I_edges, np.ma.masked_invalid(grid),
+                           cmap=cmap, vmin=vmin, vmax=vmax,
+                           shading="flat", rasterized=True)
+        x_lo, x_hi = min(x_lo, H_edges[0]), max(x_hi, H_edges[-1])
+        ax.set_ylabel(r"Current ($\mu$A)")
+        ax.set_ylim(I_edges[0], I_edges[-1])
+        ax.margins(0)
+        if BF:
+            ax.text(0.02, 0.96, "H forward" if b == "fwd" else "H backward",
+                    transform=ax.transAxes, va="top", ha="left",
+                    fontsize=7, color="w")
+
+        if show_ic_eff and params_list is not None:
+            xs, ics, irs = [], [], []
+            for j, i in enumerate(idx):
+                p = params_list[i] if i < len(params_list) else {}
+                xs.append(x[j])
+                ics.append(p.get("Ic_eff+_f_mA", np.nan) * 1e3)
+                irs.append(p.get("Ir_eff+_b_mA", np.nan) * 1e3)
+            xs, ics, irs = map(np.asarray, (xs, ics, irs))
+            mi = np.isfinite(ics)
+            mr = np.isfinite(irs)
+            if np.any(mi):
+                ax.plot(xs[mi], ics[mi], "o-", color="orange", ms=1.5, lw=0.6,
+                        label=r"$I_{c,\mathrm{eff}}$")
+            if np.any(mr):
+                ax.plot(xs[mr], irs[mr], "o-", color="darkblue", ms=1.5, lw=0.6,
+                        label=r"$I_{r,\mathrm{eff}}$")
+            if np.any(mi) or np.any(mr):
+                ax.legend(loc="upper right", fontsize=6, frameon=False)
+
+    axes[-1].set_xlabel(r"$\mu_0 H$ (mT)")
+    axes[-1].set_xlim(x_lo, x_hi)
+    fig.colorbar(im, ax=list(axes), label=r"dV/dI ($\Omega$)")
+    fig.savefig(output, dpi=300)
+    plt.close(fig)
+    print(f"Saved: {output}")
+
+
+def _run_multi_h_file(args):
+    """Driver for ``IV --multi-h-file``."""
+    set_paper_style()
+    filepath = args.multi_h_file
+    H_range = tuple(args.H_range) if getattr(args, "H_range", None) else None
+    H_step = getattr(args, "H_step", None)
+    H_max = getattr(args, "H_max", None)
+    BF = bool(getattr(args, "BF", False))
+    full_I = bool(getattr(args, "full_I", False))
+    pps = getattr(args, "points_per_sweep", DEFAULT_POINTS_PER_SWEEP)
+    iv_bf = bool(getattr(args, "IV_BF", False))
+
+    print(f"Running Fraunhofer (multi-H) analysis: {filepath}")
+    datasets = segment_multi_h_iv(
+        filepath,
+        channel_dV=args.channel_dV, channel_dI=args.channel_dI,
+        H_step=H_step, H_range=H_range, H_max=H_max, BF=BF,
+        min_points=getattr(args, "min_points", 30),
+        phase_channel=getattr(args, "phase_channel", "theta2"),
+        di_sense_R=getattr(args, "di_sense_R", 1e3),
+        points_per_sweep=pps, iv_bf=iv_bf,
+    )
+    if not datasets:
+        print("  No H segments - nothing to do.")
+        return
+
+    if H_range is None:
+        print("  [H] --H-range not given: x axis = mean Hsample per IV loop "
+              "(may be unreliable).")
+    print(_format_H_noise_report(datasets))
+
+    params_list = None
+    if getattr(args, "per_H_analysis", False):
+        print("Running per-field single IV analysis...")
+        params_list = run_per_T_iv_from_multi_t_file(
+            filepath,
+            channel_dV=args.channel_dV, channel_dI=args.channel_dI,
+            min_points=getattr(args, "min_points", 30),
+            out_root=getattr(args, "singles_dir", "singles"),
+            figsize=tuple(args.figsize),
+            do_analyze=True,
+            area_um2=args.area,
+            rn_criterion=args.rn_criterion,
+            ic_span=args.ic_span,
+            outlier_thresh=args.outlier_thresh,
+            diff_threshold=args.diff_threshold,
+            advanced=getattr(args, "advanced", False),
+            ic_I_min=getattr(args, "ic_I_min", None),
+            ic_I_max=getattr(args, "ic_I_max", None),
+            split_sweeps=getattr(args, "split_sweeps", False),
+            show_ic_eff=getattr(args, "ic_eff", False),
+            tc_for_rn=getattr(args, "tc_for_rn", None),
+            include_phase=getattr(args, "phase", False),
+            phase_channel=getattr(args, "phase_channel", "theta2"),
+            di_sense_R=getattr(args, "di_sense_R", 1e3),
+            points_per_sweep=pps,
+            plot_points_line=getattr(args, "plot_points_line", False),
+            show_ic_lines=getattr(args, "ic_lines", False),
+            ic_rho_frac=getattr(args, "ic_rho_frac", 0.03),
+            datasets=datasets, label_key="H_label", label_suffix="",
+            extra_log=_write_H_log_block, iv_bf=iv_bf,
+        )
+    elif getattr(args, "ic_eff", False):
+        print("  [map-H] NOTE: --ic-eff overlay on the map needs "
+              "--per-H-analysis (Ic_eff is computed there).")
+
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    out = f"{base}_dVdI_H_map" + ("_fullI" if full_I else "") + ".pdf"
+    plot_Fraunhofer_dvdi_map(
+        datasets, out, BF=BF, full_I=full_I, figsize=tuple(args.figsize),
+        params_list=params_list,
+        show_ic_eff=bool(getattr(args, "ic_eff", False)) and params_list is not None,
+        H_step=H_step,
+    )
 
 
 def _add_IV_dVdI_parser(subparsers):
@@ -5829,8 +6288,35 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument('--min-points', type=int, default=30,
                    help="Minimum points required in a temperature segment "
                         "(default: 30).")
+    p.add_argument('--IV-BF', action='store_true',
+                   help="Multi-variable files (--multi-t-file / --multi-h-file): each IV "
+                        "loop contains forward AND backward current sweeps (2N-1 rows, "
+                        "shared turnaround). Default: each IV loop is forward-only "
+                        "(N rows, N = --points-per-sweep).")
     p.add_argument('--singles-dir', type=str, default='singles',
-                   help="Root folder for per-T outputs (default: singles).")
+                   help="Root folder for per-T / per-H outputs (default: singles).")
+    # ---- Fraunhofer / multi-H file mode ----
+    p.add_argument('--multi-h-file', type=str, default=None, metavar='CSV',
+                   help="Single CSV with one IV loop per H value (Fraunhofer "
+                        "measurement). Produces a dV/dI intensity map "
+                        "(mu0H in mT vs current in uA).")
+    p.add_argument('--H-step', type=float, default=None, metavar='OE',
+                   help="Field step (Oe) between successive IV loops. Required with --H-range.")
+    p.add_argument('--H-range', nargs=2, type=float, default=None,
+                   metavar=('H_FIRST_OE', 'H_LAST_OE'),
+                   help="First and last measured field (Oe). When given, the nominal values "
+                        "(H_first + k*H_step) are used on the x axis and Hsample is only used "
+                        "to estimate the field noise/error.")
+    p.add_argument('--H-max', type=float, default=None, metavar='OE',
+                   help="Only analyse/plot loops with |H| <= H_max (Oe).")
+    p.add_argument('--BF', action='store_true',
+                   help="File contains forward AND backward H sweeps: plot two stacked "
+                        "maps (forward top, backward bottom).")
+    p.add_argument('--full-I', action='store_true',
+                   help="Plot the full current range (default: I > 0 only).")
+    p.add_argument('--per-H-analysis', action='store_true',
+                   help="For --multi-h-file: per-field single IV analysis "
+                        "(singles/<H label>/ with plots + analysis.log).")
     return p
 
 def _add_Hall_MR_parser(subparsers):
@@ -6544,6 +7030,9 @@ def _run_IV_dVdI(args):
 
             print(f"Processed {csv_file}")
         return
+    elif getattr(args, 'multi_h_file', None):
+        _run_multi_h_file(args)
+        return
     elif getattr(args, 'multi_t_file', None):
         filepath = args.multi_t_file
         T_max = getattr(args, 'T_max', None)
@@ -6563,6 +7052,7 @@ def _run_IV_dVdI(args):
             phase_channel=getattr(args, 'phase_channel', 'theta2'),
             map_J=getattr(args, 'map_J', False),
             area_um2=getattr(args, 'area', None),
+            iv_bf=getattr(args, 'IV_BF', False),
         )
         if getattr(args, 'per_T_analysis', False):
             print("Running per-temperature single IV analysis...")
@@ -6597,10 +7087,11 @@ def _run_IV_dVdI(args):
                 show_ic_lines=getattr(args, 'ic_lines', False),
                 ic_rho_frac=getattr(args, 'ic_rho_frac', 0.03),
                 datasets=map_datasets,
+                iv_bf=getattr(args, 'IV_BF', False),
             )
         return
     raise ValueError(
-        "IV: provide CSV file(s), --multi-temp PATTERN or --multi-t-file FILE."
+        "IV: provide CSV file(s), --multi-temp PATTERN, --multi-t-file FILE or --multi-h-file FILE."
     )
 
 def _find_comments_for_csv(csv_path):
