@@ -1586,13 +1586,52 @@ def plot_didv(result, ax=None, show_peaks=True, xlim=None,
 
     return ax
 
+
+def _parse_ic_dvdi_ranges(raw):
+    """Parse --ic-dvdi-range into a list of (lo, hi) float pairs.
+
+    Accepts repeated pairs from argparse nargs='+', e.g.
+        --ic-dvdi-range 1 10 20 25  →  [(1,10), (20,25)]
+    or a single pair.  Returns None if raw is None / empty.
+    """
+    if not raw:
+        return None
+    vals = [float(v) for v in raw]
+    if len(vals) % 2 != 0:
+        raise ValueError(
+            "--ic-dvdi-range expects an even number of floats "
+            "(pairs of lo, hi). Got: " + str(raw)
+        )
+    ranges = []
+    for i in range(0, len(vals), 2):
+        lo, hi = vals[i], vals[i + 1]
+        if hi < lo:
+            lo, hi = hi, lo
+        ranges.append((lo, hi))
+    return ranges
+
+
+def _in_ic_dvdi_range(x, ranges):
+    """True if x lies in any [lo, hi] of *ranges* (inclusive).
+
+    If ranges is None / empty → False (Ic_eff used everywhere by default).
+    """
+    if not ranges or x is None or not np.isfinite(x):
+        return False
+    for lo, hi in ranges:
+        if lo <= x <= hi:
+            return True
+    return False
+
+
 def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
                          outlier_thresh=5.0, advanced=False, diff_threshold=0.001,
                          figsize=None, ic_I_min=None, ic_I_max=None,
                          rn_override_mOhm=None, rn_from_T_K=None,
                          advanced_outdir=None, advanced_quiet=False,
                          ic_rho_frac=0.03, rho_k_noise=3.0, rho_smooth=1,
-                         rho_persist=3, rho_imin_frac=0.02):
+                         rho_persist=3, rho_imin_frac=0.02,
+                         pre_jump_offset=3, use_jump_ic=True):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data.
  
     Parameters
@@ -1632,6 +1671,8 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         'ic_I_min_A': ic_I_min,
         'ic_I_max_A': ic_I_max,
         'ic_rho_frac': ic_rho_frac,
+        'pre_jump_offset': int(pre_jump_offset),
+        'use_jump_ic': bool(use_jump_ic),
     }
  
     # ------------------------------------------------------------------
@@ -1685,7 +1726,8 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
     signal = dVdI if dVdI is not None and not np.all(np.isnan(dVdI)) else np.abs(V)
  
     def find_ic_in_direction(I_seg, signal_seg, direction_sign=1, span=10,
-                               outlier_threshold=5.0, diff_threshold=0.001):
+                               outlier_threshold=5.0, diff_threshold=0.001,
+                               pre_jump_offset=3):
         """Locate Ic via a peak-weighted jump score in the signal.
  
         For each sliding window on the chosen polarity:
@@ -1700,8 +1742,9 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
              rise/fall of dV/dI *near the peak*, so those steps get both
              a large |Δs| and large weights → highest score.
           4. Sum δ_i (optionally only those above diff_threshold) and pick
-             the window with the maximum score.  Ic is |I| at the window
-             centre.
+             the window with the maximum score.  The reported Ic is |I| at
+             index (best_centre − pre_jump_offset), i.e. still in the SC
+             state just before the transition (default offset 3 points).
  
         Weighting makes the detector much less sensitive to the absolute
         scale of dV/dI across temperatures, so a single span /
@@ -1759,7 +1802,9 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         # No meaningful jump → nan so caller falls back to the rho criterion
         if best_idx is None or max_change <= 0:
             return np.nan
-        best_idx = int(np.clip(best_idx, 0, len(I_dir) - 1))
+        # Step back by pre_jump_offset so Ic is taken while still SC
+        off = max(0, int(pre_jump_offset))
+        best_idx = int(np.clip(best_idx - off, 0, len(I_dir) - 1))
         return abs(float(I_dir[best_idx]))
  
     # Overall Ic+ / Ic-
@@ -1823,14 +1868,18 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         return np.nan, None
  
     def _resolve_ic(I_win, sig_win, I_full, V_full,
-                     direction_sign, span, out_thr, d_thr):
+                     direction_sign, span, out_thr, d_thr,
+                     pre_jump_offset=3, force_rho=False):
         """Jump-based Ic inside the ic_I_min/max window; fallback = rho criterion
         on the *full* (unrestricted) data.
  
         Returns (Ic_abs_A, method) where method is
-          None             — jump detector
+          None             — jump detector (dV/dI jump)
           'rho_crit'       — rho > ic_rho_frac criterion
           'rho_resistive'  — already resistive at lowest |I| (Ic = 0)
+ 
+        If force_rho is True the jump layer is skipped and only the rho
+        criterion is used (used when the setpoint is outside --ic-dvdi-range).
         """
         I_win = np.asarray(I_win, dtype=float)
         sig_win = np.asarray(sig_win, dtype=float)
@@ -1838,10 +1887,11 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         V_full = np.asarray(V_full, dtype=float)
  
         # --- layer 1: jump search (windowed) ---
-        if len(I_win) > 0:
+        if (not force_rho) and len(I_win) > 0:
             val = find_ic_in_direction(
                 I_win, sig_win, direction_sign=direction_sign,
                 span=span, outlier_threshold=out_thr, diff_threshold=d_thr,
+                pre_jump_offset=pre_jump_offset,
             )
             if val is not None and np.isfinite(val):
                 return float(val), None
@@ -1868,21 +1918,25 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
             I[fwd_win], sig_arr[fwd_win],
             I[fwd], V_arr[fwd],
             1, ic_span, outlier_thresh, diff_threshold,
+            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
         )
         Ic_minus_fwd, fb_mf = _resolve_ic(
             I[fwd_win], sig_arr[fwd_win],
             I[fwd], V_arr[fwd],
             -1, ic_span, outlier_thresh, diff_threshold,
+            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
         )
         Ic_plus_bwd, fb_pb = _resolve_ic(
             I[bwd_win], sig_arr[bwd_win],
             I[bwd], V_arr[bwd],
             1, ic_span, outlier_thresh, diff_threshold,
+            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
         )
         Ic_minus_bwd, fb_mb = _resolve_ic(
             I[bwd_win], sig_arr[bwd_win],
             I[bwd], V_arr[bwd],
             -1, ic_span, outlier_thresh, diff_threshold,
+            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
         )
  
         results['Ic+_f_mA'] = Ic_plus_fwd * 1000 if np.isfinite(Ic_plus_fwd) else np.nan
@@ -1904,15 +1958,18 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         results['Ir_eff+_b_mA'] = ir_eff * 1000 if np.isfinite(ir_eff) else np.nan
         results['Ic_eff_method'] = fb_ie
         results['Ir_eff_method'] = fb_re
+        results['Ic_definition'] = 'jump_dvdi' if use_jump_ic else 'rho_eff'
     else:
         # Uni-directional: report +/- on the single sweep as _f for convenience
         Ic_plus, fb_p = _resolve_ic(
             I_ic, sig_ic, I, V_arr,
             1, ic_span, outlier_thresh, diff_threshold,
+            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
         )
         Ic_minus, fb_m = _resolve_ic(
             I_ic, sig_ic, I, V_arr,
             -1, ic_span, outlier_thresh, diff_threshold,
+            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
         )
         results['Ic+_f_mA'] = Ic_plus * 1000 if np.isfinite(Ic_plus) else np.nan
         results['Ic-_f_mA'] = Ic_minus * 1000 if np.isfinite(Ic_minus) else np.nan
@@ -1926,6 +1983,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         results['Ir_eff+_b_mA'] = np.nan
         results['Ic_eff_method'] = fb_ie
         results['Ir_eff_method'] = None
+        results['Ic_definition'] = 'jump_dvdi' if use_jump_ic else 'rho_eff'
  
     # Jc from switching current Ic+_f (effective Jc is Jc_eff_kA/cm2)
     ic_for_jc = results.get('Ic+_f_mA', np.nan)
@@ -5516,7 +5574,7 @@ _IV_ADVANCED_KEYS = {
     'gap_V_mV', 'Delta_meV', 'peaks_V_mV', 'didv_plot',
 }
 _IV_DEFAULT_ORDER = [
-    'T_K', 'is_bf',
+    'T_K', 'is_bf', 'Ic_definition',
     'Ic+_f_mA', 'Ic-_f_mA', 'Ic+_b_mA', 'Ic-_b_mA',
     'Ic_eff+_f_mA', 'Ir_eff+_b_mA', 'Ic_eff_method', 'Ir_eff_method',
     'Rn+_mOhm', 'Rn-_mOhm', 'Rn_mean_mOhm', 'Rn_from_T_K',
@@ -5599,7 +5657,9 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    show_ic_lines=False,
                                    ic_rho_frac=0.03, datasets=None,
                                    label_key="T_label", label_suffix="K",
-                                   extra_log=None, iv_bf=False):
+                                   extra_log=None, iv_bf=False,
+                                   ic_dvdi_ranges=None, pre_jump_offset=3,
+                                   range_axis="T"):
     """Per-temperature IV diagnostics + parameter logs under ``singles/``.
 
     Layout
@@ -5645,6 +5705,7 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             diff_threshold=diff_threshold, advanced=False,
             figsize=figsize, ic_I_min=ic_I_min, ic_I_max=ic_I_max,
             advanced_quiet=True, ic_rho_frac=ic_rho_frac,
+            pre_jump_offset=pre_jump_offset, use_jump_ic=False,
         )
         rn_override = ref_params.get('Rn_mean_mOhm', np.nan)
         if not np.isfinite(rn_override):
@@ -5656,6 +5717,16 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
               f"Rn_mean={rn_override:.6g} mOhm  (Tc={tc_for_rn:g}, Tc−2)")
 
     all_params = []
+    if ic_dvdi_ranges and (ic_I_min is None and ic_I_max is None):
+        warnings.warn(
+            "Ic dV/dI jump method requested via --ic-dvdi-range without "
+            "--ic-I-min / --ic-I-max. A current search window is strongly "
+            "advised to avoid spurious jumps at large |I|.",
+            UserWarning, stacklevel=2,
+        )
+        print("  ⚠  --ic-dvdi-range active without --ic-I-min/--ic-I-max; "
+              "a search window is advised.")
+
     for i, data in enumerate(datasets):
         T_lab = data[label_key]
         if iv_bf and not data.get("is_bf", False):
@@ -5668,6 +5739,17 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
         params = {}
         if do_analyze:
             use_override = rn_override is not None and i != rn_ref_idx
+            # Axis value for --ic-dvdi-range membership
+            if range_axis == "H":
+                axis_val = data.get("H_x_Oe", np.nan)
+            else:
+                axis_val = data.get("T_mean", np.nan)
+                if not np.isfinite(axis_val):
+                    try:
+                        axis_val = float(T_lab)
+                    except (TypeError, ValueError):
+                        axis_val = np.nan
+            use_jump = _in_ic_dvdi_range(axis_val, ic_dvdi_ranges)
             params = compute_iv_parameters(
                 data, area_um2=area_um2, rn_criterion=rn_criterion,
                 ic_span=ic_span, outlier_thresh=outlier_thresh,
@@ -5678,13 +5760,19 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                 rn_from_T_K=(rn_from_T if use_override else None),
                 advanced_outdir=folder,
                 advanced_quiet=True, ic_rho_frac=ic_rho_frac,
+                pre_jump_offset=pre_jump_offset,
+                use_jump_ic=use_jump,
             )
             all_params.append(params)
 
+        # Plotting: jump-range → Ic lines (red/black); else → Ic_eff lines
+        _def = (params or {}).get("Ic_definition", "rho_eff")
+        _show_lines = show_ic_lines or (_def == "jump_dvdi")
+        _show_eff = show_ic_eff or (_def == "rho_eff")
         plot_iv_diagnostics(
             data, base_name=base_name, figsize=figsize,
             split_sweeps=split_sweeps, ic_params=params or None,
-            show_ic_eff=show_ic_eff, show_ic_lines=show_ic_lines,
+            show_ic_eff=_show_eff, show_ic_lines=_show_lines,
             include_phase=include_phase,
             plot_points_line=plot_points_line,
         )
@@ -5725,7 +5813,19 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             fh.write(f"points_per_sweep = {points_per_sweep}\n")
             fh.write(f"advanced       = {advanced}\n")
             fh.write(f"ic_rho_frac    = {ic_rho_frac}  (Ic_eff: V/(Rn·I) > frac)\n")
+            fh.write(f"pre_jump_offset = {pre_jump_offset}\n")
+            fh.write(f"ic_dvdi_ranges = {ic_dvdi_ranges}\n")
             if params:
+                ic_def = params.get("Ic_definition", "rho_eff")
+                fh.write("\n--- Ic definition for this run ---\n")
+                if ic_def == "jump_dvdi":
+                    fh.write("  USE_IC       : Ic  (dV/dI jump method)\n")
+                    fh.write("  USE_IC_EFF   : no  (stored for reference only)\n")
+                    fh.write("  Ic_definition: jump_dvdi\n")
+                else:
+                    fh.write("  USE_IC       : no\n")
+                    fh.write("  USE_IC_EFF   : Ic_eff  (rho criterion)\n")
+                    fh.write("  Ic_definition: rho_eff\n")
                 _write_params_block(fh, params, advanced)
             fh.write(f"\nplots saved as {base_name}_*.pdf\n")
             if advanced and params.get("didv_plot"):
@@ -6083,24 +6183,44 @@ def plot_Fraunhofer_dvdi_map(datasets, output, BF=False, full_I=False,
                     transform=ax.transAxes, va="top", ha="left",
                     fontsize=7, color="w")
 
-        if show_ic_eff and params_list is not None:
-            xs, ics, irs = [], [], []
+        if params_list is not None:
+            xs, ic_jump, ic_eff, ir_eff = [], [], [], []
             for j, i in enumerate(idx):
                 p = params_list[i] if i < len(params_list) else {}
                 xs.append(x[j])
-                ics.append(p.get("Ic_eff+_f_mA", np.nan) * 1e3)
-                irs.append(p.get("Ir_eff+_b_mA", np.nan) * 1e3)
-            xs, ics, irs = map(np.asarray, (xs, ics, irs))
-            mi = np.isfinite(ics)
-            mr = np.isfinite(irs)
-            if np.any(mi):
-                ax.plot(xs[mi], ics[mi], "o-", color="orange", ms=1.5, lw=0.6,
-                        label=r"$I_{c,\mathrm{eff}}$")
-            if np.any(mr):
-                ax.plot(xs[mr], irs[mr], "o-", color="darkblue", ms=1.5, lw=0.6,
-                        label=r"$I_{r,\mathrm{eff}}$")
-            if np.any(mi) or np.any(mr):
-                ax.legend(loc="upper right", fontsize=6, frameon=False)
+                defn = p.get("Ic_definition", "rho_eff")
+                # Primary Ic for this field point (mA → µA)
+                if defn == "jump_dvdi":
+                    ic_jump.append(p.get("Ic+_f_mA", np.nan) * 1e3)
+                    ic_eff.append(np.nan)
+                else:
+                    ic_jump.append(np.nan)
+                    ic_eff.append(p.get("Ic_eff+_f_mA", np.nan) * 1e3)
+                ir_eff.append(p.get("Ir_eff+_b_mA", np.nan) * 1e3)
+            xs = np.asarray(xs)
+            ic_jump = np.asarray(ic_jump)
+            ic_eff = np.asarray(ic_eff)
+            ir_eff = np.asarray(ir_eff)
+            mj = np.isfinite(ic_jump)
+            me = np.isfinite(ic_eff)
+            mr = np.isfinite(ir_eff)
+            handles_labels = []
+            if np.any(mj):
+                h, = ax.plot(xs[mj], ic_jump[mj], "o-", color="k", ms=1.5, lw=0.6,
+                             label=r"$I_c$")
+                handles_labels.append((h, r"$I_c$"))
+            if np.any(me):
+                h, = ax.plot(xs[me], ic_eff[me], "o-", color="gold", ms=1.5, lw=0.6,
+                             label=r"$I_{c,\mathrm{eff}}$")
+                handles_labels.append((h, r"$I_{c,\mathrm{eff}}$"))
+            if show_ic_eff and np.any(mr):
+                h, = ax.plot(xs[mr], ir_eff[mr], "o-", color="darkblue", ms=1.5, lw=0.6,
+                             label=r"$I_{r,\mathrm{eff}}$")
+                handles_labels.append((h, r"$I_{r,\mathrm{eff}}$"))
+            if handles_labels:
+                leg = ax.legend(loc="upper right", fontsize=6, frameon=False)
+                for txt in leg.get_texts():
+                    txt.set_color("white")
 
     axes[-1].set_xlabel(r"$\mu_0 H$ (mT)")
     axes[-1].set_xlim(x_lo, x_hi)
@@ -6160,7 +6280,7 @@ def _run_multi_h_file(args):
             ic_I_min=getattr(args, "ic_I_min", None),
             ic_I_max=getattr(args, "ic_I_max", None),
             split_sweeps=getattr(args, "split_sweeps", False),
-            show_ic_eff=getattr(args, "ic_eff", False),
+            show_ic_eff=True,  # always available; definition per-H via ranges
             tc_for_rn=getattr(args, "tc_for_rn", None),
             include_phase=getattr(args, "phase", False),
             phase_channel=getattr(args, "phase_channel", "theta2"),
@@ -6171,17 +6291,17 @@ def _run_multi_h_file(args):
             ic_rho_frac=getattr(args, "ic_rho_frac", 0.03),
             datasets=datasets, label_key="H_label", label_suffix="",
             extra_log=_write_H_log_block, iv_bf=iv_bf,
+            ic_dvdi_ranges=_parse_ic_dvdi_ranges(getattr(args, "ic_dvdi_range", None)),
+            pre_jump_offset=getattr(args, "ic_pre_jump_offset", 3),
+            range_axis="H",
         )
-    elif getattr(args, "ic_eff", False):
-        print("  [map-H] NOTE: --ic-eff overlay on the map needs "
-              "--per-H-analysis (Ic_eff is computed there).")
 
     base = os.path.splitext(os.path.basename(filepath))[0]
     out = f"{base}_dVdI_H_map" + ("_fullI" if full_I else "") + ".pdf"
     plot_Fraunhofer_dvdi_map(
         datasets, out, BF=BF, full_I=full_I, figsize=tuple(args.figsize),
         params_list=params_list,
-        show_ic_eff=bool(getattr(args, "ic_eff", False)) and params_list is not None,
+        show_ic_eff=params_list is not None,
         H_step=H_step,
     )
 
@@ -6222,9 +6342,20 @@ def _add_IV_dVdI_parser(subparsers):
                         "(forward top, backward bottom) with Ic+/- guide lines.")
     p.add_argument('--ic-lines', action='store_true',
                    help="Draw vertical lines for Ic+/− F and B on I(V)/dV/dI/phase plots.")
-    p.add_argument('--ic-eff', action='store_true',
-                   help="Draw effective Ic (orange) and Ir (dark blue) lines "
-                        "on I(V), dV/dI, and phase plots (merged and split).")
+    p.add_argument('--ic-dvdi-range', nargs='+', type=float, default=None,
+                   metavar='LO HI',
+                   help="Use the dV/dI jump method for Ic inside the given "
+                        "range(s) of the multi-T (Kelvin) or multi-H (Oe) axis. "
+                        "Supply one or more continuous intervals as pairs: "
+                        "--ic-dvdi-range 1 10 20 25 means [1,10] U [20,25]. "
+                        "Outside those ranges (and when omitted) Ic_eff "
+                        "(rho criterion) is the primary critical current. "
+                        "Ic_eff is always computed and stored. "
+                        "A search window via --ic-I-min / --ic-I-max is "
+                        "strongly advised when the jump method is used.")
+    p.add_argument('--ic-pre-jump-offset', type=int, default=3, metavar='N',
+                   help="Points to step back from the detected dV/dI jump "
+                        "so Ic is taken still in the SC state (default: 3).")
     p.add_argument('--phase', action='store_true',
                    help="Also plot lock-in phase vs current (default column "
                         "theta2; override with --phase-channel).")
@@ -6985,7 +7116,8 @@ def _run_IV_dVdI(args):
             need_ic = (
                 getattr(args, 'analyze', False)
                 or getattr(args, 'split_sweeps', False)
-                or getattr(args, 'ic_eff', False)
+                or getattr(args, 'ic_lines', False)
+                or getattr(args, 'ic_dvdi_range', None) is not None
             )
             if need_ic:
                 # Single-file Rn at Tc−2 if --tc-for-rn given
@@ -6997,6 +7129,18 @@ def _run_IV_dVdI(args):
                             f"--tc-for-rn={tc_rn:g}: this file has T≈{Tm:.2f} K, "
                             f"need T <= {float(tc_rn)-2:g} K to define Rn."
                         )
+                # Single-file mode: Ic_eff is primary unless --ic-dvdi-range
+                # covers the (mean) temperature of this file.
+                _ranges = _parse_ic_dvdi_ranges(getattr(args, 'ic_dvdi_range', None))
+                _Tmean = float(np.nanmean(data.get('T', np.nan)))
+                _use_jump = _in_ic_dvdi_range(_Tmean, _ranges)
+                if _use_jump and (getattr(args, 'ic_I_min', None) is None
+                                  and getattr(args, 'ic_I_max', None) is None):
+                    warnings.warn(
+                        "Ic dV/dI jump method active without --ic-I-min/"
+                        "--ic-I-max; a search window is strongly advised.",
+                        UserWarning, stacklevel=2,
+                    )
                 params = compute_iv_parameters(
                     data, area_um2=args.area,
                     rn_criterion=args.rn_criterion,
@@ -7010,14 +7154,17 @@ def _run_IV_dVdI(args):
                     advanced_outdir=".",
                     advanced_quiet=False,
                     ic_rho_frac=getattr(args, 'ic_rho_frac', 0.03),
+                    pre_jump_offset=getattr(args, 'ic_pre_jump_offset', 3),
+                    use_jump_ic=_use_jump,
                 )
 
+            _def = (params or {}).get('Ic_definition', 'rho_eff')
             plot_iv_diagnostics(
                 data, base_name=f"{base}", figsize=args.figsize,
                 split_sweeps=getattr(args, 'split_sweeps', False),
                 ic_params=params,
-                show_ic_eff=getattr(args, 'ic_eff', False),
-                show_ic_lines=getattr(args, 'ic_lines', False),
+                show_ic_eff=True if _def == 'rho_eff' else getattr(args, 'ic_lines', False),
+                show_ic_lines=True if _def == 'jump_dvdi' else getattr(args, 'ic_lines', False),
                 include_phase=getattr(args, 'phase', False),
                 plot_points_line=getattr(args, 'plot_points_line', False),
             )
@@ -7077,7 +7224,7 @@ def _run_IV_dVdI(args):
                 ic_I_min=getattr(args, 'ic_I_min', None),
                 ic_I_max=getattr(args, 'ic_I_max', None),
                 split_sweeps=getattr(args, 'split_sweeps', False),
-                show_ic_eff=getattr(args, 'ic_eff', False),
+                show_ic_eff=True,
                 tc_for_rn=getattr(args, 'tc_for_rn', None),
                 include_phase=getattr(args, 'phase', False),
                 phase_channel=getattr(args, 'phase_channel', 'theta2'),
@@ -7088,6 +7235,9 @@ def _run_IV_dVdI(args):
                 ic_rho_frac=getattr(args, 'ic_rho_frac', 0.03),
                 datasets=map_datasets,
                 iv_bf=getattr(args, 'IV_BF', False),
+                ic_dvdi_ranges=_parse_ic_dvdi_ranges(getattr(args, 'ic_dvdi_range', None)),
+                pre_jump_offset=getattr(args, 'ic_pre_jump_offset', 3),
+                range_axis="T",
             )
         return
     raise ValueError(

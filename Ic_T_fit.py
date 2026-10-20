@@ -49,15 +49,23 @@ source temperature Rn_from_T_K is reported when present).
 
 Data selection
 --------------
-  By default the script uses Ic+_f_mA (and Ic+_b_mA as the retrapping
-  current Ir when plotting without a fit).  Pass --eff to use the
-  effective values Ic_eff+_f_mA and Ir_eff+_b_mA instead.
+  Each analysis.log writes an "Ic definition for this run" block set by
+  plot_csv_data.py (--ic-dvdi-range):
+
+      Ic_definition: jump_dvdi  →  use Ic+_f_mA  (dV/dI jump)
+      Ic_definition: rho_eff    →  use Ic_eff+_f_mA  (rho criterion)
+
+  This script reads that flag per temperature and selects the matching
+  Ic (and Ir) automatically.  No CLI switch is required.  Legacy logs
+  without the flag default to rho_eff (Ic_eff) when available.
 
 CSV workflow
 ------------
   After collecting data from logs the script always writes a CSV
   (default: Ic_T_data.csv) with columns
-      T_K, Ic_mA, Ir_mA, Rn_mean_mOhm, rn_criterion, source
+      T_K, Ic_mA, Ir_mA, Ic_eff_mA, Ir_eff_mA,
+      Ic_active_mA, Ir_active_mA, Ic_definition,
+      Rn_mean_mOhm, rn_criterion, source
   so you can edit values by hand.  Subsequent runs can skip the folder
   scan entirely with --from-csv PATH.
 
@@ -65,9 +73,9 @@ Usage examples
 --------------
     python Ic_T_fit.py
     python Ic_T_fit.py --dir /path/to/main_folder
-    python Ic_T_fit.py --eff --model d-wave --fit-eta
+    python Ic_T_fit.py --model d-wave --fit-eta
     python Ic_T_fit.py --model d-wave --fit-eta --fit-y0
-    python Ic_T_fit.py --no-fit --eff
+    python Ic_T_fit.py --no-fit
     python Ic_T_fit.py --from-csv Ic_T_data.csv --model ab --Tc 7.2
     python Ic_T_fit.py --icrn --model d-wave --fit-eta
     python Ic_T_fit.py --normalize --Tc 7.2 --fit-eta
@@ -133,17 +141,59 @@ def _grab_float(pattern, text):
     return float(m.group(1)) if m else None
 
 
-def parse_log(path, use_eff=True):
+def _parse_ic_definition(text):
+    """Return 'jump_dvdi' or 'rho_eff' from an analysis.log body.
+
+    Looks for the block written by plot_csv_data.py::
+
+        --- Ic definition for this run ---
+          USE_IC       : Ic  (dV/dI jump method)
+          USE_IC_EFF   : no  (stored for reference only)
+          Ic_definition: jump_dvdi
+
+    or the rho_eff variant.  Falls back to scanning
+    ``Ic_definition: <token>`` alone.  Logs without the flag are
+    treated as ``rho_eff`` (prefer Ic_eff when available).
+    """
+    m = re.search(
+        r"^  Ic_definition\s*:\s*(jump_dvdi|rho_eff)\s*$",
+        text, re.MULTILINE,
+    )
+    if m:
+        return m.group(1)
+    m = re.search(
+        r"^Ic_definition\s*[=:]\s*(jump_dvdi|rho_eff)\s*$",
+        text, re.MULTILINE,
+    )
+    if m:
+        return m.group(1)
+    # USE_IC / USE_IC_EFF lines (robust to spacing)
+    use_ic = re.search(
+        r"^  USE_IC\s*:\s*(Ic\b|no)\b", text, re.MULTILINE | re.IGNORECASE,
+    )
+    use_eff_line = re.search(
+        r"^  USE_IC_EFF\s*:\s*(Ic_eff\b|no)\b",
+        text, re.MULTILINE | re.IGNORECASE,
+    )
+    if use_ic and re.match(r"Ic\b", use_ic.group(1), re.IGNORECASE):
+        return "jump_dvdi"
+    if use_eff_line and re.match(r"Ic_eff\b", use_eff_line.group(1), re.IGNORECASE):
+        return "rho_eff"
+    return "rho_eff"  # legacy default
+
+
+def parse_log(path):
     """Extract temperature, Ic, Ir, Rn and rn_criterion from one log.
 
-    Always reads both effective and non-effective currents when present:
-        Ic_mA      <- Ic+_f_mA   (non-effective)
-        Ic_eff_mA  <- Ic_eff+_f_mA
-        Ir_mA      <- Ic+_b_mA   (non-effective retrapping)
-        Ir_eff_mA  <- Ir_eff+_b_mA
+    Always reads both jump (Ic+_f_mA) and effective (Ic_eff+_f_mA)
+    currents when present.  The active Ic/Ir used for fitting/plotting
+    is chosen from the log's ``Ic_definition`` flag:
 
-    The active Ic/Ir used for fitting/plotting is selected by use_eff
-    (default True = effective).  Falls back to legacy Ic_mA if needed.
+        jump_dvdi  →  Ic+_f_mA / Ic+_b_mA
+        rho_eff    →  Ic_eff+_f_mA / Ir_eff+_b_mA
+
+    Legacy logs without the flag default to rho_eff when Ic_eff is
+    available, otherwise fall back to the jump value.
     """
     with open(path, "r") as f:
         text = f.read()
@@ -161,12 +211,14 @@ def parse_log(path, use_eff=True):
     if Ic_raw is None and legacy is not None:
         Ic_raw = legacy
 
-    if use_eff:
-        Ic_active = Ic_eff if Ic_eff is not None else Ic_raw
-        Ir_active = Ir_eff if Ir_eff is not None else Ir_raw
-    else:
+    ic_def = _parse_ic_definition(text)
+
+    if ic_def == "jump_dvdi":
         Ic_active = Ic_raw if Ic_raw is not None else Ic_eff
         Ir_active = Ir_raw if Ir_raw is not None else Ir_eff
+    else:  # rho_eff
+        Ic_active = Ic_eff if Ic_eff is not None else Ic_raw
+        Ir_active = Ir_eff if Ir_eff is not None else Ir_raw
 
     Rn_mean_mOhm = _grab_float(r"^  Rn_mean_mOhm\s*=\s*([\-0-9.eE]+)", text)
     if Rn_mean_mOhm is None:
@@ -182,10 +234,11 @@ def parse_log(path, use_eff=True):
         "T_K": T_K,
         "Ic_mA": Ic_active,          # active value used for fit/plot
         "Ir_mA": Ir_active,
-        "Ic_raw_mA": Ic_raw,         # non-effective
-        "Ir_raw_mA": Ir_raw,
-        "Ic_eff_mA": Ic_eff,         # effective
+        "Ic_raw_mA": Ic_raw,         # jump (Ic+_f_mA)
+        "Ir_raw_mA": Ir_raw,         # jump retrapping (Ic+_b_mA)
+        "Ic_eff_mA": Ic_eff,         # rho criterion
         "Ir_eff_mA": Ir_eff,
+        "Ic_definition": ic_def,
         "Rn_mean_mOhm": Rn_mean_mOhm,
         "Rn_from_T_K": Rn_from_T_K,
         "rn_criterion": rn_criterion,
@@ -193,7 +246,7 @@ def parse_log(path, use_eff=True):
     }
 
 
-def collect_data(base_dir, use_eff=True):
+def collect_data(base_dir):
     """Find every analysis.log under the temperature subfolders.
 
     Accepts either:
@@ -201,6 +254,7 @@ def collect_data(base_dir, use_eff=True):
       base_dir/<T>K/analysis.log           (base_dir is the singles folder itself)
 
     Both layouts are tried; the first that yields files is used.
+    Active Ic/Ir is taken per-log from the ``Ic_definition`` flag.
     """
     base_dir = os.path.abspath(os.path.expanduser(base_dir))
     candidates = [
@@ -226,18 +280,24 @@ def collect_data(base_dir, use_eff=True):
     print(f"  matched pattern: {used_pattern}  ({len(log_files)} file(s))")
 
     records = []
+    n_jump = n_eff = 0
     for lf in log_files:
-        rec = parse_log(lf, use_eff=use_eff)
+        rec = parse_log(lf)
         # T and Ic are mandatory; Rn is taken from the first usable log later
         missing = [k for k in ("T_K", "Ic_mA") if rec[k] is None]
         if missing:
             print(f"  [skip] {lf}: could not parse {missing}", file=sys.stderr)
             continue
+        if rec.get("Ic_definition") == "jump_dvdi":
+            n_jump += 1
+        else:
+            n_eff += 1
         records.append(rec)
 
     if not records:
         raise RuntimeError("No usable analysis.log files were parsed.")
 
+    print(f"  Ic_definition:  jump_dvdi = {n_jump}  |  rho_eff = {n_eff}")
     records.sort(key=lambda r: r["T_K"])
     return records
 
@@ -273,15 +333,17 @@ def save_csv(path, records):
     """Write collected records to a CSV for manual editing / reuse.
 
     Columns:
-      Ic_mA / Ir_mA         non-effective (Ic+_f_mA / Ic+_b_mA)
-      Ic_eff_mA / Ir_eff_mA effective   (Ic_eff+_f_mA / Ir_eff+_b_mA)
-      Ic_active_mA / Ir_active_mA  values used for the current run
+      Ic_mA / Ir_mA               jump values (Ic+_f_mA / Ic+_b_mA)
+      Ic_eff_mA / Ir_eff_mA       rho criterion (Ic_eff+_f_mA / Ir_eff+_b_mA)
+      Ic_active_mA / Ir_active_mA values used for this run (per Ic_definition)
+      Ic_definition               jump_dvdi | rho_eff
     """
     fieldnames = [
         "T_K",
         "Ic_mA", "Ir_mA",
         "Ic_eff_mA", "Ir_eff_mA",
         "Ic_active_mA", "Ir_active_mA",
+        "Ic_definition",
         "Rn_mean_mOhm", "Rn_from_T_K", "rn_criterion", "source",
     ]
 
@@ -300,6 +362,7 @@ def save_csv(path, records):
                 "Ir_eff_mA": _cell(r.get("Ir_eff_mA")),
                 "Ic_active_mA": _cell(r.get("Ic_mA")),
                 "Ir_active_mA": _cell(r.get("Ir_mA")),
+                "Ic_definition": _cell(r.get("Ic_definition", "")),
                 "Rn_mean_mOhm": _cell(r.get("Rn_mean_mOhm")),
                 "Rn_from_T_K": _cell(r.get("Rn_from_T_K")),
                 "rn_criterion": _cell(r.get("rn_criterion")),
@@ -309,7 +372,13 @@ def save_csv(path, records):
 
 
 def load_csv(path):
-    """Load records previously written by save_csv (or hand-edited)."""
+    """Load records previously written by save_csv (or hand-edited).
+
+    Preference order for the active Ic:
+      1. Ic_active_mA (previous run / hand edit)
+      2. Rebuild from Ic_definition + Ic_mA / Ic_eff_mA columns
+      3. Ic_eff_mA then Ic_mA
+    """
     records = []
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
@@ -324,31 +393,43 @@ def load_csv(path):
                 print(f"  [skip] CSV row: {e}", file=sys.stderr)
                 continue
 
-            # prefer active column from a previous run; fall back to
-            # effective then non-effective for hand-edited CSVs
+            ic_def = (row.get("Ic_definition") or "").strip() or None
+            Ic_raw = _opt_float("Ic_mA")
+            Ic_eff = _opt_float("Ic_eff_mA")
+            Ir_raw = _opt_float("Ir_mA")
+            Ir_eff = _opt_float("Ir_eff_mA")
+
             Ic = _opt_float("Ic_active_mA")
+            if Ic is None and ic_def == "jump_dvdi":
+                Ic = Ic_raw if Ic_raw is not None else Ic_eff
+            if Ic is None and ic_def == "rho_eff":
+                Ic = Ic_eff if Ic_eff is not None else Ic_raw
             if Ic is None:
-                Ic = _opt_float("Ic_eff_mA")
-            if Ic is None:
-                Ic = _opt_float("Ic_mA")
+                Ic = Ic_eff if Ic_eff is not None else Ic_raw
             if Ic is None:
                 print(f"  [skip] CSV row: no Ic column", file=sys.stderr)
                 continue
 
             Ir = _opt_float("Ir_active_mA")
+            if Ir is None and ic_def == "jump_dvdi":
+                Ir = Ir_raw if Ir_raw is not None else Ir_eff
+            if Ir is None and ic_def == "rho_eff":
+                Ir = Ir_eff if Ir_eff is not None else Ir_raw
             if Ir is None:
-                Ir = _opt_float("Ir_eff_mA")
-            if Ir is None:
-                Ir = _opt_float("Ir_mA")
+                Ir = Ir_eff if Ir_eff is not None else Ir_raw
+
+            if ic_def not in ("jump_dvdi", "rho_eff"):
+                ic_def = "rho_eff" if Ic_eff is not None else "jump_dvdi"
 
             records.append({
                 "T_K": T,
                 "Ic_mA": Ic,
                 "Ir_mA": Ir,
-                "Ic_raw_mA": _opt_float("Ic_mA"),
-                "Ir_raw_mA": _opt_float("Ir_mA"),
-                "Ic_eff_mA": _opt_float("Ic_eff_mA"),
-                "Ir_eff_mA": _opt_float("Ir_eff_mA"),
+                "Ic_raw_mA": Ic_raw,
+                "Ir_raw_mA": Ir_raw,
+                "Ic_eff_mA": Ic_eff,
+                "Ir_eff_mA": Ir_eff,
+                "Ic_definition": ic_def,
                 "Rn_mean_mOhm": _opt_float("Rn_mean_mOhm"),
                 "Rn_from_T_K": _opt_float("Rn_from_T_K"),
                 "rn_criterion": _opt_float("rn_criterion"),
@@ -579,13 +660,12 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
         lo.append(0.01)
         hi.append(5.0)
 
-        span = float(np.max(np.abs(Ic))) if len(Ic) else 1.0
-        Tspan = max(T_hi - T_lo, 1.0)
-        k_bound = 2.0 * span / Tspan
-        tm_lo = T_lo * 0.5
-        tm_hi = min(T_hi * 0.99, Tc_fixed * 0.99)
-
         if piecewise:
+            span = float(np.max(np.abs(Ic))) if len(Ic) else 1.0
+            Tspan = max(T_hi - T_lo, 1.0)
+            k_bound = 2.0 * span / Tspan
+            tm_lo = T_lo * 0.5
+            tm_hi = min(T_hi * 0.99, Tc_fixed * 0.99)
             # Eq. (7): free Tm and k
             Tm_guess = float(np.clip(Tm_guess, tm_lo, tm_hi))
             free_names.append("Tm")
@@ -1057,9 +1137,10 @@ Argument summary
                        (default: Ic_T_data.csv).
 
   Which Ic / Ir
-    --eff              Use effective values Ic_eff+_f_mA and Ir_eff+_b_mA.
-                       Without this flag: Ic+_f_mA and Ic+_b_mA (or legacy
-                       Ic_mA).
+    (automatic)        Taken from each analysis.log's Ic_definition flag
+                       written by plot_csv_data.py (jump_dvdi or rho_eff).
+                       No CLI switch; edit the CSV Ic_active_mA column if
+                       a manual override is needed.
 
   Fit control
     --no-fit           Only plot the data (no curve fit).  When Ir is
@@ -1099,12 +1180,6 @@ Argument summary
     parser.add_argument("--save-csv", default="Ic_T_data.csv", metavar="FILE",
                         help="Write collected data to this CSV "
                              "(default: Ic_T_data.csv)")
-    parser.add_argument("--eff", action="store_true",
-                        help="Use effective Ic/Ir (default behaviour). "
-                             "Kept for compatibility.")
-    parser.add_argument("--no-eff", action="store_true",
-                        help="Use non-effective Ic+_f_mA / Ic+_b_mA instead "
-                             "of the default effective values.")
     parser.add_argument("--no-fit", action="store_true",
                         help="Plot data only; do not perform a fit. "
                              "Default output: IcIr_T.pdf")
@@ -1159,8 +1234,6 @@ Argument summary
 
     if args.normalize and args.Tc is None:
         parser.error("--normalize requires --Tc <value>")
-    if args.eff and args.no_eff:
-        parser.error("Use only one of --eff / --no-eff")
     if args.piecewise and args.piecewise_multiples is not None:
         parser.error("Use only one of --piecewise / --piecewise-multiples")
     any_pw = args.piecewise or (args.piecewise_multiples is not None)
@@ -1181,19 +1254,19 @@ Argument summary
             parser.error(f"--Tm-initial expects {expected_tm_guesses} value(s) for the selected fitting mode; got {len(args.Tm_initial)}")
     if args.out is None:
         args.out = "IcIr_T.pdf" if args.no_fit else "Ic_T_fit.pdf"
-    use_eff = not args.no_eff   # default: effective values
-
     # ------------------------------------------------------------------
-    # 1. Collect data
+    # 1. Collect data  (Ic/Ir chosen per log from Ic_definition)
     # ------------------------------------------------------------------
     if args.from_csv:
         print(f"Loading data from CSV: {args.from_csv}")
         records = load_csv(args.from_csv)
+        n_jump = sum(1 for r in records if r.get("Ic_definition") == "jump_dvdi")
+        n_eff = len(records) - n_jump
+        print(f"  Ic_definition:  jump_dvdi = {n_jump}  |  rho_eff = {n_eff}")
     else:
         print(f"Scanning '{os.path.abspath(os.path.expanduser(args.dir))}' "
-              f"for analysis.log files "
-              f"({'effective' if use_eff else 'non-effective'} Ic/Ir)...")
-        records = collect_data(args.dir, use_eff=use_eff)
+              f"for analysis.log files (Ic from per-log Ic_definition)...")
+        records = collect_data(args.dir)
 
     save_csv(args.save_csv, records)
 
