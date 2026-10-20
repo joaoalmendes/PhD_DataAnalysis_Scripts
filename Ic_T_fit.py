@@ -576,14 +576,14 @@ def ic0_from_model(popt, Rn_Ohm):
                                    eta=eta)[0])
 
     dCel = popt.get("dCel", 0.95)
+    y0 = popt.get("y0", 0.0)
     if piecewise:
         return float(ic_ab_dwave_piecewise(
             T0, Delta0, Tc, Rn_Ohm,
             eta=eta, dCel=dCel,
-            Tm=popt["Tm"], k=popt["k"])[0])
+            Tm=popt["Tm"], k=popt["k"], y0=y0)[0])
 
     # smooth d-wave Eq. (7a)
-    y0 = popt.get("y0", 0.0)
     return float(ic_ab_dwave(T0, Delta0, Tc, Rn_Ohm,
                              eta=eta, dCel=dCel, y0=y0)[0])
 
@@ -661,12 +661,12 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
         hi.append(5.0)
 
         if piecewise:
+            # Eq. (7): free Tm and k  (Tc is fixed → Tc_fixed is not None)
             span = float(np.max(np.abs(Ic))) if len(Ic) else 1.0
             Tspan = max(T_hi - T_lo, 1.0)
             k_bound = 2.0 * span / Tspan
             tm_lo = T_lo * 0.5
-            tm_hi = min(T_hi * 0.99, Tc_fixed * 0.99)
-            # Eq. (7): free Tm and k
+            tm_hi = min(T_hi * 0.99, float(Tc_fixed) * 0.99)
             Tm_guess = float(np.clip(Tm_guess, tm_lo, tm_hi))
             free_names.append("Tm")
             p0.append(Tm_guess)
@@ -676,6 +676,12 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
             p0.append(k_guess)
             lo.append(-k_bound)
             hi.append(k_bound)
+            if fit_y0:
+                # vertical offset of the AB branch (and continuity at Tm)
+                free_names.append("y0")
+                p0.append(y0_guess)
+                lo.append(0.0)          # y0 >= 0
+                hi.append(span)
         elif fit_y0:
             # Eq. (7a): optional positive offset only
             free_names.append("y0")
@@ -691,13 +697,13 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
         eta = kw.get("eta", 1.0)
         if model == "d-wave":
             dCel = kw["dCel"]
+            y0 = kw.get("y0", 0.0)
             if piecewise:
                 return ic_ab_dwave_piecewise(
                     T_arr, Delta0, Tc, Rn_Ohm,
                     eta=eta, dCel=dCel,
-                    Tm=kw["Tm"], k=kw["k"])
+                    Tm=kw["Tm"], k=kw["k"], y0=y0)
             else:
-                y0 = kw.get("y0", 0.0)
                 return ic_ab_dwave(T_arr, Delta0, Tc, Rn_Ohm,
                                   eta=eta, dCel=dCel, y0=y0)
         else:
@@ -730,7 +736,7 @@ def fit_ic_vs_T(T, Ic, Rn_Ohm, model="ab", Tc_guess=None, fit_eta=False,
 
 
 def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
-                            Tm_initial=None):
+                            Tm_initial=None, fit_y0=False):
     """Fit N independent piecewise Eq. (7) models in consecutive T windows.
 
     If ``splits`` is supplied, its values are fixed window boundaries. If it is
@@ -738,6 +744,10 @@ def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
     squared residual across all segments (dynamic programming over contiguous
     temperature windows). Each segment has independent Delta0, eta, dCel, Tm,
     and k; Tc is fixed globally.
+
+    With ``fit_y0=True`` the highest-temperature segment (fit 1) also frees
+    the vertical offset y0 of its AB branch.  Lower-T segments still inherit
+    y0 from the continuity anchor at the shared boundary.
     """
     from functools import lru_cache
 
@@ -784,7 +794,7 @@ def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
     Delta0_0 = (4.28 / 2.0) * K_BOLTZ * Tc / (1e-3 * E_CHARGE)
 
     @lru_cache(maxsize=None)
-    def fit_window(i0, i1, anchor=None):
+    def fit_window(i0, i1, anchor=None, free_y0=False):
         Ts, Ics = T[i0:i1], Ic[i0:i1]
         if len(Ts) < 5:
             return None
@@ -806,19 +816,35 @@ def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
                 low_to_high_rank = min(n_segments - 1, int(mid_index / max(len(T), 1) * n_segments))
                 fit_rank = n_segments - 1 - low_to_high_rank
                 tm_guess = float(tm_values[fit_rank])
+            elif len(tm_values) == 1:
+                tm_guess = float(tm_values[0])
         tm0 = tm_guess if tm_guess is not None else 0.5 * (float(Ts.min()) + float(Ts.max()))
         tm0 = float(np.clip(tm0, tm_lo + 1e-9, tm_hi - 1e-9))
-        p0 = [Delta0_0, 1.0, 0.95, tm0, 0.0]
-        lo = [1e-3, 1e-3, 0.01, tm_lo, -k_bound]
-        hi = [50.0, 10.0, 5.0, tm_hi, k_bound]
+        # free y0 only for the highest-T segment (anchor is None) when requested
+        use_free_y0 = bool(free_y0) and anchor is None
+        y0_hi = max(float(np.max(np.abs(Ics))), 1e-6)
+        if use_free_y0:
+            free_names_win = ["Delta0_meV", "eta", "dCel", "Tm", "k", "y0"]
+            p0 = [Delta0_0, 1.0, 0.95, tm0, 0.0, 0.0]
+            lo = [1e-3, 1e-3, 0.01, tm_lo, -k_bound, 0.0]
+            hi = [50.0, 10.0, 5.0, tm_hi, k_bound, y0_hi]
+        else:
+            free_names_win = ["Delta0_meV", "eta", "dCel", "Tm", "k"]
+            p0 = [Delta0_0, 1.0, 0.95, tm0, 0.0]
+            lo = [1e-3, 1e-3, 0.01, tm_lo, -k_bound]
+            hi = [50.0, 10.0, 5.0, tm_hi, k_bound]
 
-        def segment_fn(x, Delta0, eta, dCel, Tm, k):
-            y0 = 0.0
-            if anchor is not None:
-                ta, ia = anchor
-                da = bcs_gap_dwave(np.array([ta]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
-                ab_a = float(_ab_core_mA(da, Tc, Rn_Ohm, eta)[0])
-                y0 = ia - ab_a
+        def segment_fn(x, *params):
+            Delta0, eta, dCel, Tm, k = params[:5]
+            if use_free_y0:
+                y0 = params[5]
+            else:
+                y0 = 0.0
+                if anchor is not None:
+                    ta, ia = anchor
+                    da = bcs_gap_dwave(np.array([ta]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
+                    ab_a = float(_ab_core_mA(da, Tc, Rn_Ohm, eta)[0])
+                    y0 = ia - ab_a
             return ic_ab_dwave_piecewise(x, Delta0, Tc, Rn_Ohm,
                                          eta=eta, dCel=dCel, Tm=Tm, k=k, y0=y0)
         try:
@@ -830,18 +856,24 @@ def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
         sse = float(np.sum((Ics - pred) ** 2))
         ss_tot = float(np.sum((Ics - np.mean(Ics)) ** 2))
         r2 = 1.0 - sse / ss_tot if ss_tot > 0 else 0.0
-        perr = np.sqrt(np.maximum(np.diag(pcov), 0.0)) if pcov is not None else np.full(5, np.nan)
-        Delta0, eta, dCel, Tm, k = map(float, popt_arr)
+        n_par = len(popt_arr)
+        perr = (np.sqrt(np.maximum(np.diag(pcov), 0.0))
+                if pcov is not None else np.full(n_par, np.nan))
+        Delta0, eta, dCel, Tm, k = map(float, popt_arr[:5])
+        if use_free_y0:
+            y0 = float(popt_arr[5])
+        else:
+            y0 = 0.0
+            if anchor is not None:
+                ta, ia = anchor
+                da = bcs_gap_dwave(np.array([ta]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
+                y0 = ia - float(_ab_core_mA(da, Tc, Rn_Ohm, eta)[0])
         Delta_Tm = bcs_gap_dwave(np.array([Tm]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
         AB_Tm = float(_ab_core_mA(Delta_Tm, Tc, Rn_Ohm, eta)[0])
-        y0 = 0.0
-        if anchor is not None:
-            ta, ia = anchor
-            da = bcs_gap_dwave(np.array([ta]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
-            y0 = ia - float(_ab_core_mA(da, Tc, Rn_Ohm, eta)[0])
         a0 = AB_Tm + y0 - k * Tm
         return {"popt_arr": popt_arr, "pcov": pcov, "pred": pred, "sse": sse,
                 "r_squared": r2, "param_err": perr, "a0_mA": float(a0),
+                "y0": float(y0), "free_names": free_names_win,
                 "T": Ts.copy(), "Ic": Ics.copy(), "i0": i0, "i1": i1}
 
     if not fixed_splits:
@@ -891,19 +923,17 @@ def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
     # Number fits from highest-T window downwards. Each lower-T segment's AB
     # branch is vertically shifted so it meets the previous (higher-T) fit at
     # the shared boundary; the offset is recalculated during every fit trial.
+    # Fit 1 (highest T) may free y0 when fit_y0 is True.
     windows = sorted(windows, key=lambda w: w[1], reverse=True)
     anchor = None
     for i, (i0, i1) in enumerate(windows):
-        fit = fit_window(i0, i1, anchor=anchor)
+        # free y0 only on the first (highest-T) segment
+        fit = fit_window(i0, i1, anchor=anchor, free_y0=(fit_y0 and i == 0))
         if fit is None:
             raise ValueError(f"Could not fit segment {i + 1}; try changing the split temperatures or using fewer segments.")
         all_pred[i0:i1] = fit["pred"]
-        Delta0, eta, dCel, Tm, k = map(float, fit["popt_arr"])
-        y0 = 0.0
-        if anchor is not None:
-            ta, ia = anchor
-            da = bcs_gap_dwave(np.array([ta]), Delta0 * 1e-3 * E_CHARGE, Tc, dCel)
-            y0 = ia - float(_ab_core_mA(da, Tc, Rn_Ohm, eta)[0])
+        Delta0, eta, dCel, Tm, k = map(float, fit["popt_arr"][:5])
+        y0 = float(fit["y0"])
         # For fits after the highest-temperature segment, report the zero-
         # current temperature of that segment's shifted AB branch. This is
         # the root of y0 + AB(T) = 0 on the AB branch T in [Tm, Tc].
@@ -929,9 +959,9 @@ def fit_piecewise_multiples(T, Ic, Rn_Ohm, n_segments, Tc, splits=None,
                 "Tm": Tm, "k": k, "y0": y0, "a0_mA": fit["a0_mA"], "Tc": float(Tc),
                 "Tc_expected": Tc_expected,
                 "model": "d-wave", "piecewise": True, "segment": i + 1,
-                "splits": boundaries}
+                "splits": boundaries, "y0_fitted": bool(fit_y0 and i == 0)}
         results.append({"popt": popt, "pcov": fit["pcov"],
-                        "free_names": ["Delta0_meV", "eta", "dCel", "Tm", "k"],
+                        "free_names": list(fit["free_names"]),
                         "r_squared": fit["r_squared"], "T_lo": float(T[i0]),
                         "T_hi": float(T[i1 - 1]), "n_points": int(i1 - i0),
                         "T": fit["T"], "Ic": fit["Ic"], "param_err": fit["param_err"],
@@ -1158,8 +1188,12 @@ Argument summary
     --fit-eta          Let the dimensionless prefactor eta vary; without
                        this flag eta is fixed at 1.  (Always free under
                        --piecewise.)
-    --fit-y0           Also fit a constant offset y0 >= 0 (mA).  Only for
-                       non-piecewise d-wave (Eq. 7a).
+    --fit-y0           Also fit a constant offset y0 >= 0 (mA):
+                       Eq. (7a)  — free y0 on the whole curve.
+                       --piecewise — free y0 on the AB branch.
+                       --piecewise-multiples — free y0 only on fit 1
+                       (highest-T segment); lower segments keep the
+                       continuity-derived offset.
     --Tc FLOAT         Only keep data with T <= Tc (K).
                        ab: also holds Tc fixed in the fit.
                        d-wave --piecewise: required and held fixed.
@@ -1212,8 +1246,10 @@ Argument summary
                         help="Treat eta as a free fit parameter "
                              "(default: eta = 1 fixed)")
     parser.add_argument("--fit-y0", action="store_true",
-                        help="Also fit a constant offset y0 >= 0 (mA); only "
-                             "for non-piecewise d-wave (Eq. 7a)")
+                        help="Fit constant offset y0 >= 0 (mA).  Eq. (7a): "
+                             "whole curve.  --piecewise: AB branch.  "
+                             "--piecewise-multiples: only fit 1 (highest-T "
+                             "segment); lower segments keep continuity y0.")
     parser.add_argument("--Tc", type=float, default=None,
                         help="Only analyse temperatures T <= Tc (K). "
                              "For --model ab: also holds Tc fixed in the fit. "
@@ -1240,8 +1276,6 @@ Argument summary
     if any_pw and args.model != "d-wave":
         parser.error("--piecewise / --piecewise-multiples only apply with "
                      "--model d-wave")
-    if any_pw and args.fit_y0:
-        parser.error("--fit-y0 is for Eq. (7a) only; not with piecewise modes")
     if any_pw and args.Tc is None:
         parser.error("Piecewise modes require --Tc <value> (Tc held fixed)")
     if args.piecewise_multiples is not None and args.piecewise_multiples < 2:
@@ -1321,7 +1355,8 @@ Argument summary
                 n_segments=args.piecewise_multiples,
                 Tc=args.Tc,
                 splits=splits if splits else None,
-                Tm_initial=args.Tm_initial[0] if args.Tm_initial is not None else None,
+                Tm_initial=args.Tm_initial if args.Tm_initial is not None else None,
+                fit_y0=args.fit_y0,
             )
             popt = segment_results[0]["popt"]
             free_names = segment_results[0]["free_names"]
@@ -1418,6 +1453,11 @@ Argument summary
                       + (f" +/- {k_err:.6g}" if k_err is not None else "")
                       + " uA/K")
                 print(f"  linear intercept I(0)     = {p['a0_mA']:.6g} mA")
+            if p.get("y0") is not None and (p.get("y0_fitted") or abs(p["y0"]) > 1e-12):
+                y0_tag = "fit" if p.get("y0_fitted") else "continuity"
+                print(f"  y0 ({y0_tag})                 = {p['y0']:.4f}"
+                      + (f" +/- {em['y0']:.4f}" if "y0" in em else "")
+                      + " mA")
             Ic0 = ic0_from_model(p, Rn_Ohm)
             print(f"  Ic(T=0)                   = {Ic0:.4f} mA")
             print(f"  R^2                       = {seg['r_squared']:.5f}")
@@ -1462,7 +1502,7 @@ Argument summary
                 print(f"k (fit)                     = {k_uA:.6g}"
                       + (f" +/- {k_err:.6g}" if k_err is not None else "")
                       + " uA/K")
-        if args.fit_y0:
+        if args.fit_y0 or (popt.get("y0") is not None and abs(popt.get("y0", 0.0)) > 1e-12):
             print(f"y0 (fit)                    = {popt['y0']:.4f}"
                   + (f" +/- {err_map['y0']:.4f}" if "y0" in err_map else "")
                   + " mA")
