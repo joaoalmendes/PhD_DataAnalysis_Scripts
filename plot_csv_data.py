@@ -1629,7 +1629,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
                          figsize=None, ic_I_min=None, ic_I_max=None,
                          rn_override_mOhm=None, rn_from_T_K=None,
                          advanced_outdir=None, advanced_quiet=False,
-                         ic_rho_frac=0.03, rho_k_noise=3.0, rho_smooth=1,
+                         ic_rho_frac=0.03, rho_k_noise=3.0, rho_smooth=5,
                          rho_persist=3, rho_imin_frac=0.02,
                          pre_jump_offset=3, use_jump_ic=True):
     """Compute Ic, Jc, R_N, Jc*R_N from I(V) data.
