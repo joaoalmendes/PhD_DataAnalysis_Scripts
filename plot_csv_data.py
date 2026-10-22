@@ -930,6 +930,21 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
     else:
         raise ValueError(f"Unknown plot_type: {plot_type}")
 
+    # Uni-directional IV loops (no --IV-BF): the first sample of each
+    # segment is an artefact of the rack jumping from +I_max of the
+    # previous loop to -I_max of the next.  Drop it for IV / dV / dI /
+    # dV/dI diagnostic plots so the real transition is visible.
+    n_pts = len(x)
+    keep = np.ones(n_pts, dtype=bool)
+    if (
+        not data.get("is_bf", False)
+        and plot_type in ("iv", "dvdI", "dv", "di")
+        and n_pts > 1
+    ):
+        keep[0] = False
+    x = x[keep]
+    y = y[keep]
+
     # Forward = black, backward = red (merged plot)
     base_ms = markersize if markersize is not None else 3
     if plot_points_line:
@@ -949,8 +964,9 @@ def plot_IV_dVdI(data, ax=None, plot_type="iv", show_branches=True, color="k",
 
     if show_branches and "branch" in data:
         colors = {"forward": "k", "backward": "tab:red"}
+        branch_arr = np.asarray(data["branch"])[keep]
         for b_name in ["forward", "backward"]:
-            mask = data["branch"] == b_name
+            mask = branch_arr == b_name
             if not np.any(mask):
                 continue
             _plt(x[mask], y[mask], colors[b_name], b_name.capitalize())
@@ -1653,6 +1669,8 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         voltage noise at small |I| cannot trigger the criterion.
     rho_smooth : int
         Median-filter length applied to V(I) before evaluating rho.
+        Affects only the rho-criterion Ic_eff path inside this function;
+        raw dV/dI used for 2D intensity maps is never smoothed by this.
     rho_persist : int
         Number of consecutive points that must satisfy rho > threshold.
     rho_imin_frac : float
@@ -1742,9 +1760,11 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
              rise/fall of dV/dI *near the peak*, so those steps get both
              a large |Δs| and large weights → highest score.
           4. Sum δ_i (optionally only those above diff_threshold) and pick
-             the window with the maximum score.  The reported Ic is |I| at
-             index (best_centre − pre_jump_offset), i.e. still in the SC
-             state just before the transition (default offset 3 points).
+             the window with the maximum score.  Points are ordered by
+             increasing |I| so the SC branch is at low indices; Ic is
+             taken at (best_centre − pre_jump_offset), still in the SC
+             state (default offset 3 points).  Correct for both polarities
+             and both F/B sweeps (switching and retrapping).
  
         Weighting makes the detector much less sensitive to the absolute
         scale of dV/dI across temperatures, so a single span /
@@ -1761,6 +1781,13 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
             return np.nan
         I_dir = np.asarray(I_seg[mask], dtype=float)
         sig_dir = np.asarray(signal_seg[mask], dtype=float)
+
+        # Sort by increasing |I| so the SC branch (low |I|) is at low
+        # indices.  pre_jump_offset then always steps toward smaller |I|,
+        # independent of polarity and of F/B sweep direction.
+        order = np.argsort(np.abs(I_dir))
+        I_dir = I_dir[order]
+        sig_dir = sig_dir[order]
  
         # Global peak scale on this polarity (for weights)
         peak = float(np.nanmax(np.abs(sig_dir)))
@@ -1802,7 +1829,7 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         # No meaningful jump → nan so caller falls back to the rho criterion
         if best_idx is None or max_change <= 0:
             return np.nan
-        # Step back by pre_jump_offset so Ic is taken while still SC
+        # Step toward SC (lower |I| ≡ lower index after the |I| sort)
         off = max(0, int(pre_jump_offset))
         best_idx = int(np.clip(best_idx - off, 0, len(I_dir) - 1))
         return abs(float(I_dir[best_idx]))
@@ -1906,39 +1933,69 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         return np.nan, None
  
     results['Ic_fallback'] = {}
- 
+
     # Branch masks (full data for fallbacks / effective; window for jump)
     if is_bf:
         fwd = branch == "forward"
         bwd = branch == "backward"
         fwd_win = fwd & ic_window
         bwd_win = bwd & ic_window
- 
+    else:
+        fwd = bwd = fwd_win = bwd_win = None
+
+    # ------------------------------------------------------------------
+    # Effective Ic / Ir ALWAYS from the rho criterion (unrestricted I).
+    # When use_jump_ic is False (no --ic-dvdi-range membership), this is
+    # the *only* critical-current evaluation performed — the jump
+    # detector is skipped entirely to save time.
+    # ------------------------------------------------------------------
+    if is_bf:
+        ic_eff, fb_ie = _ic_rho_criterion(I[fwd], V_arr[fwd], direction_sign=1)
+        ir_eff, fb_re = _ic_rho_criterion(I[bwd], V_arr[bwd], direction_sign=1)
+        results['Ic_eff+_f_mA'] = ic_eff * 1000 if np.isfinite(ic_eff) else np.nan
+        results['Ir_eff+_b_mA'] = ir_eff * 1000 if np.isfinite(ir_eff) else np.nan
+        results['Ic_eff_method'] = fb_ie
+        results['Ir_eff_method'] = fb_re
+    else:
+        ic_eff, fb_ie = _ic_rho_criterion(I, V_arr, direction_sign=1)
+        results['Ic_eff+_f_mA'] = ic_eff * 1000 if np.isfinite(ic_eff) else np.nan
+        results['Ir_eff+_b_mA'] = np.nan
+        results['Ic_eff_method'] = fb_ie
+        results['Ir_eff_method'] = None
+
+    if not use_jump_ic:
+        # No dV/dI jump search: only effective quantities are defined.
+        results['Ic+_f_mA'] = np.nan
+        results['Ic-_f_mA'] = np.nan
+        results['Ic+_b_mA'] = np.nan
+        results['Ic-_b_mA'] = np.nan
+        results['Ic_definition'] = 'rho_eff'
+    elif is_bf:
         Ic_plus_fwd, fb_pf = _resolve_ic(
             I[fwd_win], sig_arr[fwd_win],
             I[fwd], V_arr[fwd],
             1, ic_span, outlier_thresh, diff_threshold,
-            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
+            pre_jump_offset=pre_jump_offset, force_rho=False,
         )
         Ic_minus_fwd, fb_mf = _resolve_ic(
             I[fwd_win], sig_arr[fwd_win],
             I[fwd], V_arr[fwd],
             -1, ic_span, outlier_thresh, diff_threshold,
-            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
+            pre_jump_offset=pre_jump_offset, force_rho=False,
         )
         Ic_plus_bwd, fb_pb = _resolve_ic(
             I[bwd_win], sig_arr[bwd_win],
             I[bwd], V_arr[bwd],
             1, ic_span, outlier_thresh, diff_threshold,
-            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
+            pre_jump_offset=pre_jump_offset, force_rho=False,
         )
         Ic_minus_bwd, fb_mb = _resolve_ic(
             I[bwd_win], sig_arr[bwd_win],
             I[bwd], V_arr[bwd],
             -1, ic_span, outlier_thresh, diff_threshold,
-            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
+            pre_jump_offset=pre_jump_offset, force_rho=False,
         )
- 
+
         results['Ic+_f_mA'] = Ic_plus_fwd * 1000 if np.isfinite(Ic_plus_fwd) else np.nan
         results['Ic-_f_mA'] = Ic_minus_fwd * 1000 if np.isfinite(Ic_minus_fwd) else np.nan
         results['Ic+_b_mA'] = Ic_plus_bwd * 1000 if np.isfinite(Ic_plus_bwd) else np.nan
@@ -1949,27 +2006,18 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
             'Ic+_b_mA': fb_pb,
             'Ic-_b_mA': fb_mb,
         })
- 
-        # Effective Ic / Ir ALWAYS from the rho criterion, unrestricted I
-        # Ic_eff = SC→N on forward (+); Ir_eff = N→SC on backward (+)
-        ic_eff, fb_ie = _ic_rho_criterion(I[fwd], V_arr[fwd], direction_sign=1)
-        ir_eff, fb_re = _ic_rho_criterion(I[bwd], V_arr[bwd], direction_sign=1)
-        results['Ic_eff+_f_mA'] = ic_eff * 1000 if np.isfinite(ic_eff) else np.nan
-        results['Ir_eff+_b_mA'] = ir_eff * 1000 if np.isfinite(ir_eff) else np.nan
-        results['Ic_eff_method'] = fb_ie
-        results['Ir_eff_method'] = fb_re
-        results['Ic_definition'] = 'jump_dvdi' if use_jump_ic else 'rho_eff'
+        results['Ic_definition'] = 'jump_dvdi'
     else:
         # Uni-directional: report +/- on the single sweep as _f for convenience
         Ic_plus, fb_p = _resolve_ic(
             I_ic, sig_ic, I, V_arr,
             1, ic_span, outlier_thresh, diff_threshold,
-            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
+            pre_jump_offset=pre_jump_offset, force_rho=False,
         )
         Ic_minus, fb_m = _resolve_ic(
             I_ic, sig_ic, I, V_arr,
             -1, ic_span, outlier_thresh, diff_threshold,
-            pre_jump_offset=pre_jump_offset, force_rho=not use_jump_ic,
+            pre_jump_offset=pre_jump_offset, force_rho=False,
         )
         results['Ic+_f_mA'] = Ic_plus * 1000 if np.isfinite(Ic_plus) else np.nan
         results['Ic-_f_mA'] = Ic_minus * 1000 if np.isfinite(Ic_minus) else np.nan
@@ -1978,13 +2026,8 @@ def compute_iv_parameters(data, area_um2=1.0, rn_criterion=0.5, ic_span=10,
         results['Ic_fallback'].update({
             'Ic+_f_mA': fb_p, 'Ic-_f_mA': fb_m,
         })
-        ic_eff, fb_ie = _ic_rho_criterion(I, V_arr, direction_sign=1)
-        results['Ic_eff+_f_mA'] = ic_eff * 1000 if np.isfinite(ic_eff) else np.nan
-        results['Ir_eff+_b_mA'] = np.nan
-        results['Ic_eff_method'] = fb_ie
-        results['Ir_eff_method'] = None
-        results['Ic_definition'] = 'jump_dvdi' if use_jump_ic else 'rho_eff'
- 
+        results['Ic_definition'] = 'jump_dvdi'
+
     # Jc from switching current Ic+_f (effective Jc is Jc_eff_kA/cm2)
     ic_for_jc = results.get('Ic+_f_mA', np.nan)
     results['Jc_kA/cm2'] = (
@@ -6387,9 +6430,6 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument('--plot-didv', action='store_true', help="Plot dI/dV and find Riedel peaks")
     p.add_argument('--multi-t-file', type=str, nargs='?', const='',
                        help="Single file with multiple temperatures. Provide filename for 2D dV/dI map")
-    # deprecated / ignored (kept so old command lines still parse)
-    p.add_argument("--n-T-bins", type=int, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--n-I-bins", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument('--ic-span', type=int, default=10,
                    help="Span for jump detection in Ic (default 10)")
     p.add_argument('--outlier-thresh', type=float, default=5.0,
