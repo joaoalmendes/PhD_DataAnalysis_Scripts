@@ -1,0 +1,271 @@
+================================================================================
+plot_csv_data.py — usage reference
+================================================================================
+Entry point:
+
+    python3 plot_csv_data.py <MODE> [arguments...]
+
+Modes:  RT  |  IV  |  Hall_MR
+
+Ic(T) fitting after multi-T analysis is a separate script (Ic_T_fit.py) and is
+not covered here.
+
+
+================================================================================
+MODE: RT  —  Resistance vs temperature
+================================================================================
+Goal
+----
+Load one or more R(T) CSVs (PPMS or rack), plot R(T) with optional
+cooldown/warmup split, zooms, normal-state linear fit, Tc, RRR, dR/dT, and
+pseudogap T*.  Multiple files overlay on the same figure.
+
+Typical invocation
+------------------
+    python3 plot_csv_data.py RT <file.csv> [more.csv ...] [options]
+
+Arguments
+---------
+Input / instrument
+  csv_files              One or more measurement CSV paths (required).
+  --source {ppms,rack}   Instrument format (default: rack).
+  --current AMPS        Source current in A (required for --source rack).
+  --channel {1,2,3}      Rack LIA channel for V (default: 2 → column R2).
+  --bridge N             PPMS bridge channel (default: 1).
+  --rack-signals ...     Multiple rack columns with optional legends
+                         (e.g. R2:bottom  X1:Josephson).
+
+Data selection
+  --skip-points N        Drop the first N samples (e.g. SNR calibration).
+  --no-split             Do not split cooldown / warmup.
+  --branches             Colour cooldown and warmup differently.
+
+Plot / output
+  --labels L1 [L2 ...]   Legend labels, one per file (default: file names).
+  --normalized           Plot R / R(T_ref) instead of R.
+  --plot-points-line     Circles connected by a line.
+  --errorbars            Draw error bars when available.
+  --zoom XMIN XMAX       Extra zoomed panel (repeatable).
+  --figsize W H          Figure size in cm (default: 8.6 6.0).
+  -o, --output PATH      Output PDF (default: RT_plot.pdf).
+
+Normal-state fit
+  --fit-range TMIN TMAX  Weighted linear fit window (K); results on stdout.
+  --fit-branch {cooldown,warmup}
+                         Restrict fit to one branch.
+  --show-fit-on PANEL... Draw the fit on main and/or zoom1, zoom2, ...
+
+Tc and RRR
+  --find-tc              Tc where R reaches --tc-criterion of R_normal.
+  --tc-criterion FRAC    Fraction of R_normal (default: 0.5).
+  --tc-normal-range TMIN TMAX
+                         Window used to define R_normal.
+  --drdt                 Overlay dR/dT; Tc from the dR/dT peak.
+  --rrr                  Print RRR = R(T_high) / R(T_low).
+  --rrr-temp T_LOW       Temperature just above Tc for R_low (required with --rrr).
+  --rrr-window DT        Half-width (K) around --rrr-temp (default: 10).
+
+Pseudogap / resistivity geometry
+  --T-star               Estimate T* and save scaling plots.
+  --T-star-branch {both,cooldown,warmup}
+  --T-star-range TMIN TMAX
+  --T-star-Tc-offset DK  Auto-window starts at Tc + offset (K).
+  --area UM2 / --length UM / --thickness M / --width M
+                         Geometry for R → ρ conversion when needed.
+
+Abstract example
+----------------
+    python3 plot_csv_data.py RT run_RT.csv --source rack --current 1e-6 \
+        --skip-points 3 --branches --drdt --find-tc --zoom 2 15 -o RT.pdf
+
+
+================================================================================
+MODE: IV  —  I(V), dV/dI, and critical-current analysis
+================================================================================
+Goal
+----
+Analyse Josephson / transport I(V) data from the rack.  Four input layouts:
+
+  1. Single-T CSV(s)          one temperature per file
+  2. --multi-t-file           one CSV with many temperatures → 2D dV/dI map
+                              optional --per-T-analysis → singles/<T>K/
+  3. --multi-h-file           one CSV with many fields → Fraunhofer dV/dI map
+                              optional --per-H-analysis → singles/<H>/
+  4. --multi-temp PATTERN     glob of single-T files plotted together
+
+Critical current
+  - Default (no --ic-dvdi-range): only Ic_eff from the rho criterion
+    (V/(I·Rn) > --ic-rho-frac).  Jump search is not run.
+  - With --ic-dvdi-range LO HI [...]: dV/dI jump method inside those
+    axis ranges (T in K or H in Oe); outside, Ic_eff remains primary.
+    Use --ic-I-min / --ic-I-max to window the jump search in |I|.
+  - --ic-pre-jump-offset steps toward the SC state (lower |I|) from the
+    detected jump (default: 3 points).
+
+Without --IV-BF, each IV loop is forward-only; the first sample of each
+loop is dropped on diagnostic IV/dV/dI plots (rack jump artefact).
+
+Typical invocations
+-------------------
+    # single temperature
+    python3 plot_csv_data.py IV <file.csv> [options]
+
+    # multi-T map (+ optional per-T singles)
+    python3 plot_csv_data.py IV --multi-t-file <map.csv> [options]
+
+    # Fraunhofer map (+ optional per-H singles)
+    python3 plot_csv_data.py IV --multi-h-file <map.csv> [options]
+
+    # many single-T files
+    python3 plot_csv_data.py IV --multi-temp 'path/IV_*K*.csv' [options]
+
+Arguments
+---------
+Input layout (choose one)
+  csv_files              Single-T CSV path(s).
+  --multi-t-file CSV     Multi-temperature scan → 2D dV/dI(T,I) map.
+  --multi-h-file CSV     Multi-field scan → Fraunhofer dV/dI(H,I) map.
+  --multi-temp PATTERN   Glob of single-T CSVs.
+
+Channels / hardware
+  --channel-dV {1,2,3}   LIA channel for dV (default: 2).
+  --channel-dI {1,2,3}   LIA channel for dI (default: 1).
+  --di-sense-R OHM       Sense resistor for dI (default: 1000).
+  --phase                Also plot lock-in phase vs I.
+  --phase-channel COL    Phase column name (default: theta2).
+  --points-per-sweep N   Samples per forward sweep (default: 201).
+  --IV-BF                Each loop is forward+backward (2N−1 rows).
+                         Default: forward-only (N rows).
+
+Junction / Rn
+  --area UM2             Junction area (µm²) for Jc and optional --map-J.
+  --rn-criterion FRAC    High-bias window for Rn: |I| > FRAC·max|I|
+                         (default: 0.5).
+  --tc-for-rn K          Fit Rn once near Tc−2 K; reuse for all T.
+  --ic-rho-frac FRAC     Rho criterion threshold (default: 0.03).
+
+Ic detection (jump method — only with --ic-dvdi-range)
+  --ic-dvdi-range LO HI [LO HI ...]
+                         Axis intervals where the jump method is primary
+                         (T in K for multi-T, H in Oe for multi-H).
+                         When omitted, only Ic_eff is computed.
+  --ic-I-min A           Ignore |I| < this value in the jump search.
+  --ic-I-max A           Ignore |I| > this value in the jump search.
+  --ic-pre-jump-offset N Points toward SC from the jump (default: 3).
+  --ic-span N            Sliding-window length for the jump score (default: 10).
+  --outlier-thresh X     MAD outlier multiplier (default: 5).
+  --diff-threshold X     Minimum weighted step to sum (default: 0.001).
+
+Analysis / plots
+  --analyze              Compute Ic, Jc, Rn, etc. (and write logs).
+  --advanced             Extra metrics (gap, β_c, diode efficiency, …).
+  --plot-didv            dI/dV + Riedel peaks.
+  --split-sweeps         Separate F (top) / B (bottom) figures when BF.
+  --ic-lines             Vertical guide lines for Ic± F/B.
+  --plot-points-line     Circles + connecting line on diagnostics.
+  --map-J                2D map vs J (kA/cm²) instead of I (needs --area).
+  --figsize W H          Figure size in cm (default: 8.6 6.0).
+  -o, --output PATH      Output name for single-file mode.
+
+Multi-T file (--multi-t-file)
+  --T-initial K          First setpoint (else parsed from filename).
+  --T-final K            Last setpoint (else parsed from filename).
+  --T-step K             Step between setpoints (else parsed; alias: --T-round).
+  --T-max K              Keep only T ≤ T_max for map / per-T analysis.
+  --min-points N         Minimum points per temperature segment (default: 30).
+  --per-T-analysis       Write singles/<T>K/ plots + analysis.log each.
+  --singles-dir DIR      Root for per-T / per-H folders (default: singles).
+
+Multi-H file (--multi-h-file)
+  --H-step OE            Field step between loops (with --H-range).
+  --H-range H0 HF        First and last field (Oe) for the nominal axis.
+  --H-max OE             Keep only |H| ≤ H_max.
+  --BF                   File has forward and backward H sweeps (two maps).
+  --full-I               Plot full current range (default: I > 0 only).
+  --per-H-analysis       Write singles/<H>/ plots + analysis.log each.
+
+Abstract examples
+-----------------
+    # Single T, rho-only Ic, diagnostics
+    python3 plot_csv_data.py IV sample_3K.csv --area 215 --analyze \
+        --rn-criterion 0.65 --split-sweeps
+
+    # Multi-T map + per-T analysis; jump Ic only below 10 K
+    python3 plot_csv_data.py IV --multi-t-file map_2to35K.csv --IV-BF \
+        --T-max 30 --per-T-analysis --analyze --area 215 \
+        --ic-dvdi-range 2 10 --ic-I-min 1.8e-4 --ic-I-max 4e-4 \
+        --rn-criterion 0.75 --tc-for-rn 7.5
+
+    # Fraunhofer map
+    python3 plot_csv_data.py IV --multi-h-file fraunhofer.csv \
+        --H-range 0 200 --H-step 2 --full-I --per-H-analysis --analyze
+
+
+================================================================================
+MODE: Hall_MR  —  Hall effect and magnetoresistance
+================================================================================
+Goal
+----
+Analyse Hall (ρ_yx) and longitudinal (ρ_xx) field sweeps.  Forward files are
+required; optional backward files are averaged on a common H grid to reduce
+thermal drift.  Outputs R_H, n_H, µ_H, optional multi-T colour maps, and
+hysteresis checks.
+
+Typical invocation
+------------------
+    python3 plot_csv_data.py Hall_MR <fwd.csv...> --current AMPS \
+        --thickness M [--bwd-files ...] [options]
+
+Arguments
+---------
+Input
+  fwd_files              Forward-sweep CSV(s), −Hmax→+Hmax (required).
+  --bwd-files FILES...   Matching backward sweeps +Hmax→−Hmax.
+  --comments FILES...    Comments .txt metadata, same order as fwd files.
+  --T-labels L1 L2 ...   Temperature labels (default: mean Tsample).
+
+Channels / current
+  --current AMPS         Source current in A (required).
+  --hall-n N             LIA channel for Hall voltage (default: 1).
+  --mr-n N               LIA channel for longitudinal voltage (default: 2).
+  --hall-col {X,R}       Hall column type (default: R).
+  --mr-col {X,R}         MR column type (default: R).
+
+Sample geometry
+  --thickness M          Thickness in metres (required) for ρ_yx.
+  --width M              Sample width (m); with --length → full ρ_xx.
+  --length M             Voltage-probe separation (m).
+
+Hall analysis
+  --fit-H-range HMIN HMAX
+                         Positive-field window (Oe) for the linear R_H fit.
+  --rho-xx-field OE      Field at which ρ_xx enters µ_H (default: 0).
+  --ryx-fit-mode {normal,full}
+                         Fit above H_irr only, or full positive-H range.
+  --V-cell-Z A3          Unit-cell volume per Cu (Å³) for doping estimate.
+
+Display / diagnostics
+  --show-T               Extra Tsample(H) panel on the raw-voltage figure.
+  --check-hysteresis     Print ρ near H=0 for fwd vs bwd.
+  --zoom-Rxx HMIN HMAX   Zoomed symmetrized ρ_xx window (Oe).
+  --intensity-plots      Multi-T: dρ_xx/dH and FFT colour maps.
+  --n-grid N             Points on the common H grid (default: 500).
+  --figsize W H          Figure size in cm (default: 8.6 7.0).
+  -o, --output PATH      Output PDF base (default: Hall_MR.pdf).
+
+Abstract example
+----------------
+    python3 plot_csv_data.py Hall_MR fwd_5to-5T.csv --bwd-files bwd_5to-5T.csv \
+        --comments run_comments.txt --current 1e-6 --thickness 40e-9 \
+        --fit-H-range 20000 50000 --show-T --check-hysteresis \
+        --zoom-Rxx -500 500
+
+
+================================================================================
+Notes
+================================================================================
+- Figure sizes are in centimetres (matplotlib inches = cm / 2.54).
+- For multi-T / multi-H maps, T_step / T_initial / T_final (or H grid) are
+  preferably taken from the filename; CLI flags override the parse.
+- After --per-T-analysis, use Ic_T_fit.py on the singles/ tree to fit Ic(T).
+- Run  python3 plot_csv_data.py <MODE> -h  for the live help of any mode.
