@@ -5820,6 +5820,29 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             plot_points_line=plot_points_line,
         )
 
+        # Persist dV/dI vs I for later map reconstruction (Fraunhofer, etc.)
+        # Forward current sweep only; two columns: I(A), dV/dI(Ohm).
+        dvdi_path = os.path.join(folder, "dVdI.dat")
+        try:
+            br = np.asarray(data.get("branch", np.array([])))
+            if br.size == len(data["I"]) and np.any(br == "forward"):
+                m = br == "forward"
+            else:
+                m = np.ones(len(data["I"]), dtype=bool)
+            I_out = np.asarray(data["I"], dtype=float)[m]
+            Z_out = np.asarray(data["dVdI"], dtype=float)[m]
+            order = np.argsort(I_out)
+            I_out, Z_out = I_out[order], Z_out[order]
+            with open(dvdi_path, "w", encoding="utf-8") as fh:
+                fh.write("# Current_A    dVdI_Ohm\n")
+                for ii, zz in zip(I_out, Z_out):
+                    if np.isfinite(ii) and np.isfinite(zz):
+                        fh.write(f"{ii:.10g}  {zz:.10g}\n")
+                    elif np.isfinite(ii):
+                        fh.write(f"{ii:.10g}  nan\n")
+        except Exception as exc:
+            print(f"    ⚠ could not write {dvdi_path}: {exc}")
+
         # Log file
         log_path = os.path.join(folder, "analysis.log")
         with open(log_path, "w", encoding="utf-8") as fh:
@@ -5871,6 +5894,7 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                     fh.write("  Ic_definition: rho_eff\n")
                 _write_params_block(fh, params, advanced)
             fh.write(f"\nplots saved as {base_name}_*.pdf\n")
+            fh.write(f"dVdI data    : {os.path.join(folder, 'dVdI.dat')}\n")
             if advanced and params.get("didv_plot"):
                 fh.write(f"dI/dV gap plot : {params['didv_plot']}\n")
 
@@ -5932,19 +5956,16 @@ def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
 
     Returns a list of dicts compatible with ``compute_iv_parameters`` /
     ``plot_iv_diagnostics`` plus the H bookkeeping keys:
-        H_x_Oe        field used for plotting (nominal if --H-range else mean Hsample)
-        H_nominal_Oe  intended field (NaN without --H-range)
+        H_x_Oe        field used for plotting (nominal from --H-step if set, else mean)
+        H_nominal_Oe  nearest --H-step grid value (NaN if --H-step omitted)
         H_mean_Oe, H_std_Oe, H_sem_Oe, H_dev_Oe (mean - nominal),
         H_min_Oe, H_max_Oe, n_H_pts, H_branch ('fwd'/'bwd'), H_label, seg_index
     """
     n_pps = int(points_per_sweep) if points_per_sweep is not None else 0
     if n_pps <= 0:
         raise ValueError("points_per_sweep must be > 0 for multi-H segmentation.")
-    if H_range is not None:
-        if len(H_range) != 2:
-            raise ValueError("--H-range takes exactly two values (Oe).")
-        if H_step is None or float(H_step) <= 0:
-            raise ValueError("--H-range requires --H-step > 0 (Oe).")
+    if H_range is not None and len(H_range) != 2:
+        raise ValueError("--H-range takes exactly two values (Oe): H_lo H_hi.")
     stride = (2 * n_pps - 1) if iv_bf else n_pps
 
     df = _load_csv_rack(filepath, mode="iv", channel_dV=channel_dV,
@@ -5970,45 +5991,52 @@ def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
     H_nom = np.full(n_seg, np.nan)
     hbranch = np.full(n_seg, "ign", dtype=object)
 
-    if H_range is not None:
-        H0, H1 = float(H_range[0]), float(H_range[1])
-        step = float(H_step)
-        n_H = int(round(abs(H1 - H0) / step)) + 1
-        sgn = 1.0 if H1 >= H0 else -1.0
-        fwd_vals = H0 + sgn * step * np.arange(n_H)
-        if abs(fwd_vals[-1] - H1) > 0.01 * step:
-            print(f"  [segment-H] WARNING: (H1-H0) = {H1 - H0:g} Oe is not a "
-                  f"multiple of H-step={step:g}; last nominal point = "
-                  f"{fwd_vals[-1]:g} Oe")
-        n_f = min(n_seg, n_H)
-        n_b = max(0, min(n_seg - n_H, n_H))
-        hbranch[:n_f] = "fwd"
-        H_nom[:n_f] = fwd_vals[:n_f]
-        if n_b:
-            hbranch[n_H:n_H + n_b] = "bwd"
-            H_nom[n_H:n_H + n_b] = fwd_vals[::-1][:n_b]
-        n_extra = n_seg - n_H - n_b
-        print(f"  [segment-H] H-range {H0:g} -> {H1:g} Oe, step {step:g} Oe "
-              f"-> {n_H} points per sweep")
-        if n_f < n_H:
-            print(f"  [segment-H] WARNING: forward sweep incomplete "
-                  f"({n_f}/{n_H} loops in file).")
-        if n_extra > 0:
-            print(f"  [segment-H] WARNING: {n_extra} extra loop(s) beyond "
-                  f"2 x {n_H} ignored.")
-    else:
-        i_turn = _detect_H_turnaround(H_mean_all)
+    # Branch labels from the measured Hsample trend (shared turnaround
+    # is automatic: the extreme is the last fwd / first bwd point).
+    # --H-range is applied later as a *plot/analysis window*, not as the
+    # measurement grid definition.
+    #
+    # Important: without --BF, every kept segment is labelled "fwd" so that
+    # no IV loop is discarded as "bwd".  A false mid-sweep turnaround
+    # detection would otherwise silently drop half the Ic points.
+    i_turn = _detect_H_turnaround(H_mean_all)
+    if not BF:
+        hbranch[:] = "fwd"
         if i_turn is not None:
-            hbranch[:i_turn + 1] = "fwd"
-            hbranch[i_turn + 1:] = "bwd"
-        elif BF:
-            half = n_seg // 2
-            hbranch[:half] = "fwd"
-            hbranch[half:] = "bwd"
-            print("  [segment-H] WARNING: no H turnaround detected in "
-                  "Hsample; --BF splits the file in two equal halves.")
-        else:
-            hbranch[:] = "fwd"
+            print(f"  [segment-H] H turnaround detected at segment {i_turn} "
+                  f"(Hmean ≈ {H_mean_all[i_turn]:.4g} Oe) but --BF not set: "
+                  f"all {n_seg} loops kept as forward (use --BF for two panels).")
+        i_turn = None  # no shared-turnaround duplication without BF
+    elif i_turn is not None:
+        hbranch[:i_turn + 1] = "fwd"
+        hbranch[i_turn + 1:] = "bwd"
+        print(f"  [segment-H] H turnaround at segment {i_turn} "
+              f"(Hmean ≈ {H_mean_all[i_turn]:.4g} Oe); "
+              f"fwd={i_turn + 1}, bwd={n_seg - i_turn - 1}")
+    else:
+        half = n_seg // 2
+        hbranch[:half] = "fwd"
+        hbranch[half:] = "bwd"
+        print("  [segment-H] WARNING: no H turnaround detected in "
+              "Hsample; --BF splits the file in two equal halves.")
+
+    # Optional nominal grid from --H-step using the measured H span
+    if H_step is not None and float(H_step) > 0:
+        step = float(H_step)
+        H_valid = H_mean_all[np.isfinite(H_mean_all)]
+        if len(H_valid):
+            H_lo_m = float(np.min(H_valid))
+            H_hi_m = float(np.max(H_valid))
+            # Snap to a regular grid covering the measured span
+            n0 = int(np.floor(H_lo_m / step - 1e-9))
+            n1 = int(np.ceil(H_hi_m / step + 1e-9))
+            grid = step * np.arange(n0, n1 + 1)
+            for k in range(n_seg):
+                if not np.isfinite(H_mean_all[k]):
+                    continue
+                H_nom[k] = float(grid[np.argmin(np.abs(grid - H_mean_all[k]))])
+            print(f"  [segment-H] nominal grid from --H-step={step:g} Oe "
+                  f"(measured span {H_lo_m:.4g} … {H_hi_m:.4g} Oe)")
 
     has_bwd = bool(np.any(hbranch == "bwd"))
     n_bwd = int(np.sum(hbranch == "bwd"))
@@ -6033,12 +6061,25 @@ def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
         H_std = float(np.std(Hs_f, ddof=1)) if len(Hs_f) > 1 else np.nan
         H_sem = H_std / np.sqrt(len(Hs_f)) if np.isfinite(H_std) else np.nan
         H_nominal = float(H_nom[k])
-        H_x = H_nominal if H_range is not None else H_mean
+        # Map / Ic axis uses the physical mean Hsample so each IV loop keeps
+        # a unique field position.  Snapping to --H-step (nominal) collapsed
+        # neighbouring loops onto the same x and hid Ic markers.
+        # Nominal remains available as H_nominal_Oe for logs / bookkeeping.
+        H_x = H_mean
         if not np.isfinite(H_x):
             continue
         if H_max is not None and abs(H_x) > float(H_max) + 1e-9:
             n_skip_hmax += 1
             continue
+        if H_range is not None:
+            H_lo = min(float(H_range[0]), float(H_range[1]))
+            H_hi = max(float(H_range[0]), float(H_range[1]))
+            # Window on the physical field (mean Hsample), independent of
+            # whether the map axis later uses nominal or --H-mean.
+            H_for_window = H_mean if np.isfinite(H_mean) else H_x
+            if H_for_window < H_lo - 1e-9 or H_for_window > H_hi + 1e-9:
+                n_skip_hmax += 1  # reuse counter for window skips
+                continue
 
         fwd = df.iloc[i0:i0 + n_pps]
         bwd = (df.iloc[i0 + n_pps - 1:i0 + stride] if iv_bf
@@ -6085,11 +6126,40 @@ def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
             "H_max_Oe": float(np.max(Hs_f)) if len(Hs_f) else np.nan,
             "n_H_pts": int(len(Hs_f)),
             "H_branch": str(b), "H_label": lab, "seg_index": k,
-            "H_from_range": H_range is not None,
+            "H_from_range": False,  # H-range is a keep-window, not a grid source
         })
 
     if n_skip_hmax:
-        print(f"  [segment-H] --H-max={H_max:g} Oe: skipped {n_skip_hmax} loop(s)")
+        bits = []
+        if H_max is not None:
+            bits.append(f"--H-max={H_max:g}")
+        if H_range is not None:
+            bits.append(f"--H-range [{min(H_range):g}, {max(H_range):g}]")
+        print(f"  [segment-H] skipped {n_skip_hmax} loop(s) outside "
+              + (" / ".join(bits) if bits else "window") + " Oe")
+
+    # Shared turnaround: the last forward segment is also the first of the
+    # return sweep and is not measured twice.  Duplicate it into the bwd
+    # branch so both intensity-map panels show that field point.
+    if BF:
+        fwd_ds = [d for d in datasets if d["H_branch"] == "fwd"]
+        bwd_ds = [d for d in datasets if d["H_branch"] == "bwd"]
+        if fwd_ds and bwd_ds and i_turn is not None:
+            # last fwd by segment index
+            turn = max(fwd_ds, key=lambda d: d.get("seg_index", -1))
+            H_turn = turn.get("H_x_Oe", np.nan)
+            already = any(
+                abs(d.get("H_x_Oe", np.nan) - H_turn) < 1e-6
+                for d in bwd_ds if np.isfinite(d.get("H_x_Oe", np.nan))
+            )
+            if not already and np.isfinite(H_turn):
+                dup = dict(turn)
+                dup["H_branch"] = "bwd"
+                dup["H_label"] = f"H{H_turn:+.1f}Oe_Hbwd"
+                datasets.append(dup)
+                print(f"  [segment-H] shared turnaround {H_turn:g} Oe "
+                      f"copied into backward sweep for the map")
+
     print(f"  [segment-H] {len(datasets)} IV loop(s) kept "
           f"(forward: {sum(d['H_branch'] == 'fwd' for d in datasets)}, "
           f"backward: {sum(d['H_branch'] == 'bwd' for d in datasets)})")
@@ -6143,13 +6213,23 @@ def _write_H_log_block(fh, d):
 def plot_Fraunhofer_dvdi_map(datasets, output, BF=False, full_I=False,
                              figsize=(8.6, 6.0), clim_pct=(2, 98),
                              params_list=None, show_ic_eff=False,
-                             H_step=None):
-    """Intensity map: x = mu0 H (mT), y = current (uA), colour = dV/dI (Ohm).
+                             H_step=None, I_range_A=None, Rn_Ohm=None):
+    """Intensity map: x = mu0 H (mT), y = current (or I·Rn), colour = dV/dI.
 
     For each field the *forward current sweep* is used (one value per I).
     Only I > 0 is drawn unless ``full_I``.  With ``BF`` two stacked panels
     (forward H sweep on top, backward H sweep below) share the x axis and
     the colour scale.
+
+    Gaps on the common current grid (different I steps between loops) are
+    filled by 1-D linear interpolation along I; the mean number of filled
+    cells per IV is printed.  ``I_range_A`` is an optional (I_min,) or
+    (I_min, I_max) in Amperes constraining the plotted current window.
+
+    If ``Rn_Ohm`` is given (normal-state resistance in Ohm):
+      * y-axis is I·Rn in mV
+      * colour is (dV/dI)/Rn  (dimensionless)
+      * Ic overlays are also converted to I·Rn (mV)
     """
     set_paper_style()
     branches = ["fwd", "bwd"] if BF else ["fwd"]
@@ -6162,14 +6242,25 @@ def plot_Fraunhofer_dvdi_map(datasets, output, BF=False, full_I=False,
         print("  [map-H] no data to plot.")
         return
 
+    use_rn = Rn_Ohm is not None and float(Rn_Ohm) > 0
+    Rn = float(Rn_Ohm) if use_rn else None
+
     def _get_IZ(d):
         m = (np.asarray(d["branch"]) == "forward")
-        I = np.asarray(d["I"], dtype=float)[m] * 1e6          # uA
-        Z = np.asarray(d["dVdI"], dtype=float)[m]             # Ohm
-        keep = np.isfinite(I) & np.isfinite(Z)
+        I_A = np.asarray(d["I"], dtype=float)[m]
+        Z_ohm = np.asarray(d["dVdI"], dtype=float)[m]
+        keep = np.isfinite(I_A) & np.isfinite(Z_ohm)
         if not full_I:
-            keep &= I > 0
-        return I[keep], Z[keep]
+            keep &= I_A > 0
+        I_A, Z_ohm = I_A[keep], Z_ohm[keep]
+        if use_rn:
+            # y: I·Rn in mV;  colour: (dV/dI)/Rn dimensionless
+            y = I_A * Rn * 1e3
+            z = Z_ohm / Rn
+        else:
+            y = I_A * 1e6          # µA
+            z = Z_ohm              # Ohm
+        return y, z
 
     used = [i for idx in cols.values() for i in idx]
     I_all, Z_all = [], []
@@ -6177,54 +6268,130 @@ def plot_Fraunhofer_dvdi_map(datasets, output, BF=False, full_I=False,
         I, Z = _get_IZ(datasets[i])
         I_all.append(I)
         Z_all.append(Z)
+    if not any(len(I) for I in I_all):
+        print("  [map-H] no finite current points - map not produced.")
+        return
     I_ref = max(I_all, key=len)
     I_ref = np.unique(np.round(I_ref, 6))
+
+    # Optional current window (Amperes → plot units)
+    if I_range_A is not None and len(I_range_A) >= 1:
+        a_lo = float(I_range_A[0])
+        if len(I_range_A) >= 2 and I_range_A[1] is not None:
+            a_hi = float(I_range_A[1])
+        else:
+            # recover max |I| from plot units
+            ymax = float(np.nanmax(np.abs(np.concatenate(
+                [a for a in I_all if len(a)]))))
+            a_hi = (ymax / (Rn * 1e3)) if use_rn else (ymax * 1e-6)
+        if a_hi < a_lo:
+            a_lo, a_hi = a_hi, a_lo
+        if use_rn:
+            i_lo, i_hi = a_lo * Rn * 1e3, a_hi * Rn * 1e3
+        else:
+            i_lo, i_hi = a_lo * 1e6, a_hi * 1e6
+        I_ref = I_ref[(I_ref >= i_lo - 1e-9) & (I_ref <= i_hi + 1e-9)]
+        print(f"  [map-H] I window: {a_lo:.4g} – {a_hi:.4g} A"
+              + (f"  →  {i_lo:.4g} – {i_hi:.4g} mV (I·Rn)" if use_rn
+                 else f"  →  {i_lo:.4g} – {i_hi:.4g} µA"))
+
     if len(I_ref) < 2:
         print("  [map-H] fewer than 2 current points - map not produced.")
         return
     I_edges = _edges_from_centers(I_ref)
-    Zc = np.concatenate(Z_all)
+    Zc = np.concatenate([z for z in Z_all if len(z)])
     vmin, vmax = np.nanpercentile(Zc, list(clim_pct))
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
         vmin, vmax = float(np.nanmin(Zc)), float(np.nanmax(Zc))
-    print(f"  [map-H] {Zc.size:,} points; dV/dI colour range "
-          f"({clim_pct[0]}-{clim_pct[1]}th pct): {vmin:.3f} - {vmax:.3f} Ohm")
+    if use_rn:
+        print(f"  [map-H] Rn = {Rn:g} Ohm;  {Zc.size:,} points; "
+              f"(dV/dI)/Rn colour range ({clim_pct[0]}-{clim_pct[1]}th pct): "
+              f"{vmin:.4g} - {vmax:.4g}")
+    else:
+        print(f"  [map-H] {Zc.size:,} points; dV/dI colour range "
+              f"({clim_pct[0]}-{clim_pct[1]}th pct): {vmin:.3f} - {vmax:.3f} Ohm")
 
     nrow = len(cols)
     w, h = figsize[0] / 2.54, figsize[1] / 2.54
     fig, axes = plt.subplots(nrow, 1, sharex=True, constrained_layout=True,
                              figsize=(w, h * (1.0 if nrow == 1 else 1.6)))
     axes = np.atleast_1d(axes)
-    cmap = plt.get_cmap("viridis")
+    cmap = plt.get_cmap("jet")
     x_lo, x_hi = np.inf, -np.inf
     im = None
     fallback_w = (float(H_step) * _OE_TO_MT) if H_step else 1.0
+    fill_counts = []
+
+    # Bright overlay colours for contrast on jet
+    c_ic = "#00FF00"       # bright green — jump Ic
+    c_ic_eff = "#FFFFFF"   # white — Ic_eff
+    c_ir_eff = "#00FFFF"   # cyan — Ir_eff
+
+    def _fill_gaps_1d(col):
+        """Linear-interpolate NaNs along the current axis; return n_filled."""
+        col = np.asarray(col, dtype=float).copy()
+        n = len(col)
+        good = np.isfinite(col)
+        n_miss = int(np.count_nonzero(~good))
+        if n_miss == 0 or not np.any(good):
+            return col, 0
+        idx = np.arange(n)
+        col[~good] = np.interp(idx[~good], idx[good], col[good])
+        # do not extrapolate beyond measured ends — restore edge NaNs
+        first, last = int(np.argmax(good)), int(n - 1 - np.argmax(good[::-1]))
+        if first > 0:
+            col[:first] = np.nan
+        if last < n - 1:
+            col[last + 1:] = np.nan
+        n_filled = int(np.count_nonzero(np.isfinite(col) & ~good))
+        return col, n_filled
+
+    def _ic_to_y(ic_mA):
+        """Convert Ic in mA to plot y units (µA or I·Rn in mV)."""
+        arr = np.asarray(ic_mA, dtype=float)
+        if use_rn:
+            return arr * Rn          # mA * Ohm = mV
+        return arr * 1e3             # mA → µA
 
     for ax, (b, idx) in zip(axes, cols.items()):
-        x = np.array([datasets[i]["H_x_Oe"] for i in idx]) * _OE_TO_MT   # mT
+        x = np.array([datasets[i]["H_x_Oe"] for i in idx], dtype=float) * _OE_TO_MT
         order = np.argsort(x)
         idx = [idx[o] for o in order]
         x = x[order]
+        # Tiny jitter for exact numeric duplicates so pcolormesh edges stay
+        # strictly increasing (otherwise a whole column can vanish).
+        for j in range(1, len(x)):
+            if np.isfinite(x[j]) and np.isfinite(x[j - 1]) and x[j] <= x[j - 1]:
+                x[j] = x[j - 1] + 1e-6
         grid = np.full((len(I_ref), len(idx)), np.nan)
         for j, i in enumerate(idx):
             I, Z = _get_IZ(datasets[i])
             if len(I) == 0:
+                fill_counts.append(0)
                 continue
             ii = np.digitize(I, I_edges) - 1
             ok = (ii >= 0) & (ii < len(I_ref))
-            grid[ii[ok], j] = Z[ok]
+            # last write wins if several samples fall in one bin
+            for k, z in zip(ii[ok], Z[ok]):
+                grid[k, j] = z
+            grid[:, j], n_f = _fill_gaps_1d(grid[:, j])
+            fill_counts.append(n_f)
         H_edges = _edges_from_centers(x, fallback_w)
         im = ax.pcolormesh(H_edges, I_edges, np.ma.masked_invalid(grid),
                            cmap=cmap, vmin=vmin, vmax=vmax,
                            shading="flat", rasterized=True)
         x_lo, x_hi = min(x_lo, H_edges[0]), max(x_hi, H_edges[-1])
-        ax.set_ylabel(r"Current ($\mu$A)")
+        if use_rn:
+            ax.set_ylabel(r"$I R_n$ (mV)")
+        else:
+            ax.set_ylabel(r"Current ($\mu$A)")
         ax.set_ylim(I_edges[0], I_edges[-1])
         ax.margins(0)
         if BF:
             ax.text(0.02, 0.96, "H forward" if b == "fwd" else "H backward",
                     transform=ax.transAxes, va="top", ha="left",
-                    fontsize=7, color="w")
+                    fontsize=7, color="w",
+                    path_effects=[])
 
         if params_list is not None:
             xs, ic_jump, ic_eff, ir_eff = [], [], [], []
@@ -6232,32 +6399,31 @@ def plot_Fraunhofer_dvdi_map(datasets, output, BF=False, full_I=False,
                 p = params_list[i] if i < len(params_list) else {}
                 xs.append(x[j])
                 defn = p.get("Ic_definition", "rho_eff")
-                # Primary Ic for this field point (mA → µA)
                 if defn == "jump_dvdi":
-                    ic_jump.append(p.get("Ic+_f_mA", np.nan) * 1e3)
+                    ic_jump.append(p.get("Ic+_f_mA", np.nan))
                     ic_eff.append(np.nan)
                 else:
                     ic_jump.append(np.nan)
-                    ic_eff.append(p.get("Ic_eff+_f_mA", np.nan) * 1e3)
-                ir_eff.append(p.get("Ir_eff+_b_mA", np.nan) * 1e3)
+                    ic_eff.append(p.get("Ic_eff+_f_mA", np.nan))
+                ir_eff.append(p.get("Ir_eff+_b_mA", np.nan))
             xs = np.asarray(xs)
-            ic_jump = np.asarray(ic_jump)
-            ic_eff = np.asarray(ic_eff)
-            ir_eff = np.asarray(ir_eff)
+            ic_jump = _ic_to_y(ic_jump)
+            ic_eff = _ic_to_y(ic_eff)
+            ir_eff = _ic_to_y(ir_eff)
             mj = np.isfinite(ic_jump)
             me = np.isfinite(ic_eff)
             mr = np.isfinite(ir_eff)
             handles_labels = []
             if np.any(mj):
-                h, = ax.plot(xs[mj], ic_jump[mj], "o-", color="k", ms=1.5, lw=0.6,
+                h, = ax.plot(xs[mj], ic_jump[mj], "o-", color=c_ic, ms=2.0, lw=0.8,
                              label=r"$I_c$")
                 handles_labels.append((h, r"$I_c$"))
             if np.any(me):
-                h, = ax.plot(xs[me], ic_eff[me], "o-", color="gold", ms=1.5, lw=0.6,
+                h, = ax.plot(xs[me], ic_eff[me], "o-", color=c_ic_eff, ms=2.0, lw=0.8,
                              label=r"$I_{c,\mathrm{eff}}$")
                 handles_labels.append((h, r"$I_{c,\mathrm{eff}}$"))
             if show_ic_eff and np.any(mr):
-                h, = ax.plot(xs[mr], ir_eff[mr], "o-", color="darkblue", ms=1.5, lw=0.6,
+                h, = ax.plot(xs[mr], ir_eff[mr], "o-", color=c_ir_eff, ms=2.0, lw=0.8,
                              label=r"$I_{r,\mathrm{eff}}$")
                 handles_labels.append((h, r"$I_{r,\mathrm{eff}}$"))
             if handles_labels:
@@ -6265,12 +6431,63 @@ def plot_Fraunhofer_dvdi_map(datasets, output, BF=False, full_I=False,
                 for txt in leg.get_texts():
                     txt.set_color("white")
 
+    if fill_counts:
+        avg_fill = float(np.mean(fill_counts))
+        print(f"  [map-H] gap-fill along I: mean {avg_fill:.2f} cells/IV "
+              f"(of {len(I_ref)} I bins; "
+              f"{100.0 * avg_fill / max(len(I_ref), 1):.2f}% of each column)")
+
     axes[-1].set_xlabel(r"$\mu_0 H$ (mT)")
     axes[-1].set_xlim(x_lo, x_hi)
-    fig.colorbar(im, ax=list(axes), label=r"dV/dI ($\Omega$)")
+    cbar_label = (r"$(dV/dI)/R_n$" if use_rn else r"dV/dI ($\Omega$)")
+    fig.colorbar(im, ax=list(axes), label=cbar_label)
     fig.savefig(output, dpi=300)
     plt.close(fig)
     print(f"Saved: {output}")
+
+
+
+def _fmt_array_cell(arr, prec=8):
+    """Space-separated floats for a single CSV cell (no commas)."""
+    a = np.asarray(arr, dtype=float)
+    parts = []
+    for v in a:
+        if np.isfinite(v):
+            parts.append(f"{v:.{prec}g}")
+        else:
+            parts.append("nan")
+    return " ".join(parts)
+
+
+def save_multi_h_summary_csv(path, datasets, params_list=None):
+    """Write one row per H loop: field bookkeeping + Ic (if analysed).
+
+    Full dV/dI(I) curves are stored as ``dVdI.dat`` inside each
+    ``singles/<Hlabel>/`` folder by the per-H analysis; Fraunhofer_analysis
+    should read those files rather than this CSV for intensity backgrounds.
+    """
+    rows = []
+    for i, d in enumerate(datasets):
+        p = params_list[i] if params_list is not None and i < len(params_list) else {}
+        rows.append({
+            "H_Oe": d.get("H_x_Oe"),
+            "H_nominal_Oe": d.get("H_nominal_Oe"),
+            "H_mean_Oe": d.get("H_mean_Oe"),
+            "H_std_Oe": d.get("H_std_Oe"),
+            "H_sem_Oe": d.get("H_sem_Oe"),
+            "H_branch": d.get("H_branch"),
+            "H_label": d.get("H_label"),
+            "Ic+_f_mA": p.get("Ic+_f_mA", np.nan),
+            "Ic_eff+_f_mA": p.get("Ic_eff+_f_mA", np.nan),
+            "Ir_eff+_b_mA": p.get("Ir_eff+_b_mA", np.nan),
+            "Ic_definition": p.get("Ic_definition", ""),
+            "Rn_mean_mOhm": p.get("Rn_mean_mOhm", np.nan),
+        })
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False)
+    print(f"  [multi-H] summary CSV saved: {os.path.abspath(path)}  "
+          f"({len(rows)} field points)")
+    return path
 
 
 def _run_multi_h_file(args):
@@ -6282,8 +6499,10 @@ def _run_multi_h_file(args):
     H_max = getattr(args, "H_max", None)
     BF = bool(getattr(args, "BF", False))
     full_I = bool(getattr(args, "full_I", False))
+    use_H_mean = bool(getattr(args, "H_mean", False))
     pps = getattr(args, "points_per_sweep", DEFAULT_POINTS_PER_SWEEP)
     iv_bf = bool(getattr(args, "IV_BF", False))
+    I_range_A = getattr(args, "dvdi_plot_I_range", None)
 
     print(f"Running Fraunhofer (multi-H) analysis: {filepath}")
     datasets = segment_multi_h_iv(
@@ -6299,9 +6518,10 @@ def _run_multi_h_file(args):
         print("  No H segments - nothing to do.")
         return
 
-    if H_range is None:
-        print("  [H] --H-range not given: x axis = mean Hsample per IV loop "
-              "(may be unreliable).")
+    # Axis is always mean Hsample (set at segmentation). --H-mean is a no-op.
+    print(f"  [H] x axis = mean Hsample per IV loop ({len(datasets)} loops)")
+    if H_range is not None:
+        print(f"  [H] --H-range window: [{min(H_range):g}, {max(H_range):g}] Oe")
     print(_format_H_noise_report(datasets))
 
     params_list = None
@@ -6340,12 +6560,21 @@ def _run_multi_h_file(args):
         )
 
     base = os.path.splitext(os.path.basename(filepath))[0]
-    out = f"{base}_dVdI_H_map" + ("_fullI" if full_I else "") + ".pdf"
+    csv_path = f"{base}_multiH_data.csv"
+    save_multi_h_summary_csv(csv_path, datasets, params_list=params_list)
+
+    Rn_Ohm = getattr(args, "Rn", None)
+    out = f"{base}_dVdI_H_map" + ("_fullI" if full_I else "")
+    if Rn_Ohm is not None:
+        out += "_IcRn"
+    out += ".pdf"
     plot_Fraunhofer_dvdi_map(
         datasets, out, BF=BF, full_I=full_I, figsize=tuple(args.figsize),
         params_list=params_list,
         show_ic_eff=params_list is not None,
         H_step=H_step,
+        I_range_A=I_range_A,
+        Rn_Ohm=Rn_Ohm,
     )
 
 
@@ -6472,12 +6701,15 @@ def _add_IV_dVdI_parser(subparsers):
                         "measurement). Produces a dV/dI intensity map "
                         "(mu0H in mT vs current in uA).")
     p.add_argument('--H-step', type=float, default=None, metavar='OE',
-                   help="Field step (Oe) between successive IV loops. Required with --H-range.")
+                   help="Field step (Oe) for nominal bookkeeping (H_nominal_Oe in "
+                        "logs) and as the default intensity-map strip width. "
+                        "The map x-axis always uses mean Hsample so every IV "
+                        "loop keeps a unique field position.")
     p.add_argument('--H-range', nargs=2, type=float, default=None,
-                   metavar=('H_FIRST_OE', 'H_LAST_OE'),
-                   help="First and last measured field (Oe). When given, the nominal values "
-                        "(H_first + k*H_step) are used on the x axis and Hsample is only used "
-                        "to estimate the field noise/error.")
+                   metavar=('H_LO', 'H_HI'),
+                   help="Plot/analysis window in Oe: only keep IV loops whose field "
+                        "lies in [min(H_LO,H_HI), max(H_LO,H_HI)]. "
+                        "Example: --H-range -10 150.")
     p.add_argument('--H-max', type=float, default=None, metavar='OE',
                    help="Only analyse/plot loops with |H| <= H_max (Oe).")
     p.add_argument('--BF', action='store_true',
@@ -6485,6 +6717,19 @@ def _add_IV_dVdI_parser(subparsers):
                         "maps (forward top, backward bottom).")
     p.add_argument('--full-I', action='store_true',
                    help="Plot the full current range (default: I > 0 only).")
+    p.add_argument('--H-mean', action='store_true',
+                   help="Accepted for compatibility: the multi-H map axis "
+                        "already uses mean Hsample per IV loop.")
+    p.add_argument('--dvdi-plot-I-range', nargs='+', type=float, default=None,
+                   metavar='A',
+                   help="Constrain the dV/dI intensity-map current axis "
+                        "(Amperes). One value: I_min only (I_max = max |I|). "
+                        "Two values: I_min I_max.")
+    p.add_argument('--Rn', type=float, default=None, metavar='OHM',
+                   help="For --multi-h-file maps: normal-state resistance (Ohm). "
+                        "When set, the intensity-map y-axis is I·Rn (mV) and the "
+                        "colour scale is (dV/dI)/Rn (dimensionless). "
+                        "Ic overlays are converted to I·Rn as well.")
     p.add_argument('--per-H-analysis', action='store_true',
                    help="For --multi-h-file: per-field single IV analysis "
                         "(singles/<H label>/ with plots + analysis.log).")

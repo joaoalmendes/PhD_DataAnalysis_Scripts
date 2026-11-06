@@ -103,6 +103,7 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy import odr
 
 # ----------------------------------------------------------------------
 # Physical constants (SI)
@@ -218,6 +219,19 @@ def parse_log(path):
                 H_branch = m.group(2).lower()
 
     Hsample_mean = _grab_float(r"^Hsample_mean\s*:\s*([\-0-9.eE]+)", text)
+    Hsample_std = _grab_float(r"^Hsample_std\s*:\s*([\-0-9.eE]+)", text)
+    Hsample_sem = _grab_float(r"^Hsample_sem\s*:\s*([\-0-9.eE]+)", text)
+    # Hsample_min/max : 4.7260 / 9.6410 Oe
+    m_mm = re.search(
+        r"^Hsample_min/max\s*:\s*([\-0-9.eE]+)\s*/\s*([\-0-9.eE]+)",
+        text, re.MULTILINE,
+    )
+    Hsample_min = float(m_mm.group(1)) if m_mm else None
+    Hsample_max = float(m_mm.group(2)) if m_mm else None
+    n_Hsample = _grab_float(r"^n_Hsample_pts\s*:\s*([\-0-9.eE]+)", text)
+    if n_Hsample is not None:
+        n_Hsample = int(n_Hsample)
+
     is_bf_str = _grab_str(r"^is_bf\s*:\s*(\w+)", text)
     is_bf = (is_bf_str or "").lower() in ("true", "1", "yes")
 
@@ -238,11 +252,24 @@ def parse_log(path):
     H_mT = H_Oe * OE_TO_MT if H_Oe is not None else None
     Ic_active_uA = (Ic_active_mA * MA_TO_UA) if Ic_active_mA is not None else None
 
+    # Working field uncertainty in mT: prefer SEM (uncertainty on the mean)
+    H_err_mT = None
+    if Hsample_sem is not None and np.isfinite(Hsample_sem):
+        H_err_mT = float(Hsample_sem) * OE_TO_MT
+    elif Hsample_std is not None and np.isfinite(Hsample_std):
+        H_err_mT = float(Hsample_std) * OE_TO_MT
+
     return {
         "H_Oe": H_Oe,
         "H_mT": H_mT,
         "H_branch": H_branch,
         "Hsample_mean_Oe": Hsample_mean,
+        "Hsample_std_Oe": Hsample_std,
+        "Hsample_sem_Oe": Hsample_sem,
+        "Hsample_min_Oe": Hsample_min,
+        "Hsample_max_Oe": Hsample_max,
+        "n_Hsample_pts": n_Hsample,
+        "H_err_mT": H_err_mT,
         "Ic_mA": Ic_raw,
         "Ic_eff_mA": Ic_eff,
         "Ic_active_mA": Ic_active_mA,
@@ -288,7 +315,7 @@ def collect_data(base_dir):
     print(f"  matched pattern: {used_pattern}  ({len(log_files)} file(s))")
 
     records = []
-    n_jump = n_eff = 0
+    n_jump = n_eff = n_dvdi = 0
     for lf in log_files:
         rec = parse_log(lf)
         missing = [k for k in ("H_mT", "Ic_active_uA") if rec[k] is None]
@@ -299,12 +326,22 @@ def collect_data(base_dir):
             n_jump += 1
         else:
             n_eff += 1
+
+        # Optional dV/dI trace from the same measurement folder
+        folder = os.path.dirname(lf)
+        I_uA, dVdI = load_dvdi_dat(folder)
+        rec["I_array_uA"] = I_uA
+        rec["dVdI_array_Ohm"] = dVdI
+        if I_uA is not None:
+            n_dvdi += 1
+
         records.append(rec)
 
     if not records:
         raise RuntimeError("No usable analysis.log files were parsed.")
 
     print(f"  Ic_definition:  jump_dvdi = {n_jump}  |  rho_eff = {n_eff}")
+    print(f"  dVdI.dat loaded for {n_dvdi} / {len(records)} point(s)")
     records.sort(key=lambda r: (r["H_mT"], r.get("H_branch") or ""))
     return records
 
@@ -313,11 +350,279 @@ def collect_data(base_dir):
 # CSV I/O
 # ----------------------------------------------------------------------
 CSV_FIELDS = [
-    "H_Oe", "H_mT", "H_branch", "Hsample_mean_Oe",
+    "H_Oe", "H_mT", "H_branch",
+    "Hsample_mean_Oe", "Hsample_std_Oe", "Hsample_sem_Oe",
+    "Hsample_min_Oe", "Hsample_max_Oe", "n_Hsample_pts",
+    "H_err_mT",
     "Ic_mA", "Ic_eff_mA", "Ic_active_mA", "Ic_active_uA",
     "Ir_mA", "Ir_eff_mA",
     "Ic_definition", "Rn_mean_mOhm", "is_bf", "source",
+    "I_array_uA", "dVdI_array_Ohm",
 ]
+
+
+def _array_to_str(arr):
+    """Serialize a 1-D array to a semicolon-separated string for CSV storage.
+
+    Semicolons avoid ambiguity with CSV commas and with decimal points.
+    """
+    if arr is None:
+        return ""
+    a = np.asarray(arr, dtype=float).ravel()
+    if a.size == 0:
+        return ""
+    return ";".join(f"{x:.8g}" for x in a)
+
+
+def _str_to_array(s):
+    """Deserialize an array cell from CSV into a 1-D float ndarray.
+
+    Accepts semicolon-, space-, tab-, or comma-separated values, optionally
+    wrapped in brackets or quotes (as produced by some spreadsheet tools).
+    """
+    if s is None:
+        return None
+    if isinstance(s, (list, tuple, np.ndarray)):
+        a = np.asarray(s, dtype=float).ravel()
+        return a if a.size else None
+    s = str(s).strip()
+    if not s or s.lower() in ("none", "nan", "null"):
+        return None
+    # Strip optional brackets / quotes (possibly nested once)
+    for _ in range(2):
+        if len(s) >= 2 and (s[0], s[-1]) in {
+            ("[", "]"), ("(", ")"), ("{", "}"), ('"', '"'), ("'", "'"),
+        }:
+            s = s[1:-1].strip()
+    if not s:
+        return None
+    # Prefer ';' (our save format); fall back to other separators
+    if ";" in s:
+        parts = s.split(";")
+    elif "," in s and " " not in s.strip():
+        # comma-separated with no spaces (ambiguous with decimal commas —
+        # only use when there is no whitespace)
+        parts = s.split(",")
+    else:
+        for sep in (",", "\t", "|"):
+            s = s.replace(sep, " ")
+        parts = s.split()
+    vals = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            vals.append(float(p))
+        except ValueError:
+            # skip non-numeric tokens rather than failing the whole cell
+            continue
+    if len(vals) < 2:
+        return None
+    a = np.asarray(vals, dtype=float)
+    if not np.any(np.isfinite(a)):
+        return None
+    return a
+
+
+def load_dvdi_dat(folder):
+    """Load ``dVdI.dat`` from a single-measurement folder.
+
+    Expected format (as written by ``plot_csv_data.py``)::
+
+        # Current_A    dVdI_Ohm
+        -1.0e-04       12.3
+        ...
+
+    Filename match is case-insensitive.  Returns (I_uA, dVdI_Ohm) or
+    (None, None) if the file is missing/invalid.
+    """
+    path = None
+    try:
+        for name in os.listdir(folder):
+            if name.lower() == "dvdi.dat":
+                path = os.path.join(folder, name)
+                break
+    except OSError:
+        path = None
+    if path is None:
+        path = os.path.join(folder, "dVdI.dat")
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        # Default comment char '#' skips the header line written by the pipeline
+        data = np.loadtxt(path, ndmin=2)
+    except Exception:
+        try:
+            data = np.genfromtxt(
+                path, dtype=float, ndmin=2, invalid_raise=False,
+                comments="#",
+            )
+        except Exception as exc:
+            print(f"  [warn] could not read {path}: {exc}", file=sys.stderr)
+            return None, None
+    if data is None or data.size == 0:
+        return None, None
+    if data.ndim == 1:
+        if data.size < 2:
+            return None, None
+        data = data.reshape(-1, 2)
+    if data.shape[1] < 2:
+        return None, None
+    # Keep rows with finite current; allow nan dV/dI only if enough finite remain
+    mask = np.isfinite(data[:, 0])
+    data = data[mask]
+    if data.shape[0] < 2:
+        return None, None
+    I_A = np.asarray(data[:, 0], dtype=float)
+    dVdI = np.asarray(data[:, 1], dtype=float)
+    if np.count_nonzero(np.isfinite(dVdI)) < 2:
+        return None, None
+    return I_A * 1e6, dVdI  # A → µA
+
+
+def _folder_label_key(name):
+    """Normalise a singles/ folder name for matching (lower, no spaces)."""
+    return re.sub(r"\s+", "", name.strip().lower())
+
+
+def attach_dvdi_from_dir(records, base_dir):
+    """Fill missing I_array_uA / dVdI_array_Ohm by scanning *base_dir*.
+
+    Looks for ``dVdI.dat`` under::
+
+        base_dir/singles/*/dVdI.dat
+        base_dir/*/dVdI.dat
+
+    and matches each file to a record by
+    (1) ``source`` path directory, (2) folder name ↔ H_label / H value.
+    """
+    if not base_dir:
+        return records, 0
+    base_dir = os.path.abspath(os.path.expanduser(base_dir))
+    patterns = [
+        os.path.join(base_dir, "singles", "*", "dVdI.dat"),
+        os.path.join(base_dir, "singles", "*", "dvdi.dat"),
+        os.path.join(base_dir, "*", "dVdI.dat"),
+        os.path.join(base_dir, "*", "dvdi.dat"),
+    ]
+    dat_files = []
+    seen = set()
+    for pat in patterns:
+        for p in glob.glob(pat):
+            ap = os.path.abspath(p)
+            if ap not in seen and os.path.isfile(ap):
+                seen.add(ap)
+                dat_files.append(ap)
+
+    if not dat_files:
+        # case-insensitive walk one level
+        for sub in ("singles", ""):
+            root = os.path.join(base_dir, sub) if sub else base_dir
+            if not os.path.isdir(root):
+                continue
+            try:
+                for entry in os.listdir(root):
+                    folder = os.path.join(root, entry)
+                    if not os.path.isdir(folder):
+                        continue
+                    for name in os.listdir(folder):
+                        if name.lower() == "dvdi.dat":
+                            ap = os.path.abspath(os.path.join(folder, name))
+                            if ap not in seen:
+                                seen.add(ap)
+                                dat_files.append(ap)
+            except OSError:
+                pass
+
+    if not dat_files:
+        print(
+            f"  [dvdi] no dVdI.dat found under {base_dir}",
+            file=sys.stderr,
+        )
+        return records, 0
+
+    # Index dat files by folder basename
+    by_label = {}
+    by_folder = {}
+    for dp in dat_files:
+        folder = os.path.dirname(dp)
+        label = _folder_label_key(os.path.basename(folder))
+        by_label[label] = folder
+        by_folder[os.path.abspath(folder)] = folder
+
+    n_filled = 0
+    for r in records:
+        if (
+            r.get("dVdI_array_Ohm") is not None
+            and isinstance(r.get("dVdI_array_Ohm"), np.ndarray)
+            and r["dVdI_array_Ohm"].size >= 2
+            and r.get("I_array_uA") is not None
+            and isinstance(r.get("I_array_uA"), np.ndarray)
+            and r["I_array_uA"].size >= 2
+        ):
+            continue
+
+        folder = None
+        src = r.get("path") or ""
+        if src:
+            src_abs = os.path.abspath(os.path.expanduser(src))
+            if os.path.isfile(src_abs):
+                cand = os.path.dirname(src_abs)
+                if os.path.abspath(cand) in by_folder:
+                    folder = by_folder[os.path.abspath(cand)]
+                elif os.path.isdir(cand):
+                    folder = cand
+            elif os.path.isdir(src_abs):
+                folder = src_abs
+
+        if folder is None:
+            # Match by H_label
+            lab = r.get("H_label") or ""
+            key = _folder_label_key(lab) if lab else ""
+            if key and key in by_label:
+                folder = by_label[key]
+            else:
+                # Match by field value encoded in folder name, e.g. H+5.0Oe_Hbwd
+                H = r.get("H_Oe")
+                br = (r.get("H_branch") or "").lower()
+                if H is not None:
+                    for lab_key, fold in by_label.items():
+                        m = re.search(
+                            r"h([+\-]?[0-9]*\.?[0-9]+)\s*oe",
+                            lab_key,
+                        )
+                        if not m:
+                            continue
+                        try:
+                            H_folder = float(m.group(1))
+                        except ValueError:
+                            continue
+                        if abs(H_folder - float(H)) > 1e-6:
+                            continue
+                        if br and br not in lab_key:
+                            # allow match if branch not in name
+                            if "fwd" in lab_key or "bwd" in lab_key:
+                                continue
+                        folder = fold
+                        break
+
+        if folder is None:
+            continue
+        I_uA, dVdI = load_dvdi_dat(folder)
+        if dVdI is None:
+            continue
+        r["I_array_uA"] = I_uA
+        r["dVdI_array_Ohm"] = dVdI
+        if not r.get("path"):
+            r["path"] = os.path.join(folder, "analysis.log")
+        n_filled += 1
+
+    print(
+        f"  [dvdi] found {len(dat_files)} dVdI.dat file(s) under {base_dir}; "
+        f"attached to {n_filled} / {len(records)} record(s)"
+    )
+    return records, n_filled
 
 
 def save_csv(path, records):
@@ -330,7 +635,12 @@ def save_csv(path, records):
         return v
 
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        # QUOTE_MINIMAL still quotes fields that contain the delimiter;
+        # array cells use ';' so they stay in a single column even if a
+        # spreadsheet re-saves the file with different quoting.
+        w = csv.DictWriter(
+            f, fieldnames=CSV_FIELDS, quoting=csv.QUOTE_MINIMAL,
+        )
         w.writeheader()
         for r in records:
             w.writerow({
@@ -338,6 +648,12 @@ def save_csv(path, records):
                 "H_mT": _cell(r.get("H_mT")),
                 "H_branch": _cell(r.get("H_branch")),
                 "Hsample_mean_Oe": _cell(r.get("Hsample_mean_Oe")),
+                "Hsample_std_Oe": _cell(r.get("Hsample_std_Oe")),
+                "Hsample_sem_Oe": _cell(r.get("Hsample_sem_Oe")),
+                "Hsample_min_Oe": _cell(r.get("Hsample_min_Oe")),
+                "Hsample_max_Oe": _cell(r.get("Hsample_max_Oe")),
+                "n_Hsample_pts": _cell(r.get("n_Hsample_pts")),
+                "H_err_mT": _cell(r.get("H_err_mT")),
                 "Ic_mA": _cell(r.get("Ic_mA")),
                 "Ic_eff_mA": _cell(r.get("Ic_eff_mA")),
                 "Ic_active_mA": _cell(r.get("Ic_active_mA")),
@@ -348,16 +664,56 @@ def save_csv(path, records):
                 "Rn_mean_mOhm": _cell(r.get("Rn_mean_mOhm")),
                 "is_bf": _cell(r.get("is_bf", False)),
                 "source": r.get("path", ""),
+                "I_array_uA": _array_to_str(r.get("I_array_uA")),
+                "dVdI_array_Ohm": _array_to_str(r.get("dVdI_array_Ohm")),
             })
     print(f"Data CSV written to: {os.path.abspath(path)}")
 
 
 def load_csv(path):
     """Load records previously written by save_csv (or hand-edited)."""
+    # Array cells can be long; raise the csv field-size limit just in case
+    try:
+        csv.field_size_limit(max(2**24, csv.field_size_limit()))
+    except (OverflowError, AttributeError):
+        pass
+
     records = []
-    with open(path, "r", newline="") as f:
-        reader = csv.DictReader(f)
+    n_array_ok = n_array_fail = 0
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        # utf-8-sig strips a BOM if present (Excel on Windows)
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(f, dialect=dialect)
+        if reader.fieldnames is None:
+            raise RuntimeError(f"CSV has no header: {path}")
+        # Normalise header names (strip whitespace / BOM leftovers)
+        raw_fields = list(reader.fieldnames)
+        norm_map = {h: h.strip() for h in raw_fields}
+        # Detect array columns under mild name variants
+        def _find_col(*candidates):
+            lower = {h.strip().lower(): h for h in raw_fields}
+            for c in candidates:
+                if c.lower() in lower:
+                    return lower[c.lower()]
+            return None
+
+        col_I = _find_col("I_array_uA", "I_array", "I_uA_array")
+        col_Z = _find_col("dVdI_array_Ohm", "dVdI_array", "dvdi_array_ohm")
+        print(
+            f"  CSV dialect delimiter={dialect.delimiter!r}, "
+            f"I_array col={col_I!r}, dVdI col={col_Z!r}, "
+            f"n_fields={len(raw_fields)}"
+        )
+
         for row in reader:
+            # Re-key row with stripped header names
+            row = {norm_map.get(k, k): v for k, v in row.items()}
+
             def _opt_float(key):
                 s = (row.get(key) or "").strip()
                 return float(s) if s else None
@@ -392,11 +748,29 @@ def load_csv(path):
             is_bf_s = (row.get("is_bf") or "").strip().lower()
             is_bf = is_bf_s in ("true", "1", "yes")
 
+            H_err = _opt_float("H_err_mT")
+            if H_err is None:
+                sem = _opt_float("Hsample_sem_Oe")
+                std = _opt_float("Hsample_std_Oe")
+                if sem is not None:
+                    H_err = sem * OE_TO_MT
+                elif std is not None:
+                    H_err = std * OE_TO_MT
+
             records.append({
                 "H_Oe": H_Oe,
                 "H_mT": H_mT,
                 "H_branch": branch,
                 "Hsample_mean_Oe": _opt_float("Hsample_mean_Oe"),
+                "Hsample_std_Oe": _opt_float("Hsample_std_Oe"),
+                "Hsample_sem_Oe": _opt_float("Hsample_sem_Oe"),
+                "Hsample_min_Oe": _opt_float("Hsample_min_Oe"),
+                "Hsample_max_Oe": _opt_float("Hsample_max_Oe"),
+                "n_Hsample_pts": (
+                    int(v) if (v := _opt_float("n_Hsample_pts")) is not None
+                    else None
+                ),
+                "H_err_mT": H_err,
                 "Ic_mA": Ic_raw,
                 "Ic_eff_mA": Ic_eff,
                 "Ic_active_mA": Ic_mA,
@@ -409,9 +783,54 @@ def load_csv(path):
                 "Rn_mean_mOhm": _opt_float("Rn_mean_mOhm"),
                 "is_bf": is_bf,
                 "path": row.get("source", path),
+                "I_array_uA": _str_to_array(
+                    row.get(col_I) if col_I else row.get("I_array_uA")
+                ),
+                "dVdI_array_Ohm": _str_to_array(
+                    row.get(col_Z) if col_Z else row.get("dVdI_array_Ohm")
+                ),
             })
+            if records[-1]["dVdI_array_Ohm"] is not None:
+                n_array_ok += 1
+            else:
+                # Cell present but failed to parse?
+                raw_z = row.get(col_Z) if col_Z else row.get("dVdI_array_Ohm")
+                if raw_z and str(raw_z).strip():
+                    n_array_fail += 1
     if not records:
         raise RuntimeError(f"No usable rows in CSV: {path}")
+
+    print(
+        f"  CSV arrays: {n_array_ok}/{len(records)} rows with dVdI_array_Ohm"
+        + (f"  ({n_array_fail} non-empty cells failed to parse)" if n_array_fail else "")
+    )
+
+    # Recover dV/dI from source folders when CSV cells are empty
+    n_recovered = 0
+    for r in records:
+        if r.get("dVdI_array_Ohm") is not None and r.get("I_array_uA") is not None:
+            continue
+        src = r.get("path") or ""
+        folder = None
+        if src and os.path.isfile(src):
+            folder = os.path.dirname(src)
+        elif src and os.path.isdir(src):
+            folder = src
+        if not folder:
+            continue
+        I_uA, dVdI = load_dvdi_dat(folder)
+        if dVdI is None:
+            continue
+        if r.get("I_array_uA") is None and I_uA is not None:
+            r["I_array_uA"] = I_uA
+        if r.get("dVdI_array_Ohm") is None:
+            r["dVdI_array_Ohm"] = dVdI
+        n_recovered += 1
+    if n_recovered:
+        print(
+            f"  recovered dV/dI for {n_recovered} row(s) from source folders"
+        )
+
     records.sort(key=lambda r: (r["H_mT"], r.get("H_branch") or ""))
     return records
 
@@ -419,6 +838,32 @@ def load_csv(path):
 # ----------------------------------------------------------------------
 # Data preparation helpers
 # ----------------------------------------------------------------------
+def apply_Hsample_mean(records):
+    """Replace nominal H with Hsample_mean_Oe for every record that has it.
+
+    Updates both ``H_Oe`` and ``H_mT``.  Points lacking a finite
+    Hsample_mean_Oe are left unchanged and reported.
+    """
+    out = []
+    n_used = n_skip = 0
+    for r in records:
+        r = dict(r)
+        h_mean = r.get("Hsample_mean_Oe")
+        if h_mean is not None and np.isfinite(h_mean):
+            r["H_Oe"] = float(h_mean)
+            r["H_mT"] = float(h_mean) * OE_TO_MT
+            n_used += 1
+        else:
+            n_skip += 1
+        out.append(r)
+    print(
+        f"  --H-mean: using Hsample_mean for {n_used} point(s)"
+        + (f"; {n_skip} kept nominal (no Hsample_mean)" if n_skip else "")
+    )
+    out.sort(key=lambda r: (r["H_mT"], r.get("H_branch") or ""))
+    return out
+
+
 def apply_branch_alignment(records, offsets_mT, bf=False):
     """Relative branch alignment for bi-directional averaging only.
 
@@ -461,11 +906,57 @@ def apply_branch_alignment(records, offsets_mT, bf=False):
     return out
 
 
+def _average_dvdi_pair(r_a, r_b):
+    """Average two dV/dI traces onto a shared current grid.
+
+    Returns (I_uA, dVdI_Ohm) or (None, None) if neither side has data.
+    """
+    def _get(r):
+        I = r.get("I_array_uA") if r is not None else None
+        Z = r.get("dVdI_array_Ohm") if r is not None else None
+        if I is None or Z is None:
+            return None, None
+        I = np.asarray(I, dtype=float).ravel()
+        Z = np.asarray(Z, dtype=float).ravel()
+        n = min(I.size, Z.size)
+        if n < 2:
+            return None, None
+        I, Z = I[:n], Z[:n]
+        finite = np.isfinite(I) & np.isfinite(Z)
+        if np.count_nonzero(finite) < 2:
+            return None, None
+        order = np.argsort(I[finite])
+        return I[finite][order], Z[finite][order]
+
+    I1, Z1 = _get(r_a)
+    I2, Z2 = _get(r_b)
+    if I1 is None and I2 is None:
+        return None, None
+    if I1 is None:
+        return I2, Z2
+    if I2 is None:
+        return I1, Z1
+
+    I_lo = max(float(I1.min()), float(I2.min()))
+    I_hi = min(float(I1.max()), float(I2.max()))
+    if not np.isfinite(I_lo) or not np.isfinite(I_hi) or I_hi <= I_lo:
+        return I1, Z1
+    n = max(I1.size, I2.size)
+    I_grid = np.linspace(I_lo, I_hi, n)
+    Z_avg = 0.5 * (
+        np.interp(I_grid, I1, Z1) + np.interp(I_grid, I2, Z2)
+    )
+    return I_grid, Z_avg
+
+
 def average_bf(records, atol=1e-5):
     """Average forward and backward sweeps over the overlapping H range (mT).
 
     Points that cannot be paired after relative offset correction are
     discarded.  Matching uses linear interpolation onto the denser grid.
+
+    dV/dI traces (``I_array_uA``, ``dVdI_array_Ohm``) are also averaged
+    pairwise so ``--plot-dvdi`` still works after ``--average``.
     """
     fwd = [r for r in records if (r.get("H_branch") or "") == "fwd"]
     bwd = [r for r in records if (r.get("H_branch") or "") == "bwd"]
@@ -488,6 +979,15 @@ def average_bf(records, atol=1e-5):
     H_bwd = np.array([r["H_mT"] for r in bwd])
     Ic_fwd = np.array([r["Ic_active_uA"] for r in fwd])
     Ic_bwd = np.array([r["Ic_active_uA"] for r in bwd])
+    # Field uncertainties (mT); missing → nan so interp still works
+    Err_fwd = np.array([
+        r["H_err_mT"] if r.get("H_err_mT") is not None else np.nan
+        for r in fwd
+    ])
+    Err_bwd = np.array([
+        r["H_err_mT"] if r.get("H_err_mT") is not None else np.nan
+        for r in bwd
+    ])
 
     H_lo = max(H_fwd.min(), H_bwd.min())
     H_hi = min(H_fwd.max(), H_bwd.max())
@@ -500,25 +1000,49 @@ def average_bf(records, atol=1e-5):
 
     mask_f = (H_fwd >= H_lo - atol) & (H_fwd <= H_hi + atol)
     mask_b = (H_bwd >= H_lo - atol) & (H_bwd <= H_hi + atol)
-    Hf, If = H_fwd[mask_f], Ic_fwd[mask_f]
-    Hb, Ib = H_bwd[mask_b], Ic_bwd[mask_b]
+    Hf, If, Ef = H_fwd[mask_f], Ic_fwd[mask_f], Err_fwd[mask_f]
+    Hb, Ib, Eb = H_bwd[mask_b], Ic_bwd[mask_b], Err_bwd[mask_b]
+    fwd_m = [r for r, m in zip(fwd, mask_f) if m]
+    bwd_m = [r for r, m in zip(bwd, mask_b) if m]
 
     if len(Hf) >= len(Hb):
-        H_ref, Ic_ref = Hf, If
+        H_ref, Ic_ref, E_ref = Hf, If, Ef
         Ic_other = np.interp(H_ref, Hb, Ib)
+        E_other = np.interp(H_ref, Hb, Eb)
     else:
-        H_ref, Ic_ref = Hb, Ib
+        H_ref, Ic_ref, E_ref = Hb, Ib, Eb
         Ic_other = np.interp(H_ref, Hf, If)
+        E_other = np.interp(H_ref, Hf, Ef)
 
     Ic_avg = 0.5 * (Ic_ref + Ic_other)
+    # Combined field uncertainty: RSS of the two branch SEMs / √2
+    E_avg = np.sqrt(0.5 * (E_ref ** 2 + E_other ** 2))
 
     averaged = []
-    for h, ic in zip(H_ref, Ic_avg):
+    n_dvdi = 0
+    for h, ic, e in zip(H_ref, Ic_avg, E_avg):
+        e_val = float(e) if np.isfinite(e) else None
+        # Nearest fwd / bwd records at this H for dV/dI averaging
+        i_f = int(np.argmin(np.abs(Hf - h))) if len(Hf) else None
+        i_b = int(np.argmin(np.abs(Hb - h))) if len(Hb) else None
+        r_f = fwd_m[i_f] if i_f is not None else None
+        r_b = bwd_m[i_b] if i_b is not None else None
+        I_arr, Z_arr = _average_dvdi_pair(r_f, r_b)
+        if Z_arr is not None:
+            n_dvdi += 1
         averaged.append({
             "H_Oe": float(h) / OE_TO_MT,
             "H_mT": float(h),
             "H_branch": "avg",
             "Hsample_mean_Oe": None,
+            "Hsample_std_Oe": None,
+            "Hsample_sem_Oe": (
+                e_val / OE_TO_MT if e_val is not None else None
+            ),
+            "Hsample_min_Oe": None,
+            "Hsample_max_Oe": None,
+            "n_Hsample_pts": None,
+            "H_err_mT": e_val,
             "Ic_mA": None,
             "Ic_eff_mA": None,
             "Ic_active_mA": float(ic) / MA_TO_UA,
@@ -529,10 +1053,14 @@ def average_bf(records, atol=1e-5):
             "Rn_mean_mOhm": None,
             "is_bf": True,
             "path": "averaged",
+            "I_array_uA": I_arr,
+            "dVdI_array_Ohm": Z_arr,
         })
     print(
         f"  averaged {len(averaged)} points over "
         f"H ∈ [{H_lo:.4g}, {H_hi:.4g}] mT"
+        + (f"  (dV/dI kept for {n_dvdi})" if n_dvdi else
+           "  (no dV/dI arrays to average)")
     )
     return averaged + other
 
@@ -749,7 +1277,10 @@ def _estimate_H0(H, Ic):
     return max(H0_est, 1e-3)
 
 
-def fit_model(H, Ic, model, p0=None, Delta0_initial=None, H_off_initial=None):
+def fit_model(
+    H, Ic, model, p0=None, Delta0_initial=None, H_off_initial=None,
+    H_err=None,
+):
     """Fit the selected Fraunhofer model and return popt, perr, metrics.
 
     Fitting process (detailed)
@@ -773,16 +1304,25 @@ def fit_model(H, Ic, model, p0=None, Delta0_initial=None, H_off_initial=None):
        - All amplitudes ≥ 0;  ΔH₀ > 0;  I_bg ≥ 0.
        - H_off unrestricted (can be positive or negative).
 
-    4. **Optimiser**  ``scipy.optimize.curve_fit`` (Trust-Region Reflective
-       with the analytic bounds above).  Several ΔH₀ starting values are
-       tried and the solution with the lowest SSR is kept.
+    4. **Optimiser**
+       - Default: ``scipy.optimize.curve_fit`` (Trust-Region Reflective).
+       - With ``H_err`` (``--H-plot-error``): Orthogonal Distance
+         Regression (``scipy.odr``) so that field uncertainties enter
+         the residual.  Several ΔH₀ starts are tried; lowest SSR wins.
 
     5. **Metrics**  R², RMSE, SSR, AIC, BIC.
     """
     H = np.asarray(H, dtype=float)
     Ic = np.asarray(Ic, dtype=float)
-    mask = np.isfinite(H) & np.isfinite(Ic)
+    if H_err is not None:
+        H_err = np.asarray(H_err, dtype=float)
+        mask = np.isfinite(H) & np.isfinite(Ic) & np.isfinite(H_err) & (H_err > 0)
+    else:
+        mask = np.isfinite(H) & np.isfinite(Ic)
+        H_err = None
     H, Ic = H[mask], Ic[mask]
+    if H_err is not None:
+        H_err = H_err[mask]
     if len(H) < 5:
         raise RuntimeError(
             f"Only {len(H)} finite points; need ≥ 5 for a fit "
@@ -859,12 +1399,42 @@ def fit_model(H, Ic, model, p0=None, Delta0_initial=None, H_off_initial=None):
         raise ValueError(f"Unknown model: {model}")
 
     # Multi-start: keep the solution with the lowest residual SSR
+    use_odr = H_err is not None and np.any(H_err > 0)
+    if use_odr:
+        print(
+            f"  using ODR with field errors "
+            f"(median σ_H = {np.nanmedian(H_err):.4g} mT)"
+        )
+
     best = None
     for start in starts:
         try:
-            popt_try, pcov_try = curve_fit(
-                func, H, Ic, p0=start, bounds=bounds, maxfev=30000,
-            )
+            if use_odr:
+                # scipy.odr: beta = parameters, x = independent variable
+                def _f(beta, x, _func=func):
+                    return _func(x, *beta)
+
+                odr_model = odr.Model(_f)
+                data = odr.RealData(H, Ic, sx=H_err)
+                odr_obj = odr.ODR(data, odr_model, beta0=list(start))
+                odr_obj.set_job(fit_type=0)  # explicit ODR
+                out = odr_obj.run()
+                if out.info >= 4:  # did not converge
+                    continue
+                popt_try = np.asarray(out.beta, dtype=float)
+                # Covariance from ODR (may be None)
+                if out.cov_beta is not None:
+                    pcov_try = np.asarray(out.cov_beta, dtype=float)
+                else:
+                    pcov_try = np.full((len(popt_try), len(popt_try)), np.nan)
+                # Enforce physical bounds after the fact
+                lo, hi = bounds
+                if np.any(popt_try < lo) or np.any(popt_try > hi):
+                    continue
+            else:
+                popt_try, pcov_try = curve_fit(
+                    func, H, Ic, p0=start, bounds=bounds, maxfev=30000,
+                )
             resid = float(np.sum((Ic - func(H, *popt_try)) ** 2))
             if best is None or resid < best[0]:
                 best = (resid, popt_try, pcov_try)
@@ -872,7 +1442,10 @@ def fit_model(H, Ic, model, p0=None, Delta0_initial=None, H_off_initial=None):
             continue
 
     if best is None:
-        raise RuntimeError("curve_fit failed for every starting point.")
+        raise RuntimeError(
+            "fit failed for every starting point"
+            + (" (ODR)" if use_odr else " (curve_fit)")
+        )
 
     _, popt, pcov = best
     perr = np.sqrt(np.diag(pcov))
@@ -897,6 +1470,69 @@ def fit_model(H, Ic, model, p0=None, Delta0_initial=None, H_off_initial=None):
         "n_params": k,
     }
     return popt, perr, names, metrics, func
+
+
+def write_fit_results_csv(path, fit_records, popt, names, metrics, model, func):
+    """Write per-point measured / predicted values for statistical comparison.
+
+    Columns
+    -------
+    H_mT, H_err_mT, H_branch,
+    Ic_meas_uA, Ic_pred_uA, residual_uA, residual_sq,
+    model, RMSE_global, R2, n_points, n_params
+    """
+    H = np.array([r["H_mT"] for r in fit_records], dtype=float)
+    Ic = np.array([r["Ic_active_uA"] for r in fit_records], dtype=float)
+    H_err = [
+        r["H_err_mT"] if r.get("H_err_mT") is not None else ""
+        for r in fit_records
+    ]
+    branches = [r.get("H_branch") or "" for r in fit_records]
+
+    mask = np.isfinite(H) & np.isfinite(Ic)
+    H_ok, Ic_ok = H[mask], Ic[mask]
+    Ic_pred = func(H_ok, *popt)
+    resid = Ic_ok - Ic_pred
+    resid_sq = resid ** 2
+
+    # Map full-length arrays for rows that were dropped by the mask
+    pred_full = np.full(len(H), np.nan)
+    resid_full = np.full(len(H), np.nan)
+    resid_sq_full = np.full(len(H), np.nan)
+    pred_full[mask] = Ic_pred
+    resid_full[mask] = resid
+    resid_sq_full[mask] = resid_sq
+
+    fieldnames = [
+        "H_mT", "H_err_mT", "H_branch",
+        "Ic_meas_uA", "Ic_pred_uA", "residual_uA", "residual_sq",
+        "model", "RMSE_global", "R2", "n_points", "n_params",
+    ]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for i in range(len(H)):
+            w.writerow({
+                "H_mT": H[i],
+                "H_err_mT": H_err[i],
+                "H_branch": branches[i],
+                "Ic_meas_uA": Ic[i] if np.isfinite(Ic[i]) else "",
+                "Ic_pred_uA": (
+                    pred_full[i] if np.isfinite(pred_full[i]) else ""
+                ),
+                "residual_uA": (
+                    resid_full[i] if np.isfinite(resid_full[i]) else ""
+                ),
+                "residual_sq": (
+                    resid_sq_full[i] if np.isfinite(resid_sq_full[i]) else ""
+                ),
+                "model": model,
+                "RMSE_global": metrics["RMSE"],
+                "R2": metrics["R2"],
+                "n_points": metrics["n_points"],
+                "n_params": metrics["n_params"],
+            })
+    print(f"Fit results CSV written to: {os.path.abspath(path)}")
 
 
 def period_to_deff(H0_mT, width_um):
@@ -986,6 +1622,93 @@ def write_analysis_log(path, args, records, fit_result, norm_Ic0):
 # ----------------------------------------------------------------------
 # Plotting
 # ----------------------------------------------------------------------
+def _build_dvdi_background(records):
+    """Assemble a (H, I, Z) grid from per-point dV/dI arrays.
+
+    Returns
+    -------
+    H_vals : 1-D array of field positions (mT), sorted
+    I_grid : 1-D common current grid (µA)
+    Z      : 2-D array shape (n_I, n_H) of dV/dI in Ohm
+    or (None, None, None) if no usable data.
+    """
+    strips = []
+    n_total = len(records)
+    n_has_z = n_has_i = n_ok = 0
+    for r in records:
+        I_arr = r.get("I_array_uA")
+        Z_arr = r.get("dVdI_array_Ohm")
+        H = r.get("H_mT")
+        # Tolerate arrays that arrived as strings (e.g. stale in-memory state)
+        if isinstance(I_arr, str):
+            I_arr = _str_to_array(I_arr)
+        if isinstance(Z_arr, str):
+            Z_arr = _str_to_array(Z_arr)
+        if Z_arr is not None:
+            n_has_z += 1
+        if I_arr is not None:
+            n_has_i += 1
+        if Z_arr is None or H is None:
+            continue
+        Z_arr = np.asarray(Z_arr, dtype=float).ravel()
+        if Z_arr.size < 2 or not np.any(np.isfinite(Z_arr)):
+            continue
+        if I_arr is None:
+            # Synthesise a linear current axis if only dV/dI was stored
+            I_arr = np.arange(Z_arr.size, dtype=float)
+        else:
+            I_arr = np.asarray(I_arr, dtype=float).ravel()
+        n = min(I_arr.size, Z_arr.size)
+        if n < 2:
+            continue
+        I_arr, Z_arr = I_arr[:n], Z_arr[:n]
+        finite = np.isfinite(I_arr) & np.isfinite(Z_arr)
+        if np.count_nonzero(finite) < 2:
+            continue
+        I_arr, Z_arr = I_arr[finite], Z_arr[finite]
+        order = np.argsort(I_arr)
+        strips.append((float(H), I_arr[order], Z_arr[order]))
+        n_ok += 1
+
+    if len(strips) < 1:
+        print(
+            f"  [diag] dV/dI background: {n_total} records, "
+            f"{n_has_z} with dVdI_array_Ohm, {n_has_i} with I_array_uA, "
+            f"{n_ok} usable strips",
+            file=sys.stderr,
+        )
+        return None, None, None
+
+    if len(strips) == 1:
+        print(
+            "  [warn] only one field point has dV/dI data; "
+            "background map will be a single column.",
+            file=sys.stderr,
+        )
+
+    strips.sort(key=lambda t: t[0])
+    H_vals = np.array([s[0] for s in strips])
+
+    I_min = min(float(s[1].min()) for s in strips)
+    I_max = max(float(s[1].max()) for s in strips)
+    if not np.isfinite(I_min) or not np.isfinite(I_max) or I_max <= I_min:
+        return None, None, None
+    n_I = int(np.median([s[1].size for s in strips]))
+    n_I = max(n_I, 50)
+    I_grid = np.linspace(I_min, I_max, n_I)
+
+    Z = np.full((n_I, len(strips)), np.nan)
+    for j, (_, I_arr, Z_arr) in enumerate(strips):
+        Z[:, j] = np.interp(I_grid, I_arr, Z_arr, left=np.nan, right=np.nan)
+
+    print(
+        f"  dV/dI background: {len(strips)} strips, "
+        f"I ∈ [{I_min:.4g}, {I_max:.4g}] µA, "
+        f"grid {n_I} × {len(strips)}"
+    )
+    return H_vals, I_grid, Z
+
+
 def plot_fraunhofer(
     records,
     fit_result=None,
@@ -993,20 +1716,45 @@ def plot_fraunhofer(
     I_plot_range=None,
     H_plot_range=None,
     plot_x_Phi=False,
+    plot_H_error=False,
+    plot_dvdi=False,
+    smooth_dvdi=None,
+    Rn_Ohm=None,
     out_path="Fraunhofer_fit.pdf",
 ):
     """Produce a publication-quality Ic(H) figure.
 
     Data are drawn as small markers connected by a thin solid line.
-    Field axis is always in mT (or Φ/Φ0); current axis is always in µA
-    (or normalised units).
+    Field axis is always in mT (or Φ/Φ0); current axis is µA by default
+    (or normalised units).  With *Rn_Ohm*, the y-axis is Ic·Rn in mV and
+    dV/dI is shown as (dV/dI)/Rn (dimensionless).
+
+    When *plot_dvdi* is True a false-colour dV/dI map is drawn behind the
+    Ic points; the legend is then placed below the figure.  Otherwise the
+    legend stays inside the axes.
+
+    *smooth_dvdi*: ``None`` = no filter; ``int`` = median-filter kernel
+    size along the current axis (odd, ≥ 3).
     """
     set_paper_style()
-    fig, ax = plt.subplots(figsize=(3.5, 2.6))
+    # Wider with colourbar; taller only when legend sits below
+    fig_w = 4.2 if plot_dvdi else 3.5
+    fig_h = 3.2 if plot_dvdi else 2.6
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     H = np.array([r["H_mT"] for r in records], dtype=float)
     Ic = np.array([r["Ic_active_uA"] for r in records], dtype=float)
     branches = [r.get("H_branch") for r in records]
+
+    # Optional Ic → Ic·Rn (mV):  I[µA]·Rn[Ω]·1e-3 = mV
+    use_Rn = Rn_Ohm is not None and float(Rn_Ohm) > 0
+    Rn = float(Rn_Ohm) if use_Rn else None
+    y_scale = (Rn * 1e-3) if use_Rn else 1.0
+    Ic = Ic * y_scale
+    H_err = np.array([
+        r["H_err_mT"] if r.get("H_err_mT") is not None else np.nan
+        for r in records
+    ], dtype=float)
 
     # Decide x-axis units
     if plot_x_Phi and fit_result is not None:
@@ -1014,11 +1762,14 @@ def plot_fraunhofer(
         DeltaH0 = popt[names.index("DeltaH0_mT")]
         H_off = popt[names.index("H_off_mT")]
         x = (H - H_off) / DeltaH0
+        xerr = H_err / DeltaH0 if plot_H_error else None
         x_label = r"$\Phi / \Phi_0$"
         x_model = np.linspace(x.min(), x.max(), 800)
         H_model = x_model * DeltaH0 + H_off
+        H_to_x = lambda h: (h - H_off) / DeltaH0
     else:
         x = H
+        xerr = H_err if plot_H_error else None
         x_label = r"$H$ (mT)"
         if fit_result is not None:
             if H_plot_range is not None:
@@ -1027,67 +1778,224 @@ def plot_fraunhofer(
                 H_lo, H_hi = float(H.min()), float(H.max())
             H_model = np.linspace(H_lo, H_hi, 800)
             x_model = H_model
+        H_to_x = lambda h: h
 
-    # Colour / marker by branch – markers are small, connected by a thin line
+    # --- dV/dI intensity background ------------------------------------
+    show_dvdi = bool(plot_dvdi)
+    if show_dvdi and normalize:
+        print(
+            "  [warn] --plot-dvdi ignored with --normalize "
+            "(background needs absolute current axis).",
+            file=sys.stderr,
+        )
+        show_dvdi = False
+
+    if show_dvdi:
+        H_bg, I_bg, Z_bg = _build_dvdi_background(records)
+        if H_bg is None:
+            print(
+                "  [warn] --plot-dvdi requested but no usable "
+                "dVdI_array_Ohm data found.",
+                file=sys.stderr,
+            )
+            show_dvdi = False
+        else:
+            x_bg = H_to_x(H_bg)
+            # pcolormesh needs edge coordinates; pad half-steps at ends
+            if len(x_bg) >= 2:
+                dx = np.diff(x_bg)
+                x_edges = np.concatenate([
+                    [x_bg[0] - dx[0] / 2],
+                    x_bg[:-1] + dx / 2,
+                    [x_bg[-1] + dx[-1] / 2],
+                ])
+            else:
+                x_edges = np.array([x_bg[0] - 0.5, x_bg[0] + 0.5])
+            if len(I_bg) >= 2:
+                di = np.diff(I_bg)
+                I_edges = np.concatenate([
+                    [I_bg[0] - di[0] / 2],
+                    I_bg[:-1] + di / 2,
+                    [I_bg[-1] + di[-1] / 2],
+                ])
+            else:
+                I_edges = np.array([I_bg[0] - 0.5, I_bg[0] + 0.5])
+
+            # Scale current axis and resistance when --Rn is set
+            if use_Rn:
+                I_bg = I_bg * y_scale          # µA → mV (Ic·Rn)
+                Z_bg = Z_bg / Rn               # Ω → (dV/dI)/Rn
+                I_edges = I_edges * y_scale
+
+            if smooth_dvdi is not None:
+                try:
+                    from scipy.ndimage import median_filter
+                except ImportError:
+                    from scipy.signal import medfilt as _medfilt
+
+                    def median_filter(a, size):
+                        if isinstance(size, tuple):
+                            return _medfilt(a, kernel_size=size)
+                        return _medfilt(a, kernel_size=size)
+
+                k = int(smooth_dvdi)
+                if k < 1:
+                    k = 1
+                if k % 2 == 0:
+                    k += 1  # median filter needs odd kernel
+                if Z_bg.shape[0] < k:
+                    k = max(1, Z_bg.shape[0] // 2 * 2 - 1) or 1
+                if k >= 3:
+                    Z_bg = median_filter(Z_bg, size=(k, 1))
+                    print(f"  --smooth-dvdi: median filter size={k} along I")
+                else:
+                    print(
+                        f"  [warn] --smooth-dvdi k={k} too small; skipped",
+                        file=sys.stderr,
+                    )
+
+            finite = Z_bg[np.isfinite(Z_bg)]
+            if finite.size:
+                vmin, vmax = np.percentile(finite, [2, 98])
+            else:
+                vmin, vmax = 0.0, 1.0
+            im = ax.pcolormesh(
+                x_edges, I_edges, Z_bg,
+                cmap="jet", shading="flat",
+                vmin=vmin, vmax=vmax, zorder=0,
+                rasterized=True,
+            )
+            cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
+            if use_Rn:
+                cbar.set_label(r"$(dV/dI)/R_n$", fontsize=8)
+            else:
+                cbar.set_label(r"dV/dI ($\Omega$)", fontsize=8)
+            cbar.ax.tick_params(labelsize=7)
+
+    # Bright overlay colours when a dark background map is present
+    if show_dvdi:
+        series_cmap = {"fwd": "#00FFFF", "bwd": "#FF66FF", "avg": "#FFFF00"}
+        fit_color = "#FFFFFF"
+        text_color = "white"
+        mew = 0.6
+    else:
+        series_cmap = {"fwd": "C0", "bwd": "C1", "avg": "C2"}
+        fit_color = "0.25"
+        text_color = "black"
+        mew = 0.4
+
     unique_branches = sorted(set(b for b in branches if b))
-    cmap = {"fwd": "C0", "bwd": "C1", "avg": "C2"}
     markers = {"fwd": "o", "bwd": "s", "avg": "D"}
 
-    def _draw_series(xx, yy, color, marker, label):
-        # Sort by x so the connecting line is monotonic
+    def _draw_series(xx, yy, xxe, color, marker, label):
         order = np.argsort(xx)
         xx, yy = xx[order], yy[order]
+        if xxe is not None:
+            xxe = xxe[order]
         ax.plot(
             xx, yy,
-            marker=marker, ms=2.5, mew=0.4,
-            linestyle="-", lw=0.8,
+            marker=marker, ms=2.5, mew=mew,
+            markeredgecolor="k" if show_dvdi else color,
+            linestyle="-", lw=0.9 if show_dvdi else 0.8,
             color=color, label=label, zorder=3,
         )
+        if xxe is not None and np.any(np.isfinite(xxe)):
+            ax.errorbar(
+                xx, yy, xerr=xxe,
+                fmt="none", ecolor=color, elinewidth=0.6,
+                capsize=1.2, alpha=0.7, zorder=2,
+            )
 
     if not unique_branches:
-        _draw_series(x, Ic, "C0", "o", "data")
+        _draw_series(x, Ic, xerr, series_cmap.get("fwd", "C0"), "o", "data")
     else:
         for br in unique_branches:
             mask = np.array([b == br for b in branches])
+            xe = xerr[mask] if xerr is not None else None
             _draw_series(
-                x[mask], Ic[mask],
-                cmap.get(br, "C0"),
+                x[mask], Ic[mask], xe,
+                series_cmap.get(br, "C0"),
                 markers.get(br, "o"),
                 br,
             )
 
-    # Model overlay (dashed)
+    # Model overlay (dashed) — scale to display units when --Rn is set
+    Ic_model = None
+    r2_text = None
     if fit_result is not None:
         popt, perr, names, metrics, model, width_um, _, _ = fit_result
         func = fraunhofer_1H if model == "1H" else fraunhofer_2H
-        Ic_model = func(H_model, *popt)
+        Ic_model = func(H_model, *popt) * y_scale
         DeltaH0 = popt[names.index("DeltaH0_mT")]
         H_off = popt[names.index("H_off_mT")]
         label = f"fit ({model})"
         label += rf"  $\Delta H_0$={DeltaH0:.3g} mT"
         label += rf", $H_{{\rm off}}$={H_off:.3g} mT"
         ax.plot(
-            x_model, Ic_model, "--", color="0.25", lw=1.0,
-            label=label, zorder=2,
+            x_model, Ic_model, "--", color=fit_color, lw=1.2,
+            label=label, zorder=4,
         )
-        ax.text(
-            0.97, 0.95, rf"$R^2 = {metrics['R2']:.4f}$",
-            transform=ax.transAxes, ha="right", va="top", fontsize=7,
-        )
+        r2_text = rf"$R^2 = {metrics['R2']:.4f}$"
 
     ax.set_xlabel(x_label)
     if normalize:
         ax.set_ylabel(r"$I_c / I_c(0)$")
+    elif use_Rn:
+        ax.set_ylabel(r"$I_c R_n$ (mV)")
     else:
         ax.set_ylabel(r"$I_c$ (µA)")
 
+    # Y-limits always follow Ic data (+ fit), never the full dV/dI I-range
     if I_plot_range is not None:
         ax.set_ylim(float(I_plot_range[0]), float(I_plot_range[1]))
+    else:
+        y_vals = Ic[np.isfinite(Ic)]
+        if Ic_model is not None:
+            y_vals = np.concatenate([y_vals, Ic_model[np.isfinite(Ic_model)]])
+        if y_vals.size:
+            y_lo, y_hi = float(np.min(y_vals)), float(np.max(y_vals))
+            if y_hi > y_lo:
+                pad = 0.05 * (y_hi - y_lo)
+                ax.set_ylim(y_lo - pad, y_hi + pad)
+            else:
+                ax.set_ylim(y_lo - 1.0, y_hi + 1.0)
+
     if H_plot_range is not None and not plot_x_Phi:
         ax.set_xlim(float(H_plot_range[0]), float(H_plot_range[1]))
 
-    ax.legend(loc="best")
-    fig.tight_layout()
+    handles, labels = ax.get_legend_handles_labels()
+    if show_dvdi:
+        # Legend + R² below the figure (black) — keeps the map uncluttered
+        if handles:
+            fig.tight_layout(rect=(0, 0.14, 1, 1))
+            leg = fig.legend(
+                handles, labels,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.08),
+                ncol=min(len(handles), 3),
+                frameon=False,
+                fontsize=7,
+            )
+            for t in leg.get_texts():
+                t.set_color("black")
+            if r2_text is not None:
+                fig.text(
+                    0.98, 0.02, r2_text,
+                    ha="right", va="bottom", fontsize=7, color="black",
+                )
+        else:
+            fig.tight_layout()
+    else:
+        # Original behaviour: legend inside the axes
+        if handles:
+            leg = ax.legend(loc="best")
+        if r2_text is not None:
+            ax.text(
+                0.97, 0.95, r2_text,
+                transform=ax.transAxes, ha="right", va="top", fontsize=7,
+                color="black",
+            )
+        fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
     print(f"Figure saved to: {os.path.abspath(out_path)}")
@@ -1124,6 +2032,10 @@ Argument summary
                        two values may be given (fwd, bwd) to align the
                        branches before averaging; after alignment H_off
                        starts at 0.
+    --H-mean           Use Hsample_mean_Oe as the field for each point
+                       instead of the nominal H (still converted to mT).
+    --H-plot-error     Use Hsample_sem as σ_H in the fit (ODR) and draw
+                       horizontal error bars on the figure.
     --BF               Bi-directional field sweeps present.
     --average          Average fwd and bwd over the overlapping H window
                        (requires --BF).  Branch offsets are applied first.
@@ -1141,6 +2053,10 @@ Argument summary
     --I-plot-range LO HI
                        Y-axis limits (µA, or dimensionless if --normalize).
     --plot-x-Phi       When a model is fitted, plot versus Φ/Φ0 instead of H.
+    --plot-dvdi        Overlay a dV/dI intensity map as the plot background
+                       (colourbar on the right).  Loads dVdI.dat from each
+                       singles/<H>/ folder when scanning, or reads
+                       I_array_uA / dVdI_array_Ohm from the CSV.
     --out PATH         Output figure path (default: Fraunhofer_fit.pdf).
 
   Models
@@ -1153,6 +2069,9 @@ Argument summary
     --width UM         Junction width in μm; used to compute d_eff from the
                        fitted period.
     --no-fit           Explicitly skip fitting even if --model is given.
+    --write-fit-results
+                       Write Fraunhofer_fit_data.csv (measured vs predicted
+                       Ic, per-point residuals, global RMSE / R²).
 
 Examples
 --------
@@ -1188,6 +2107,16 @@ Examples
         dest="H_eq0_offset",
         help="Initial guess for central-lobe field position H_off (mT); "
              "with --BF two values (fwd, bwd) also align branches",
+    )
+    parser.add_argument(
+        "--H-mean", action="store_true",
+        help="Use Hsample_mean_Oe (converted to mT) as the field value "
+             "for each point instead of the nominal H",
+    )
+    parser.add_argument(
+        "--H-plot-error", action="store_true",
+        help="Use field uncertainty (Hsample_sem → H_err_mT) in the fit "
+             "(ODR) and draw horizontal error bars on the plot",
     )
     parser.add_argument(
         "--BF", action="store_true",
@@ -1227,6 +2156,22 @@ Examples
         help="Plot versus Φ/Φ0 (requires a successful model fit)",
     )
     parser.add_argument(
+        "--plot-dvdi", action="store_true",
+        help="Draw dV/dI intensity map as plot background "
+             "(needs dVdI.dat per folder, or dVdI_array_Ohm in CSV)",
+    )
+    parser.add_argument(
+        "--smooth-dvdi", nargs="?", const=5, type=int, default=None,
+        metavar="K",
+        help="Median-filter dV/dI along the current axis (only with "
+             "--plot-dvdi).  Optional odd kernel size K (default: 5)",
+    )
+    parser.add_argument(
+        "--Rn", type=float, default=None, metavar="OHM",
+        help="Normal-state resistance Rn (Ohm).  If set, y-axis is "
+             "Ic·Rn in mV and dV/dI is plotted as (dV/dI)/Rn",
+    )
+    parser.add_argument(
         "--out", default="Fraunhofer_fit.pdf",
         help="Output figure path (default: Fraunhofer_fit.pdf)",
     )
@@ -1248,6 +2193,11 @@ Examples
     parser.add_argument(
         "--no-fit", action="store_true",
         help="Skip model fitting even if --model is given",
+    )
+    parser.add_argument(
+        "--write-fit-results", action="store_true",
+        help="Write Fraunhofer_fit_data.csv with measured/predicted Ic, "
+             "per-point residuals, and global fit metrics",
     )
     parser.add_argument(
         "--log", default="analysis.log",
@@ -1286,12 +2236,26 @@ def main(argv=None):
         )
         records = collect_data(args.dir)
 
-    # Always persist the raw collection (before offset / averaging)
+    # Attach / recover dV/dI traces so --plot-dvdi works even when the CSV
+    # was written without array columns, or analysis.log and dVdI.dat live
+    # in slightly different layouts under --dir.
+    records, n_att = attach_dvdi_from_dir(records, args.dir)
+    if n_att == 0 and args.from_csv:
+        csv_dir = os.path.dirname(os.path.abspath(args.from_csv)) or "."
+        if os.path.abspath(csv_dir) != os.path.abspath(
+            os.path.expanduser(args.dir)
+        ):
+            records, n_att = attach_dvdi_from_dir(records, csv_dir)
+
+    # Persist collection (includes any recovered dV/dI arrays)
     save_csv(args.save_csv, records)
 
     # ------------------------------------------------------------------
-    # 2. Optional branch alignment → average → H-range cut → normalize
+    # 2. Optional Hsample_mean → branch alignment → average → H-range
     # ------------------------------------------------------------------
+    if args.H_mean:
+        records = apply_Hsample_mean(records)
+
     # Two-value --H=0-offset under --BF only pre-shifts branches for
     # averaging; a single value is the H_off fit initial guess (no shift).
     records = apply_branch_alignment(
@@ -1337,12 +2301,28 @@ def main(argv=None):
         fit_records = select_branch_for_fit(records, which=use_data)
         H_fit = np.array([r["H_mT"] for r in fit_records])
         Ic_fit = np.array([r["Ic_active_uA"] for r in fit_records])
+        H_err_fit = None
+        if args.H_plot_error:
+            H_err_fit = np.array([
+                r["H_err_mT"] if r.get("H_err_mT") is not None else np.nan
+                for r in fit_records
+            ], dtype=float)
+            n_err = int(np.sum(np.isfinite(H_err_fit) & (H_err_fit > 0)))
+            if n_err < 5:
+                print(
+                    f"  [warn] --H-plot-error set but only {n_err} point(s) "
+                    f"have usable H_err; falling back to ordinary fit.",
+                    file=sys.stderr,
+                )
+                H_err_fit = None
+
         print(f"Fitting model '{args.model}' on {len(H_fit)} point(s) …")
         try:
             popt, perr, names, metrics, func = fit_model(
                 H_fit, Ic_fit, args.model,
                 Delta0_initial=args.Delta0_initial,
                 H_off_initial=H_off_initial,
+                H_err=H_err_fit,
             )
             # Store initials alongside the fit for the analysis log
             Delta0_init_used = (
@@ -1391,6 +2371,11 @@ def main(argv=None):
                 f"AIC = {metrics['AIC']:.2f}   "
                 f"BIC = {metrics['BIC']:.2f}"
             )
+            if args.write_fit_results:
+                write_fit_results_csv(
+                    "Fraunhofer_fit_data.csv",
+                    fit_records, popt, names, metrics, args.model, func,
+                )
         except Exception as exc:
             print(f"  [fit failed] {exc}", file=sys.stderr)
             fit_result = None
@@ -1408,7 +2393,57 @@ def main(argv=None):
         f"(primary={use_data}, plot-BF={bool(args.BF and args.plot_BF)})"
     )
 
+    if args.plot_dvdi:
+        n_z = sum(
+            1 for r in plot_records
+            if r.get("dVdI_array_Ohm") is not None
+            and (
+                (isinstance(r["dVdI_array_Ohm"], np.ndarray)
+                 and r["dVdI_array_Ohm"].size >= 2)
+                or (
+                    isinstance(r["dVdI_array_Ohm"], str)
+                    and len(r["dVdI_array_Ohm"].strip()) > 0
+                )
+            )
+        )
+        n_i = sum(
+            1 for r in plot_records
+            if r.get("I_array_uA") is not None
+            and (
+                (isinstance(r["I_array_uA"], np.ndarray)
+                 and r["I_array_uA"].size >= 2)
+                or (
+                    isinstance(r["I_array_uA"], str)
+                    and len(r["I_array_uA"].strip()) > 0
+                )
+            )
+        )
+        print(
+            f"  --plot-dvdi: {n_z}/{len(plot_records)} points have "
+            f"dVdI_array_Ohm, {n_i}/{len(plot_records)} have I_array_uA"
+        )
+        if n_z == 0:
+            print(
+                "  [hint] Re-run without --from-csv so dVdI.dat is loaded "
+                "from each singles/<H>/ folder, or check that the CSV "
+                "columns I_array_uA / dVdI_array_Ohm are non-empty.",
+                file=sys.stderr,
+            )
+
     write_analysis_log(args.log, args, records, fit_result, norm_Ic0)
+    smooth_k = None
+    if args.smooth_dvdi is not None:
+        if not args.plot_dvdi:
+            print(
+                "  [warn] --smooth-dvdi ignored without --plot-dvdi",
+                file=sys.stderr,
+            )
+        else:
+            smooth_k = int(args.smooth_dvdi)
+
+    if args.Rn is not None and args.Rn <= 0:
+        parser.error("--Rn must be a positive resistance in Ohm")
+
     plot_fraunhofer(
         plot_records,
         fit_result=fit_result,
@@ -1416,6 +2451,10 @@ def main(argv=None):
         I_plot_range=args.I_plot_range,
         H_plot_range=args.H_plot_range,
         plot_x_Phi=args.plot_x_Phi and fit_result is not None,
+        plot_H_error=args.H_plot_error,
+        plot_dvdi=args.plot_dvdi,
+        smooth_dvdi=smooth_k,
+        Rn_Ohm=args.Rn,
         out_path=args.out,
     )
 
