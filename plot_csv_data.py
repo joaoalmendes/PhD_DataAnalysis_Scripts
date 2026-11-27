@@ -44,6 +44,171 @@ from scipy.stats import linregress
 # forward + one backward sweep sharing the turnaround point -> 2N-1 rows).
 DEFAULT_POINTS_PER_SWEEP = 201
 
+# ---------------------------------------------------------------------------
+# LIA channel helpers (phase-corrected dV/dI)
+# ---------------------------------------------------------------------------
+# Channel strings are of the form "X1", "R2", "Y3", … .  The trailing digit
+# is the LIA number and selects the corresponding theta column (theta1, …).
+# Defaults used throughout the module when the user does not override them:
+#   dI → X1   (LIA 1, X-channel)
+#   dV → R2   (LIA 2, R-channel)
+
+def _parse_lia_channel(ch, role="signal"):
+    """
+    Parse a LIA channel specifier into (column_name, theta_column, lia_number).
+
+    Accepts:
+      - str  "X1", "R2", "Y3", "theta2"  (case-insensitive)
+      - int  1, 2, 3  → interpreted as legacy integer LIA index
+                       (role="dI" → Xn, role="dV" → Rn)
+
+    Returns
+    -------
+    col : str
+        DataFrame column name (e.g. "X1", "R2").
+    theta_col : str
+        Matching phase column (e.g. "theta1").
+    lia : int
+        LIA number (1, 2, …).
+    """
+    if isinstance(ch, (int, np.integer)):
+        n = int(ch)
+        if n < 1:
+            raise ValueError(f"LIA number must be ≥ 1 (got {n})")
+        if role == "dI":
+            return f"X{n}", f"theta{n}", n
+        if role == "dV":
+            return f"R{n}", f"theta{n}", n
+        return f"R{n}", f"theta{n}", n
+
+    s = str(ch).strip()
+    m = re.match(r"(?i)^(X|Y|R|theta)(\d+)$", s)
+    if not m:
+        raise ValueError(
+            f"Invalid LIA channel '{ch}'. Expected e.g. 'X1', 'R2', 'Y3' "
+            f"or an integer LIA index."
+        )
+    prefix = m.group(1).upper() if m.group(1).lower() != "theta" else "theta"
+    n = int(m.group(2))
+    if prefix == "theta":
+        # user passed the phase column itself – treat as R-channel of that LIA
+        return f"R{n}", f"theta{n}", n
+    col = f"{prefix}{n}"
+    return col, f"theta{n}", n
+
+
+def _phase_corrected_dVdI(dI_V, dV_V, theta_dI_deg, theta_dV_deg, R_sense):
+    """
+    Phase-corrected differential resistance (MATLAB transcription).
+
+        R1   = dI_V / cos(theta_dI * π/180)
+        dVdI = R_sense * dV_V / R1 * sign(cos((theta_dV - theta_dI)*π/180))
+
+    Parameters
+    ----------
+    dI_V, dV_V : array-like
+        Raw LIA voltages (V) for the dI and dV channels.
+    theta_dI_deg, theta_dV_deg : array-like
+        Phase angles in degrees.
+    R_sense : float
+        Sense resistor (Ω) converting dI voltage to physical current.
+
+    Returns
+    -------
+    dVdI : ndarray
+        Differential resistance in Ω.  Invalid points are NaN.
+    """
+    th1 = np.deg2rad(np.asarray(theta_dI_deg, dtype=float))
+    th2 = np.deg2rad(np.asarray(theta_dV_deg, dtype=float))
+    X1 = np.asarray(dI_V, dtype=float)
+    R2 = np.asarray(dV_V, dtype=float)
+    R_s = float(R_sense)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        R1 = X1 / np.cos(th1)
+        dVdI = R_s * R2 / R1 * np.sign(np.cos(th2 - th1))
+
+    bad = (~np.isfinite(dVdI)) | (np.abs(R1) < 1e-30)
+    return np.where(bad, np.nan, dVdI)
+
+
+def _mad_clean_spectrum(y, window=20, mad_thresh=5.0):
+    """
+    Remove sharp magnitude spikes from a 1-D spectrum via rolling-median MAD.
+
+    Used on the averaged dI spectrum produced by ``--dI-T-range``.  Low-T
+    traces often contain dense sourcemeter-step peaks that survive averaging
+    and would dominate dV/dI at higher T.  Flagged points are replaced by the
+    local median so the overall magnitude of dI is preserved.
+
+    Parameters
+    ----------
+    y : array-like
+        Spectrum values (may contain NaN).
+    window : int
+        Odd-length rolling window for the local median / MAD (default 11).
+    mad_thresh : float
+        Points with |y − med| > mad_thresh · scale are treated as peaks
+        (default 5.0, consistent with the module's outlier_thresh).
+        scale = max(1.4826·MAD, 1e-3·median|y|) so flat baselines with
+        rare spikes are still cleaned.
+
+    Returns
+    -------
+    cleaned : ndarray
+        Spectrum with peaks replaced by the local median.
+    n_cleaned : int
+        Number of points that were replaced.
+    """
+    y = np.asarray(y, dtype=float).copy()
+    n = len(y)
+    if n < 3:
+        return y, 0
+
+    w = int(window)
+    if w < 3:
+        w = 3
+    if w % 2 == 0:
+        w += 1
+    half = w // 2
+
+    # Rolling median (NaN-aware) via a simple loop — n is at most a few
+    # hundred points for a typical IV sweep, so this is fine.
+    med = np.full(n, np.nan)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        seg = y[lo:hi]
+        finite = seg[np.isfinite(seg)]
+        if len(finite):
+            med[i] = np.median(finite)
+
+    resid = y - med
+    finite_resid = resid[np.isfinite(resid)]
+    if len(finite_resid) < 3:
+        return y, 0
+
+    mad = float(np.median(np.abs(finite_resid)))
+    finite_y = y[np.isfinite(y)]
+    y_scale = float(np.median(np.abs(finite_y))) if len(finite_y) else 0.0
+
+    # Robust scale: 1.4826 · MAD ≈ σ for Gaussian noise.  Floor at a small
+    # fraction of the spectrum magnitude so that a nearly-flat baseline with
+    # rare large spikes (MAD ≈ 0) still triggers cleaning.
+    scale = max(
+        1.4826 * mad if np.isfinite(mad) else 0.0,
+        1e-3 * y_scale if np.isfinite(y_scale) else 0.0,
+    )
+    if scale < 1e-30:
+        return y, 0
+
+    peak_mask = np.isfinite(resid) & (np.abs(resid) > mad_thresh * scale)
+    n_cleaned = int(np.count_nonzero(peak_mask))
+    if n_cleaned:
+        y[peak_mask] = med[peak_mask]
+    return y, n_cleaned
+
+
 # ==================================================================
 # Style / display helpers
 # (the only section that should contain rcParams, default colors,
@@ -154,27 +319,36 @@ def _load_csv_rack(csv_path, mode="rt", **kwargs):
         })
 
     elif mode == "iv":
-        # I(V) mode - no scaling needed, Is and Vdmm are direct
-        channel_dV = kwargs.get("channel_dV", 2)
-        channel_dI = kwargs.get("channel_dI", 1)
-        phase_col = kwargs.get("phase_channel", "theta2")
-        dV_col = f"R{channel_dV}"
-        dI_col = f"X{channel_dI}"
+        # I(V) mode.  Channels may be given as strings ("X1", "R2") or
+        # legacy integers (1 → X1 for dI, 2 → R2 for dV).
+        ch_dV_raw = kwargs.get("channel_dV", "R2")
+        ch_dI_raw = kwargs.get("channel_dI", "X1")
+        dV_col, theta_dV_col, _ = _parse_lia_channel(ch_dV_raw, role="dV")
+        dI_col, theta_dI_col, _ = _parse_lia_channel(ch_dI_raw, role="dI")
 
-        phase_vals = (
-            df[phase_col].astype(float).values
-            if phase_col in df.columns
-            else np.full(len(df), np.nan)
-        )
+        # Backward-compat: explicit --phase-channel still overrides the
+        # theta column associated with the dV channel.
+        phase_col = kwargs.get("phase_channel") or theta_dV_col
+
+        def _col_or_nan(name):
+            if name in df.columns:
+                return df[name].astype(float).values
+            return np.full(len(df), np.nan)
 
         return pd.DataFrame({
             "Current (A)": df["Is"].astype(float).values,
             "Voltage (V)": df["Vdmm"].astype(float).values,
-            "dV": df[dV_col].astype(float).values if dV_col in df.columns else np.nan,
-            "dI": df[dI_col].astype(float).values if dI_col in df.columns else np.nan,
+            "dV": _col_or_nan(dV_col),
+            "dI": _col_or_nan(dI_col),
+            "theta_dV": _col_or_nan(theta_dV_col),
+            "theta_dI": _col_or_nan(theta_dI_col),
             "Tsample": df["Tsample"].astype(float).values,
-            "phase": phase_vals,
+            "phase": _col_or_nan(phase_col),          # kept for diagnostics
             "phase_channel": phase_col,
+            "dV_col": dV_col,
+            "dI_col": dI_col,
+            "theta_dV_col": theta_dV_col,
+            "theta_dI_col": theta_dI_col,
         })
 
     else:
@@ -754,19 +928,25 @@ def _label_iv_branches(I, window=3, points_per_sweep=None):
     return branch, is_bf
 
 
-def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack",
-                    current=None, phase_channel="theta2", di_sense_R=1e3,
+def analyze_IV_dVdI(data_source, channel_dV="R2", channel_dI="X1", source="rack",
+                    current=None, phase_channel=None, di_sense_R=1e3,
                     points_per_sweep=DEFAULT_POINTS_PER_SWEEP):
-    """Extract I(V) and dV/dI data from rack CSV.
+    """Extract I(V) and phase-corrected dV/dI data from a rack CSV.
 
     The lock-in dI channel is recorded as a *voltage* (V) across a sense
     resistor ``di_sense_R`` (default 1 kΩ).  Physical AC current is
-    dI_A = dI_V / di_sense_R, and dV/dI is formed in ohms.
+    recovered after phase correction:
+
+        R1   = dI_V / cos(θ_dI)
+        dVdI = R_sense · dV_V / R1 · sign(cos(θ_dV − θ_dI))
+
+    ``channel_dV`` / ``channel_dI`` accept strings such as ``"R2"``,
+    ``"X1"`` (preferred) or legacy integer LIA indices.
 
     Returns a dict with:
-        'I', 'V', 'dV', 'dI' (physical A), 'dI_V' (raw LIA V),
+        'I', 'V', 'dV', 'dI' (physical A, phase-corrected), 'dI_V' (raw LIA V),
         'dVdI' (Ohm), 'T', 'branch', 'is_bf', 'phase', 'phase_channel',
-        'di_sense_R'
+        'theta_dI', 'theta_dV', 'di_sense_R', 'channel_dV', 'channel_dI'
     """
     df = _load_csv_rack(
         data_source, mode="iv",
@@ -777,42 +957,51 @@ def analyze_IV_dVdI(data_source, channel_dV=2, channel_dI=1, source="rack",
     I = df["Current (A)"].to_numpy(dtype=float)
     V = df["Voltage (V)"].to_numpy(dtype=float)
     dV = df["dV"].to_numpy(dtype=float)
-    dI_V = df["dI"].to_numpy(dtype=float)  # LIA voltage (V)
+    dI_V = df["dI"].to_numpy(dtype=float)          # raw LIA voltage (V)
     T = df["Tsample"].to_numpy(dtype=float)
-    phase = df["phase"].to_numpy(dtype=float) if "phase" in df.columns else np.full(len(I), np.nan)
+    theta_dI = df["theta_dI"].to_numpy(dtype=float)
+    theta_dV = df["theta_dV"].to_numpy(dtype=float)
+    phase = df["phase"].to_numpy(dtype=float) if "phase" in df.columns else theta_dV
 
     R_s = float(di_sense_R) if di_sense_R is not None else 1e3
     if R_s <= 0:
         raise ValueError(f"di_sense_R must be > 0 (got {R_s})")
-    # Physical AC current through the sense resistor
-    dI = dI_V / R_s  # Ampere
 
-    # dV/dI in Ohm (dV is LIA voltage in V; dI is A)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        dVdI = np.where(np.abs(dI) > 1e-15, dV / dI, np.nan)
+    # Phase-corrected dV/dI (Ω) and effective physical dI (A)
+    dVdI = _phase_corrected_dVdI(dI_V, dV, theta_dI, theta_dV, R_s)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # Effective AC current consistent with the phase-corrected ratio
+        dI = np.where(np.abs(dVdI) > 1e-30, dV / dVdI, np.nan)
 
     # Forward / backward from local sign of ΔI (smoothed)
     branch, is_bf = _label_iv_branches(
         I, window=3, points_per_sweep=points_per_sweep,
     )
 
+    dV_col = df["dV_col"].iloc[0] if "dV_col" in df.columns else str(channel_dV)
+    dI_col = df["dI_col"].iloc[0] if "dI_col" in df.columns else str(channel_dI)
+
     return {
         "I": I,
         "V": V,
         "dV": dV,
-        "dI": dI,          # physical current (A) = dI_V / di_sense_R
-        "dI_V": dI_V,      # raw LIA voltage (V)
-        "dVdI": dVdI,      # Ohm
+        "dI": dI,              # effective physical current (A)
+        "dI_V": dI_V,          # raw LIA voltage (V)
+        "dVdI": dVdI,          # Ohm (phase-corrected)
         "T": T,
         "phase": phase,
-        "phase_channel": phase_channel,
+        "phase_channel": df["phase_channel"].iloc[0] if "phase_channel" in df.columns else phase_channel,
+        "theta_dI": theta_dI,
+        "theta_dV": theta_dV,
         "di_sense_R": R_s,
+        "channel_dV": dV_col,
+        "channel_dI": dI_col,
         "branch": branch,
         "source": source,
         "is_bf": is_bf,
     }
 
-def load_multi_iv_files(pattern_or_list, channel_dV=2, channel_dI=1):
+def load_multi_iv_files(pattern_or_list, channel_dV="R2", channel_dI="X1"):
     if isinstance(pattern_or_list, str):
         expanded = os.path.expanduser(pattern_or_list)
         files = glob.glob(expanded)
@@ -1285,11 +1474,11 @@ def plot_multi_temp_iv(datasets, output_prefix="multi_temp", figsize=(8.6, 6.0))
 
 
 def plot_2d_dvdi_map_from_single_file(
-        filepath, channel_dV=2, channel_dI=1,
+        filepath, channel_dV="R2", channel_dI="X1",
         clim_pct=(2, 98), T_max=None, di_sense_R=1e3,
         T_step=None, T_initial=None, T_final=None,
-        points_per_sweep=DEFAULT_POINTS_PER_SWEEP, phase_channel="theta2",
-        map_J=False, area_um2=None, iv_bf=False,
+        points_per_sweep=DEFAULT_POINTS_PER_SWEEP, phase_channel=None,
+        map_J=False, area_um2=None, iv_bf=False, dI_T_range=None,
         ):
     """2D dV/dI intensity map from a multi-T rack IV file.
 
@@ -1308,6 +1497,7 @@ def plot_2d_dvdi_map_from_single_file(
         T_max=T_max, T_step=T_step, T_initial=T_initial, T_final=T_final,
         points_per_sweep=points_per_sweep, phase_channel=phase_channel,
         di_sense_R=di_sense_R, min_points=3, iv_bf=iv_bf,
+        dI_T_range=dI_T_range,
     )
     if not datasets:
         print("  No temperature segments — map not produced.")
@@ -5399,10 +5589,11 @@ def _report_segment_issues(n_setpoints, n_usable, missing, fwd_only, dropped,
               f"--points-per-sweep (now {n_pps}), --T-initial and --T-step")
 
 
-def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
+def segment_multi_t_iv(filepath, channel_dV="R2", channel_dI="X1",
                        T_max=None, T_step=None, T_initial=None, T_final=None,
-                       min_points=30, phase_channel="theta2", di_sense_R=1e3,
-                       points_per_sweep=DEFAULT_POINTS_PER_SWEEP, T_round=None, iv_bf=False):
+                       min_points=30, phase_channel=None, di_sense_R=1e3,
+                       points_per_sweep=DEFAULT_POINTS_PER_SWEEP, T_round=None,
+                       iv_bf=False, dI_T_range=None):
     """Split a multi-T rack IV file into per-temperature F+B datasets.
 
     Data placement does **not** use measured Tsample rounding.  Instead:
@@ -5419,6 +5610,15 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
        F = N points, B = N points, last F ≡ first B (not stored twice).
 
     3. Assign consecutive (F, B) pairs to setpoints ``T_k``.
+
+    Phase-corrected dV/dI is always computed (see ``_phase_corrected_dVdI``).
+
+    When ``dI_T_range=(T_lo, T_hi)`` is supplied, only temperatures inside
+    that window use their measured dI.  Outside the window the average
+    point-to-point dI spectrum (computed on the reliable window, MAD-cleaned
+    to remove sharp sourcemeter-step peaks, and mapped onto each outer-T
+    current grid) is used instead.  A terminal message reports how many
+    temperatures fall into each category and how many peaks were cleaned.
 
     Measured Tsample is still stored for diagnostics but does not decide
     which points belong to which temperature.
@@ -5493,7 +5693,23 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
         f"N_sweep={n_pps}  file_rows={n_total}"
     )
 
-    def _pack(sub, branch, is_bf, T_set):
+    # Parse dI reliability window
+    dI_lo = dI_hi = None
+    if dI_T_range is not None:
+        if len(dI_T_range) != 2:
+            raise ValueError("--dI-T-range expects exactly two floats: T_lo T_hi")
+        dI_lo, dI_hi = float(dI_T_range[0]), float(dI_T_range[1])
+        if dI_lo > dI_hi:
+            dI_lo, dI_hi = dI_hi, dI_lo
+        print(
+            f"  [dI-T-range] reliable dI window: [{dI_lo:g}, {dI_hi:g}] K.  "
+            f"Outside this window the average dI spectrum from the window "
+            f"(MAD-cleaned to remove sharp sourcemeter peaks) will be mapped "
+            f"onto each temperature's current grid."
+        )
+
+    def _pack(sub, branch, is_bf, T_set, use_measured_dI=True,
+              avg_dI_I=None, avg_dI_val=None):
         I = sub["Current (A)"].to_numpy(dtype=float)
         if len(I) < min_points or (np.nanmax(I) - np.nanmin(I) < 1e-9):
             return None
@@ -5501,24 +5717,55 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
         dV = sub["dV"].to_numpy(dtype=float)
         dI_V = sub["dI"].to_numpy(dtype=float)
         T = sub["Tsample"].to_numpy(dtype=float)
+        theta_dI = (
+            sub["theta_dI"].to_numpy(dtype=float)
+            if "theta_dI" in sub.columns
+            else np.zeros(len(I))
+        )
+        theta_dV = (
+            sub["theta_dV"].to_numpy(dtype=float)
+            if "theta_dV" in sub.columns
+            else np.zeros(len(I))
+        )
         phase = (
             sub["phase"].to_numpy(dtype=float)
             if "phase" in sub.columns
-            else np.full(len(I), np.nan)
+            else theta_dV
         )
-        dI = dI_V / R_s
-        with np.errstate(divide='ignore', invalid='ignore'):
-            dVdI = np.where(np.abs(dI) > 1e-15, dV / dI, np.nan)
+
+        if use_measured_dI:
+            dVdI = _phase_corrected_dVdI(dI_V, dV, theta_dI, theta_dV, R_s)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                dI = np.where(np.abs(dVdI) > 1e-30, dV / dVdI, np.nan)
+        else:
+            # Map the average dI spectrum onto this temperature's current grid
+            if avg_dI_I is None or avg_dI_val is None or len(avg_dI_I) < 2:
+                dVdI = np.full(len(I), np.nan)
+                dI = np.full(len(I), np.nan)
+            else:
+                # Interpolate average physical dI onto the local I grid
+                dI = np.interp(I, avg_dI_I, avg_dI_val,
+                               left=np.nan, right=np.nan)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    dVdI = np.where(np.abs(dI) > 1e-30, dV / dI, np.nan)
+
         return {
             "I": I, "V": V, "dV": dV, "dI": dI, "dI_V": dI_V, "dVdI": dVdI,
-            "T": T, "phase": phase, "phase_channel": phase_channel,
+            "T": T, "phase": phase,
+            "phase_channel": (
+                sub["phase_channel"].iloc[0]
+                if "phase_channel" in sub.columns else phase_channel
+            ),
+            "theta_dI": theta_dI, "theta_dV": theta_dV,
             "di_sense_R": R_s,
+            "channel_dV": str(channel_dV), "channel_dI": str(channel_dI),
             "branch": branch, "source": "rack", "is_bf": is_bf,
             "T_mean": float(T_set),
             "T_setpoint": float(T_set),
             "T_label": f"{float(T_set):.1f}",
             "n_forward": int(np.sum(branch == "forward")),
             "n_backward": int(np.sum(branch == "backward")),
+            "dI_from_average": not use_measured_dI,
         }
 
     datasets = []
@@ -5534,6 +5781,8 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
         print(f"  [segment] forward-only IV: stride={stride} rows/T")
     tol_T = max(0.25 * T_step, 0.05)
     missing, fwd_only, dropped, off_grid = [], [], [], []
+    reliable_packs = []   # (I, dI_physical) from the dI-T-range window
+
     for k, T_set in enumerate(setpoints):
         i0 = k * stride
         if i0 >= n_total:
@@ -5562,15 +5811,83 @@ def segment_multi_t_iv(filepath, channel_dV=2, channel_dI=1,
             if iv_bf:
                 fwd_only.append(T_set)
 
-        packed = _pack(sub, branch, is_bf, T_set)
+        in_window = (
+            dI_lo is None
+            or (dI_lo - 1e-9 <= T_set <= dI_hi + 1e-9)
+        )
+        packed = _pack(sub, branch, is_bf, T_set, use_measured_dI=in_window)
         if packed is None:
             dropped.append(T_set)
             continue
+        if in_window:
+            # Collect reliable (I, dI) for later averaging
+            mask = np.isfinite(packed["I"]) & np.isfinite(packed["dI"])
+            if np.count_nonzero(mask) >= 2:
+                reliable_packs.append(
+                    (packed["I"][mask].copy(), packed["dI"][mask].copy())
+                )
         dev = float(np.nanmean(packed["T"]) - T_set) if np.any(np.isfinite(packed["T"])) else np.nan
         packed["T_dev_K"] = dev
         if np.isfinite(dev) and abs(dev) > tol_T:
             off_grid.append((T_set, dev))
         datasets.append(packed)
+
+    # Build average dI spectrum from the reliable window and re-pack outer Ts
+    if dI_lo is not None and reliable_packs:
+        # Use a common current grid spanning the union of all reliable I ranges
+        I_min = min(p[0].min() for p in reliable_packs)
+        I_max = max(p[0].max() for p in reliable_packs)
+        n_grid_pts = max(len(p[0]) for p in reliable_packs)
+        I_common = np.linspace(I_min, I_max, n_grid_pts)
+        dI_stack = []
+        for I_r, dI_r in reliable_packs:
+            order = np.argsort(I_r)
+            dI_interp = np.interp(I_common, I_r[order], dI_r[order],
+                                  left=np.nan, right=np.nan)
+            dI_stack.append(dI_interp)
+        avg_dI = np.nanmean(np.vstack(dI_stack), axis=0)
+
+        # MAD peak cleaning: low-T spectra often contain sharp dI spikes from
+        # denser sourcemeter steps.  Those spikes survive the average and would
+        # dominate dV/dI at high T.  Replace them with a local median baseline
+        # so only the overall magnitude of dI is preserved.
+        avg_dI, n_peaks_cleaned = _mad_clean_spectrum(
+            avg_dI, window=11, mad_thresh=5.0,
+        )
+
+        good = np.isfinite(avg_dI)
+        avg_dI_I = I_common[good]
+        avg_dI_val = avg_dI[good]
+
+        n_outer = 0
+        for i, d in enumerate(datasets):
+            if d.get("dI_from_average", False):
+                # Re-compute with the average spectrum
+                I = d["I"]
+                dV = d["dV"]
+                dI_mapped = np.interp(I, avg_dI_I, avg_dI_val,
+                                      left=np.nan, right=np.nan)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    dVdI_mapped = np.where(
+                        np.abs(dI_mapped) > 1e-30, dV / dI_mapped, np.nan
+                    )
+                d["dI"] = dI_mapped
+                d["dVdI"] = dVdI_mapped
+                n_outer += 1
+        n_inner = len(datasets) - n_outer
+        print(
+            f"  [dI-T-range] {n_inner} temperature(s) used measured dI; "
+            f"{n_outer} temperature(s) used average dI spectrum from "
+            f"[{dI_lo:g}, {dI_hi:g}] K "
+            f"({len(reliable_packs)} spectra averaged, "
+            f"{n_peaks_cleaned} MAD peak(s) cleaned)."
+        )
+    elif dI_lo is not None:
+        print(
+            "  [dI-T-range] WARNING: no usable spectra inside the requested "
+            f"window [{dI_lo:g}, {dI_hi:g}] K — all temperatures keep their "
+            "raw (possibly invalid) dI."
+        )
 
     _report_segment_issues(len(setpoints), len(datasets), missing, fwd_only,
                            dropped, off_grid, tol_T, n_pps)
@@ -5685,7 +6002,7 @@ def _write_params_block(fh, params, advanced):
             fh.write(_format_param_line(k, params[k], params) + "\n")
 
 
-def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
+def run_per_T_iv_from_multi_t_file(filepath, channel_dV="R2", channel_dI="X1",
                                    T_max=None, T_step=None, T_initial=None,
                                    T_final=None, min_points=30,
                                    out_root="singles", figsize=(8.6, 6.0),
@@ -5695,14 +6012,14 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
                                    advanced=False, ic_I_min=None, ic_I_max=None,
                                    split_sweeps=False, show_ic_eff=False,
                                    tc_for_rn=None, include_phase=False,
-                                   phase_channel="theta2", di_sense_R=1e3,
+                                   phase_channel=None, di_sense_R=1e3,
                                    points_per_sweep=DEFAULT_POINTS_PER_SWEEP, plot_points_line=False,
                                    show_ic_lines=False,
                                    ic_rho_frac=0.03, datasets=None,
                                    label_key="T_label", label_suffix="K",
                                    extra_log=None, iv_bf=False,
                                    ic_dvdi_ranges=None, pre_jump_offset=3,
-                                   range_axis="T"):
+                                   range_axis="T", dI_T_range=None):
     """Per-temperature IV diagnostics + parameter logs under ``singles/``.
 
     Layout
@@ -5723,6 +6040,7 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             min_points=min_points,
             phase_channel=phase_channel, di_sense_R=di_sense_R,
             points_per_sweep=points_per_sweep, iv_bf=iv_bf,
+            dI_T_range=dI_T_range,
         )
     else:  # reuse the map segmentation (it used min_points=3)
         datasets = [d for d in datasets if len(d["I"]) >= min_points]
@@ -5861,8 +6179,8 @@ def run_per_T_iv_from_multi_t_file(filepath, channel_dV=2, channel_dI=1,
             fh.write(f"I range (A) : {np.nanmin(data['I']):.6g} … "
                      f"{np.nanmax(data['I']):.6g}\n")
             fh.write("\n--- input parameters ---\n")
-            fh.write(f"channel_dV     = {channel_dV}  (column R{channel_dV})\n")
-            fh.write(f"channel_dI     = {channel_dI}  (column X{channel_dI})\n")
+            fh.write(f"channel_dV     = {channel_dV}\n")
+            fh.write(f"channel_dI     = {channel_dI}\n")
             fh.write(f"di_sense_R    = {di_sense_R} Ohm  (dI_A = V_LIA / R; dV/dI in Ohm)\n")
             fh.write(f"T_max          = {T_max}\n")
             fh.write(f"T_step         = {T_step} K\n")
@@ -5948,7 +6266,7 @@ def _detect_H_turnaround(H_means, min_frac=0.25):
     return None
 
 
-def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
+def segment_multi_h_iv(filepath, channel_dV="R2", channel_dI="X1", H_step=None,
                        H_range=None, H_max=None, BF=False, min_points=30,
                        phase_channel="theta2", di_sense_R=1e3,
                        points_per_sweep=DEFAULT_POINTS_PER_SWEEP, iv_bf=False):
@@ -6101,11 +6419,15 @@ def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
         dV = sub["dV"].to_numpy(dtype=float)
         dI_V = sub["dI"].to_numpy(dtype=float)
         T = sub["Tsample"].to_numpy(dtype=float)
+        theta_dI = (sub["theta_dI"].to_numpy(dtype=float)
+                    if "theta_dI" in sub.columns else np.zeros(len(I)))
+        theta_dV = (sub["theta_dV"].to_numpy(dtype=float)
+                    if "theta_dV" in sub.columns else np.zeros(len(I)))
         phase = (sub["phase"].to_numpy(dtype=float) if "phase" in sub.columns
-                 else np.full(len(I), np.nan))
-        dI = dI_V / R_s
+                 else theta_dV)
+        dVdI = _phase_corrected_dVdI(dI_V, dV, theta_dI, theta_dV, R_s)
         with np.errstate(divide="ignore", invalid="ignore"):
-            dVdI = np.where(np.abs(dI) > 1e-15, dV / dI, np.nan)
+            dI = np.where(np.abs(dVdI) > 1e-30, dV / dVdI, np.nan)
         T_mean = float(np.nanmean(T))
         lab = f"H{H_x:+.1f}Oe"
         if BF:
@@ -6113,7 +6435,10 @@ def segment_multi_h_iv(filepath, channel_dV=2, channel_dI=1, H_step=None,
         datasets.append({
             "I": I, "V": V, "dV": dV, "dI": dI, "dI_V": dI_V, "dVdI": dVdI,
             "T": T, "phase": phase, "phase_channel": phase_channel,
-            "di_sense_R": R_s, "branch": branch, "source": "rack",
+            "theta_dI": theta_dI, "theta_dV": theta_dV,
+            "di_sense_R": R_s, "channel_dV": str(channel_dV),
+            "channel_dI": str(channel_dI),
+            "branch": branch, "source": "rack",
             "is_bf": is_bf,
             "T_mean": T_mean, "T_label": f"{T_mean:.1f}",
             "n_forward": int(np.sum(branch == "forward")),
@@ -6585,10 +6910,19 @@ def _add_IV_dVdI_parser(subparsers):
     p.add_argument("--multi-temp", type=str, nargs='?', const='',
                     help="Run multi-temperature analysis. Provide glob pattern (required)," \
                     " e.g. '~/PhD/scripts/260626_NbSe2_IV_*K*_004_processed.csv'")
-    p.add_argument("--channel-dV", type=int, default=2, choices=[1,2,3],
-                    help="Channel for dV (default: 2)")
-    p.add_argument("--channel-dI", type=int, default=1, choices=[1,2,3],
-                    help="Channel for dI (default: 1)")
+    p.add_argument("--channel-dV", type=str, default="R2",
+                    help="LIA channel for dV, e.g. 'R2', 'X2', 'Y3' "
+                         "(default: R2). Legacy integer (e.g. 2 → R2) still accepted.")
+    p.add_argument("--channel-dI", type=str, default="X1",
+                    help="LIA channel for dI, e.g. 'X1', 'R1', 'Y1' "
+                         "(default: X1). Legacy integer (e.g. 1 → X1) still accepted.")
+    p.add_argument("--dI-T-range", nargs=2, type=float, default=None,
+                    metavar=("T_LO", "T_HI"),
+                    help="Temperature window (K) in which the measured dI is "
+                         "trusted. Outside this window the average point-to-point "
+                         "dI spectrum from the window is mapped onto each "
+                         "temperature's current grid and used for dV/dI. "
+                         "If omitted the normal per-temperature dI is used everywhere.")
     p.add_argument("--errorbars", action="store_true")
     p.add_argument("-o", "--output", default="IV_plot.pdf")
     p.add_argument("--figsize", nargs=2, type=float, default=(8.6, 6.0),
@@ -7481,10 +7815,11 @@ def _run_IV_dVdI(args):
             T_initial=getattr(args, 'T_initial', None),
             T_final=getattr(args, 'T_final', None),
             points_per_sweep=getattr(args, 'points_per_sweep', DEFAULT_POINTS_PER_SWEEP),
-            phase_channel=getattr(args, 'phase_channel', 'theta2'),
+            phase_channel=getattr(args, 'phase_channel', None),
             map_J=getattr(args, 'map_J', False),
             area_um2=getattr(args, 'area', None),
             iv_bf=getattr(args, 'IV_BF', False),
+            dI_T_range=getattr(args, 'dI_T_range', None),
         )
         if getattr(args, 'per_T_analysis', False):
             print("Running per-temperature single IV analysis...")
@@ -7510,6 +7845,7 @@ def _run_IV_dVdI(args):
                 ic_I_max=getattr(args, 'ic_I_max', None),
                 split_sweeps=getattr(args, 'split_sweeps', False),
                 show_ic_eff=True,
+                dI_T_range=getattr(args, 'dI_T_range', None),
                 tc_for_rn=getattr(args, 'tc_for_rn', None),
                 include_phase=getattr(args, 'phase', False),
                 phase_channel=getattr(args, 'phase_channel', 'theta2'),

@@ -7,8 +7,12 @@ Entry point:
 
 Modes:  RT  |  IV  |  Hall_MR
 
-Ic(T) fitting after multi-T analysis is a separate script (Ic_T_fit.py) and is
-not covered here.
+Related scripts (not covered in detail here)
+--------------------------------------------
+  Ic_T_fit.py              Fit Ic(T) after multi-T / --per-T-analysis.
+  iv_conductance_plot.py   Phase-corrected G(V) / dV/dI overlays and multi-T
+                           waterfalls (same phase formula as IV mode below).
+  Fraunhofer_analysis.py   Post-process Fraunhofer maps from singles/ or CSVs.
 
 
 ================================================================================
@@ -93,6 +97,29 @@ Analyse Josephson / transport I(V) data from the rack.  Four input layouts:
                               optional --per-H-analysis → singles/<H>/
   4. --multi-temp PATTERN     glob of single-T files plotted together
 
+Phase-corrected dV/dI
+---------------------
+dV/dI is always computed with the lock-in phase correction (same formula as
+iv_conductance_plot.py):
+
+    R1   = dI_V / cos(θ_dI · π/180)
+    dVdI = R_sense · dV_V / R1 · sign(cos((θ_dV − θ_dI)·π/180))
+
+Channels are specified by LIA column name (preferred) or legacy integer:
+
+  --channel-dI X1        (default)  → column X1, phase theta1
+  --channel-dV R2        (default)  → column R2, phase theta2
+
+Any of Xn / Yn / Rn is accepted (n = LIA number).  The matching thetaN
+column is chosen automatically.  Legacy integers still work (1 → X1 for dI,
+2 → R2 for dV).
+
+When the dI lock-in fails above a certain temperature, restrict the measured
+dI to a trusted window with --dI-T-range T_LO T_HI.  Outside that window the
+average point-to-point dI spectrum from the window is mapped onto each
+temperature’s current grid and used for dV/dI.  Terminal messages report how
+many temperatures used measured vs averaged dI.
+
 Critical current
   - Default (no --ic-dvdi-range): only Ic_eff from the rho criterion
     (V/(I·Rn) > --ic-rho-frac).  Jump search is not run.
@@ -128,14 +155,24 @@ Input layout (choose one)
   --multi-temp PATTERN   Glob of single-T CSVs.
 
 Channels / hardware
-  --channel-dV {1,2,3}   LIA channel for dV (default: 2).
-  --channel-dI {1,2,3}   LIA channel for dI (default: 1).
+  --channel-dV STR|N     LIA channel for dV: "R2", "X2", "Y3", … or legacy
+                         integer (default: R2).  Phase = thetaN for that LIA.
+  --channel-dI STR|N     LIA channel for dI: "X1", "R1", … or legacy integer
+                         (default: X1).  Phase = thetaN for that LIA.
   --di-sense-R OHM       Sense resistor for dI (default: 1000).
   --phase                Also plot lock-in phase vs I.
-  --phase-channel COL    Phase column name (default: theta2).
+  --phase-channel COL    Override phase column for diagnostics
+                         (default: theta of the dV channel).
   --points-per-sweep N   Samples per forward sweep (default: 201).
   --IV-BF                Each loop is forward+backward (2N−1 rows).
                          Default: forward-only (N rows).
+
+dI reliability window (multi-T)
+  --dI-T-range T_LO T_HI
+                         Temperatures inside [T_LO, T_HI] use measured dI.
+                         Outside, the average dI spectrum from the window is
+                         mapped onto each temperature’s current grid.
+                         If omitted, measured dI is used everywhere.
 
 Junction / Rn
   --area UM2             Junction area (µm²) for Jc and optional --map-J.
@@ -186,13 +223,20 @@ Multi-H file (--multi-h-file)
 
 Abstract examples
 -----------------
-    # Single T, rho-only Ic, diagnostics
+    # Single T, rho-only Ic, diagnostics (default channels X1 / R2)
     python3 plot_csv_data.py IV sample_3K.csv --area 215 --analyze \
         --rn-criterion 0.65 --split-sweeps
 
-    # Multi-T map + per-T analysis; jump Ic only below 10 K
+    # Explicit channels + phase-corrected dV/dI
+    python3 plot_csv_data.py IV sample_3K.csv --channel-dI X1 --channel-dV R2 \
+        --di-sense-R 4700 --analyze
+
+    # Multi-T map + per-T analysis; jump Ic only below 10 K;
+    # trust measured dI only up to 13.5 K (average spectrum above that)
     python3 plot_csv_data.py IV --multi-t-file map_2to35K.csv --IV-BF \
         --T-max 30 --per-T-analysis --analyze --area 215 \
+        --channel-dI X1 --channel-dV R2 \
+        --dI-T-range 2 13.5 \
         --ic-dvdi-range 2 10 --ic-I-min 1.8e-4 --ic-I-max 4e-4 \
         --rn-criterion 0.75 --tc-for-rn 7.5
 
@@ -262,6 +306,38 @@ Abstract example
 
 
 ================================================================================
+iv_conductance_plot.py — phase-corrected G(V) / multi-T waterfalls
+================================================================================
+Standalone script for publication-ready differential conductance plots.
+Uses the same phase-correction formula as IV mode in plot_csv_data.py.
+
+Typical invocations
+-------------------
+    # Interactive overlay of one or more single-T files
+    python3 iv_conductance_plot.py a.csv b.csv \
+        --R 4700 10000 --n-points 101 --bf 0 0 --x-scale 1e3
+
+    # Final PDF (requires --xlim, --ylim, -o)
+    python3 iv_conductance_plot.py a.csv b.csv \
+        --R 4700 10000 --n-points 101 --bf 0 0 \
+        --x-scale 1e3 --final --xlim -2 2 --ylim 0 0.8 -o overlay.pdf
+
+    # Multi-T waterfall from one map file
+    python3 iv_conductance_plot.py --multi-t map.csv \
+        --R 4700 --n-points 251 --bf 1 \
+        --offset 0.05 --x-scale 1e3 1e3
+
+    # Subset of temperatures (colours still span the full file range)
+    python3 iv_conductance_plot.py --multi-t map.csv \
+        --R 4700 --n-points 251 --bf 1 \
+        --T-initial 2 --T-final 10 --offset 0.05 --x-scale 1e3 1e3
+
+Channel defaults match plot_csv_data.py IV mode (dI = X1, dV = R2).
+Pass --channel-dI / --channel-dV if your rack wiring differs.
+Run  python3 iv_conductance_plot.py -h  for the full argument list.
+
+
+================================================================================
 Notes
 ================================================================================
 - Figure sizes are in centimetres (matplotlib inches = cm / 2.54).
@@ -269,3 +345,5 @@ Notes
   preferably taken from the filename; CLI flags override the parse.
 - After --per-T-analysis, use Ic_T_fit.py on the singles/ tree to fit Ic(T).
 - Run  python3 plot_csv_data.py <MODE> -h  for the live help of any mode.
+- Phase-corrected dV/dI is the default in IV mode; there is no flag to
+  disable it.  Ensure the correct LIA channels and sense resistor are set.
