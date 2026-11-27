@@ -40,21 +40,26 @@ CLI examples
         --R 4700 10000 --n-points 101 --bf 0 0 \\
         --x-scale 1e3 --final --xlim -2 2 --ylim 0 0.8 -o overlay.pdf
 
-    # multi-T waterfall (interactive)
-    python iv_conductance_plot.py map.csv --multi-t \\
+    # multi-T waterfall (file is the argument of --multi-t)
+    python iv_conductance_plot.py --multi-t map.csv \\
         --R 4700 --n-points 251 --bf 1 \\
-        --T-initial 2 --T-final 35 --T-step 0.5 \\
         --offset 0.05 --x-scale 1e3 1e3
 
-    # multi-T final PDFs — xlim/ylim are the *single-T* window;
-    # y is expanded by (n_T-1)*offset for the stack
-    python iv_conductance_plot.py map.csv --multi-t --final \\
+    # subset 2–10 K: colours still span the full file range (stay blue)
+    python iv_conductance_plot.py --multi-t map.csv \\
         --R 4700 --n-points 251 --bf 1 \\
-        --T-initial 2 --T-final 35 --T-step 0.5 \\
+        --T-initial 2 --T-final 10 --offset 0.05 --x-scale 1e3 1e3
+
+    # single temperature extracted from a multi-T file (colour from full range)
+    python iv_conductance_plot.py --multi-t map.csv --plot-single-T 5 \\
+        --R 4700 --n-points 251 --bf 1 --x-scale 1e3 1e3
+
+    # multi-T final PDFs — xlim/ylim are the *single-T* window (SI or scaled);
+    # y is expanded by (n_T-1)*offset for the stack
+    python iv_conductance_plot.py --multi-t map.csv --final \\
+        --R 4700 --n-points 251 --bf 1 \\
         --offset 0.05 --x-scale 1e3 1e3 \\
-        --xlim -5 5 -0.5 0.5 \\
-        --ylim 0 0.8 \\
-        -o waterfall.pdf
+        --xlim -5 5 -0.5 0.5 --ylim 0 0.8 -o waterfall.pdf
 """
 
 from __future__ import annotations
@@ -69,10 +74,17 @@ from typing import Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib import cm
 from matplotlib.axes import Axes
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
+
+
+def _cmap(name: str = "coolwarm"):
+    """Matplotlib ≥3.7 compatible colormap lookup."""
+    try:
+        return plt.colormaps[name]
+    except (AttributeError, KeyError):
+        return plt.get_cmap(name)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +301,7 @@ def _build_T_grid(
     T_step: Optional[float],
     filepath: str,
 ) -> np.ndarray:
+    """Full temperature grid used to segment the file (not the plot window)."""
     meta = _parse_temp_grid_from_filename(filepath)
     if T_initial is None:
         T_initial = meta.get("T_initial")
@@ -299,11 +312,10 @@ def _build_T_grid(
 
     if T_initial is None or T_final is None or T_step is None or T_step <= 0:
         raise ValueError(
-            "Temperature grid unknown. Pass --T-initial, --T-final, --T-step "
-            "or encode them in the filename (e.g. 2to35K_0.5Kstep)."
+            "Temperature grid unknown. Pass --T-grid-initial, --T-grid-final, "
+            "--T-step or encode them in the filename (e.g. 2to35K_0.5Kstep)."
         )
 
-    # inclusive grid; tolerate floating-point endpoints
     n = int(round((T_final - T_initial) / T_step)) + 1
     return T_initial + np.arange(n) * T_step
 
@@ -313,21 +325,26 @@ def load_multi_t_iv(
     R_sense: float,
     n_points: int,
     is_bf: bool = True,
-    T_initial: Optional[float] = None,
-    T_final: Optional[float] = None,
+    T_grid_initial: Optional[float] = None,
+    T_grid_final: Optional[float] = None,
     T_step: Optional[float] = None,
     channel_dI: str = "X1",
     channel_dV: str = "R2",
     theta_dI: str = "theta1",
     theta_dV: str = "theta2",
-) -> list[IVData]:
+) -> tuple[list[IVData], float, float]:
     """
     Split a multi-T rack IV file into one ``IVData`` per temperature setpoint.
 
-    Layout is chronological fixed-length blocks:
-        stride = 2*n_points - 1  if is_bf else n_points
-    Setpoints are assigned in order from the T grid (filename or explicit args).
-    Measured Tsample is stored for diagnostics but does not decide segmentation.
+    Always segments the **full** grid encoded in the filename (or explicit
+    grid arguments). Plot-range filtering (``--T-initial`` / ``--T-final``)
+    is applied later so colours stay anchored to the full data set.
+
+    Returns
+    -------
+    datasets : list[IVData]
+    T_full_min, T_full_max : float
+        Extremes of the loaded setpoints (for colormap normalisation).
     """
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(csv_path)
@@ -340,7 +357,7 @@ def load_multi_t_iv(
     with np.errstate(divide="ignore", invalid="ignore"):
         G_all = np.where(np.abs(dVdI_all) > 1e-30, 1.0 / dVdI_all, np.nan)
 
-    T_grid = _build_T_grid(T_initial, T_final, T_step, csv_path)
+    T_grid = _build_T_grid(T_grid_initial, T_grid_final, T_step, csv_path)
     stride = (2 * n_points - 1) if is_bf else n_points
     n_total = len(I_all)
     n_expected = len(T_grid) * stride
@@ -385,16 +402,87 @@ def load_multi_t_iv(
             G_full=block_G, branch_full=branch_full,
         ))
 
+    Ts = np.array([float(d.T_setpoint) for d in datasets])
+    T_full_min = float(Ts.min()) if len(Ts) else float("nan")
+    T_full_max = float(Ts.max()) if len(Ts) else float("nan")
+
     print(
         f"  [multi-T] {n_seg} temperature(s) from {csv_path}  "
-        f"(stride={stride}, n_points={n_points}, bf={is_bf})"
+        f"(stride={stride}, n_points={n_points}, bf={is_bf}, "
+        f"T full range [{T_full_min:g}, {T_full_max:g}] K)"
     )
-    return datasets
+    return datasets, T_full_min, T_full_max
 
 
 # ---------------------------------------------------------------------------
 # Plotting – single / overlay
 # ---------------------------------------------------------------------------
+
+# SI base symbols for axis quantities
+_BASE_UNIT = {
+    "V": "V",
+    "I": "A",
+    "G": "S",
+    "dVdI": r"$\Omega$",
+}
+
+
+def _si_prefix(scale: float) -> tuple[str, str]:
+    """
+    Map a multiplicative scale factor to an SI prefix and a short name.
+
+    scale multiplies the *raw SI value* before plotting, so:
+        1    → no prefix (V, A, S, Ω)
+        1e3  → milli  (mV, mA, mS, mΩ)
+        1e6  → micro  (µV, µA, µS, µΩ)
+        1e-3 → kilo   (kV, kA, kS, kΩ)
+    """
+    # tolerate float noise around exact decade values
+    decades = {
+        1e-12: ("T", "tera"),
+        1e-9: ("G", "giga"),
+        1e-6: ("M", "mega"),
+        1e-3: ("k", "kilo"),
+        1.0: ("", ""),
+        1e3: ("m", "milli"),
+        1e6: (r"$\mu$", "micro"),
+        1e9: ("n", "nano"),
+        1e12: ("p", "pico"),
+    }
+    for factor, (sym, name) in decades.items():
+        if abs(scale - factor) / factor < 1e-9:
+            return sym, name
+    # arbitrary scale: no named prefix
+    return "", ""
+
+
+def _axis_label(quantity: str, scale: float) -> str:
+    """Pretty axis label with SI prefix inferred from *scale*."""
+    base = _BASE_UNIT[quantity]
+    prefix, _ = _si_prefix(scale)
+    if quantity == "dVdI":
+        # base already contains mathtext Omega
+        if prefix:
+            return rf"$dV/dI$ ({prefix}$\Omega$)"
+        return r"$dV/dI$ ($\Omega$)"
+    symbol = {"V": "V", "I": "I", "G": "G"}[quantity]
+    unit = f"{prefix}{base}" if prefix else base
+    return rf"${symbol}$ ({unit})"
+
+
+def _fmt_limit_with_unit(value: float, quantity: str, scale: float) -> str:
+    """Format a limit value with the unit implied by *scale* (plot units)."""
+    prefix, _ = _si_prefix(scale)
+    base = _BASE_UNIT[quantity]
+    if quantity == "dVdI":
+        unit = f"{prefix}Ω" if prefix and prefix != r"$\mu$" else (
+            "µΩ" if prefix == r"$\mu$" else "Ω"
+        )
+    else:
+        plain_prefix = "µ" if prefix == r"$\mu$" else prefix
+        unit = f"{plain_prefix}{base}"
+    return f"{value:g} {unit}"
+
 
 def plot_G_vs_V(
     data: Union[IVData, Sequence[IVData]],
@@ -407,6 +495,7 @@ def plot_G_vs_V(
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
     use_full: bool = False,
+    color: Optional[Union[str, tuple]] = None,
     marker: str = ".",
     markersize: float = 6,
     linestyle: str = "none",
@@ -426,17 +515,17 @@ def plot_G_vs_V(
     else:
         fig = ax.figure
 
-    colors = plt.rcParams["axes.prop_cycle"].by_key().get(
+    cycle = plt.rcParams["axes.prop_cycle"].by_key().get(
         "color", ["k", "C0", "C1", "C2", "C3"]
     )
 
     for i, d in enumerate(datasets):
+        c = color if color is not None else cycle[i % len(cycle)]
         if use_full and d.is_bf and d.V_full is not None:
             x_raw = d.V_full if x_quantity == "V" else d.I_full
             y_raw = d.G_full if quantity == "G" else d.dVdI_full
             br = d.branch_full
-            for bname, bcolor in (("forward", colors[i % len(colors)]),
-                                  ("backward", "C3")):
+            for bname, bcolor in (("forward", c), ("backward", "C3")):
                 m = br == bname
                 if not np.any(m):
                     continue
@@ -452,18 +541,14 @@ def plot_G_vs_V(
             ax.plot(
                 x_raw * x_scale, y_raw * y_scale,
                 marker=marker, markersize=markersize,
-                linestyle=linestyle,
-                color=colors[i % len(colors)],
+                linestyle=linestyle, color=c,
                 alpha=alpha, label=d.label,
             )
 
     if xlabel is None:
-        if x_quantity == "V":
-            xlabel = r"$V$ (mV)" if abs(x_scale - 1e3) < 1e-9 else r"$V$ (V)"
-        else:
-            xlabel = r"$I$ (mA)" if abs(x_scale - 1e3) < 1e-9 else r"$I$ (A)"
+        xlabel = _axis_label(x_quantity, x_scale)
     if ylabel is None:
-        ylabel = r"$G$ (S)" if quantity == "G" else r"$dV/dI$ ($\Omega$)"
+        ylabel = _axis_label(quantity, y_scale)
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -491,11 +576,20 @@ def overlay_files(
 # Plotting – multi-T waterfall
 # ---------------------------------------------------------------------------
 
-def _temperature_colormap(n: int):
-    """Dark blue (cold) → red (warm)."""
-    # coolwarm maps low→blue, high→red; skip the very pale centre for clarity
-    base = cm.get_cmap("coolwarm", max(n, 2))
-    return [base(i / max(n - 1, 1)) for i in range(n)]
+def _T_key(d: IVData) -> float:
+    if d.T_setpoint is not None:
+        return float(d.T_setpoint)
+    if d.T is not None and np.any(np.isfinite(d.T)):
+        return float(np.nanmean(d.T))
+    return 0.0
+
+
+def _color_for_T(T: float, T_min: float, T_max: float):
+    """Colour of temperature *T* on the full-range coolwarm scale."""
+    cmap = _cmap("coolwarm")
+    if not np.isfinite(T_min) or not np.isfinite(T_max) or T_max <= T_min:
+        return cmap(0.0)
+    return cmap((float(T) - T_min) / (T_max - T_min))
 
 
 def plot_waterfall(
@@ -510,6 +604,8 @@ def plot_waterfall(
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
     use_full: bool = False,
+    T_norm_min: Optional[float] = None,
+    T_norm_max: Optional[float] = None,
     marker: str = ".",
     markersize: float = 3,
     linestyle: str = "none",
@@ -521,23 +617,20 @@ def plot_waterfall(
     """
     Offset-stack of G (or dV/dI) vs V or I for a temperature series.
 
-    Each curve is shifted by ``k * offset`` (after ``y_scale``). Colours run
-    dark blue (lowest T) → red (highest T).
+    Each curve is shifted by ``k * offset`` in **SI units** of the y-quantity
+    (S or Ω); data and offset are then multiplied by ``y_scale`` so the
+    visual spacing is preserved when the axis unit changes.
+
+    Colours use the **full** temperature range ``[T_norm_min, T_norm_max]``
+    (defaults to the min/max of *datasets*), so a cold subset stays blue.
     """
     if not datasets:
         raise ValueError("plot_waterfall: empty dataset list.")
 
-    # sort by setpoint (or measured mean T)
-    def _T_key(d: IVData) -> float:
-        if d.T_setpoint is not None:
-            return float(d.T_setpoint)
-        if d.T is not None and np.any(np.isfinite(d.T)):
-            return float(np.nanmean(d.T))
-        return 0.0
-
     datasets = sorted(datasets, key=_T_key)
     Ts = np.array([_T_key(d) for d in datasets])
-    colors = _temperature_colormap(len(datasets))
+    t0 = float(T_norm_min) if T_norm_min is not None else float(Ts.min())
+    t1 = float(T_norm_max) if T_norm_max is not None else float(Ts.max())
 
     if ax is None:
         set_paper_style()
@@ -553,22 +646,26 @@ def plot_waterfall(
             x_raw = d.V if x_quantity == "V" else d.I
             y_raw = d.G if quantity == "G" else d.dVdI
 
-        y_plot = y_raw * y_scale + k * offset
+        # offset is SI; scale data and offset together
+        y_plot = (y_raw + k * offset) * y_scale
         ax.plot(
             x_raw * x_scale, y_plot,
             marker=marker, markersize=markersize,
-            linestyle=linestyle, color=colors[k], alpha=alpha,
+            linestyle=linestyle,
+            color=_color_for_T(_T_key(d), t0, t1),
+            alpha=alpha,
             label=d.label,
         )
 
     if xlabel is None:
-        if x_quantity == "V":
-            xlabel = r"$V$ (mV)" if abs(x_scale - 1e3) < 1e-9 else r"$V$ (V)"
-        else:
-            xlabel = r"$I$ (mA)" if abs(x_scale - 1e3) < 1e-9 else r"$I$ (A)"
+        xlabel = _axis_label(x_quantity, x_scale)
     if ylabel is None:
-        base = r"$G$ (S)" if quantity == "G" else r"$dV/dI$ ($\Omega$)"
-        ylabel = base + (f"  + offset ({offset:g} / curve)" if offset else "")
+        base = _axis_label(quantity, y_scale)
+        if offset:
+            off_scaled = offset * y_scale
+            ylabel = base + f"  + offset ({off_scaled:g} / curve)"
+        else:
+            ylabel = base
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -576,9 +673,9 @@ def plot_waterfall(
         ax.set_title(title)
     ax.grid(True, which="both", alpha=0.2)
 
-    if show_colorbar and len(Ts) > 1:
-        norm = Normalize(vmin=Ts.min(), vmax=Ts.max())
-        sm = cm.ScalarMappable(cmap=cm.get_cmap("coolwarm"), norm=norm)
+    if show_colorbar:
+        norm = Normalize(vmin=t0, vmax=t1 if t1 > t0 else t0 + 1.0)
+        sm = plt.cm.ScalarMappable(cmap=_cmap("coolwarm"), norm=norm)
         sm.set_array([])
         cbar = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.04)
         cbar.set_label(r"$T$ (K)")
@@ -670,19 +767,21 @@ def _expand_ylim_for_waterfall(
     ylim_single: Optional[Sequence[float]],
     n_curves: int,
     offset: float,
+    y_scale: float = 1.0,
 ) -> Optional[list[float]]:
     """
-    Map a single-T y-window onto the full waterfall stack.
+    Map a single-T y-window (in *scaled* plot units) onto the waterfall stack.
 
-    Curve k is drawn at ``y_scaled + k * offset``, so the top of the stack
-    sits ``(n_curves - 1) * offset`` above the single-T ymax.
+    Curve k is drawn at ``(y_SI + k * offset_SI) * y_scale``, so the top of
+    the stack sits ``(n_curves - 1) * offset * y_scale`` above the single-T
+    ymax (offset is SI; ylim is already scaled).
     """
     if ylim_single is None:
         return None
     ymin, ymax = float(ylim_single[0]), float(ylim_single[1])
     if n_curves < 1:
         return [ymin, ymax]
-    return [ymin, ymax + (n_curves - 1) * offset]
+    return [ymin, ymax + (n_curves - 1) * offset * y_scale]
 
 
 def _apply_limits(ax: Axes, xlim, ylim) -> None:
@@ -737,6 +836,39 @@ def _finish_figure(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _report_limits(
+    which: str,
+    xlim,
+    ylim,
+    *,
+    x_quantity: str,
+    y_quantity: str,
+    x_scale: float,
+    y_scale: float,
+    expanded: bool = False,
+) -> None:
+    """Print axis windows with explicit units (plot units after scaling)."""
+    parts = []
+    if xlim is not None:
+        parts.append(
+            f"xlim=[{_fmt_limit_with_unit(xlim[0], x_quantity, x_scale)}, "
+            f"{_fmt_limit_with_unit(xlim[1], x_quantity, x_scale)}]"
+        )
+    if ylim is not None:
+        tag = "ylim (waterfall)" if expanded else "ylim (single-T)"
+        parts.append(
+            f"{tag}=[{_fmt_limit_with_unit(ylim[0], y_quantity, y_scale)}, "
+            f"{_fmt_limit_with_unit(ylim[1], y_quantity, y_scale)}]"
+        )
+    if parts:
+        print(f"  [limits {which}] " + "  ".join(parts))
+    # always remind of the SI base of the raw arrays
+    print(
+        f"  [units] raw data in SI: V→V, I→A, G→S, dV/dI→Ω; "
+        f"plot scales x={x_scale:g}, y={y_scale:g}"
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
@@ -746,13 +878,22 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("csv_files", nargs="+", help="Measurement CSV path(s).")
-
     p.add_argument(
-        "--multi-t", action="store_true",
+        "csv_files", nargs="*", default=[],
+        help="Single-T measurement CSV path(s). Not used with --multi-t.",
+    )
+    p.add_argument(
+        "--multi-t", metavar="CSV", default=None,
         help=(
-            "Treat the (single) CSV as a multi-temperature map and produce "
-            "waterfall plots G(V) and G(I)."
+            "Path to a multi-temperature IV CSV. Enables the waterfall "
+            "(or --plot-single-T) pipeline on that file."
+        ),
+    )
+    p.add_argument(
+        "--plot-single-T", type=float, default=None, metavar="T_K",
+        help=(
+            "With --multi-t: plot only this temperature (K), closest setpoint. "
+            "Colour is taken from the full data-set range. No offset."
         ),
     )
 
@@ -770,13 +911,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Back-and-forth flag(s). One value, or one per file.",
     )
 
-    # multi-T grid (optional if encoded in filename)
-    p.add_argument("--T-initial", type=float, default=None, help="First T setpoint (K).")
-    p.add_argument("--T-final", type=float, default=None, help="Last T setpoint (K).")
-    p.add_argument("--T-step", type=float, default=None, help="T step (K).")
+    # plot window in temperature (filters curves; does not change colormap)
+    p.add_argument(
+        "--T-initial", type=float, default=None,
+        help="Lowest T (K) to *plot* from a multi-T file (colour still uses full range).",
+    )
+    p.add_argument(
+        "--T-final", type=float, default=None,
+        help="Highest T (K) to *plot* from a multi-T file (colour still uses full range).",
+    )
+    # optional overrides for the segmentation grid when the filename lacks it
+    p.add_argument(
+        "--T-grid-initial", type=float, default=None,
+        help="Full-grid start (K) for segmentation if not in the filename.",
+    )
+    p.add_argument(
+        "--T-grid-final", type=float, default=None,
+        help="Full-grid end (K) for segmentation if not in the filename.",
+    )
+    p.add_argument(
+        "--T-step", type=float, default=None,
+        help="T step (K) for the full segmentation grid if not in the filename.",
+    )
     p.add_argument(
         "--offset", type=float, default=0.05,
-        help="Vertical offset per temperature curve in waterfall plots.",
+        help=(
+            "Vertical offset per temperature curve in SI units of the "
+            "y-quantity (S for G, Ω for dV/dI). Scaled together with --y-scale."
+        ),
     )
 
     p.add_argument("--quantity", choices=["G", "dVdI"], default="G",
@@ -785,33 +947,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--x-scale", type=float, nargs="+", default=[1.0],
         metavar="S",
         help=(
-            "Horizontal scale factor(s): one value for both plots, or two "
-            "values (V-plot, I-plot). Example: --x-scale 1e3 1e3 plots mV and mA."
+            "Multiply raw SI x-data before plotting. "
+            "1 → V/A, 1e3 → mV/mA, 1e6 → µV/µA. "
+            "One value for both plots, or two (V-plot, I-plot)."
         ),
     )
     p.add_argument(
         "--y-scale", type=float, nargs="+", default=[1.0],
         metavar="S",
         help=(
-            "Vertical scale factor(s): one value for both plots, or two "
-            "values (V-plot, I-plot)."
+            "Multiply raw SI y-data before plotting. "
+            "1 → S or Ω, 1e3 → mS or mΩ, 1e6 → µS or µΩ. "
+            "One value for both plots, or two (V-plot, I-plot)."
         ),
     )
     p.add_argument(
         "--xlim", type=float, nargs="+", default=None, metavar="X",
         help=(
-            "X-axis window for a *single temperature*: "
-            "2 values (shared by V and I plots) or 4 values "
-            "(Vmin Vmax Imin Imax). Units are after --x-scale."
+            "X-axis window for a *single temperature* in *scaled* units: "
+            "2 values (shared) or 4 values (Vmin Vmax Imin Imax)."
         ),
     )
     p.add_argument(
         "--ylim", type=float, nargs="+", default=None, metavar="Y",
         help=(
-            "Y-axis window for a *single temperature* (no offset): "
-            "2 values (shared) or 4 values (V-plot ymin ymax, I-plot ymin ymax). "
-            "For multi-T waterfalls the upper limit is expanded by "
-            "(n_T-1)*--offset so every curve stays inside the frame."
+            "Y-axis window for a *single temperature* (no offset) in *scaled* units: "
+            "2 values (shared) or 4 values (V-plot, I-plot). "
+            "Waterfalls expand ymax by (n_T-1)*--offset."
         ),
     )
     p.add_argument("--labels", nargs="+", default=None,
@@ -823,16 +985,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--final", action="store_true",
         help=(
             "Publication mode: skip interactive window, write PDF only. "
-            "Requires --xlim, --ylim and -o/--output. "
-            "ylim is the single-T window; waterfalls expand it automatically."
+            "Requires --xlim, --ylim and -o/--output."
         ),
     )
     p.add_argument(
         "-o", "--output", default=None,
         help=(
             "Output path for the PDF/PNG. Used only with --final. "
-            "For multi-T, this is the G-vs-V file; G-vs-I is written next to "
-            "it with suffix _vs_I."
+            "For multi-T, this is the G-vs-V file; G-vs-I gets suffix _vs_I."
         ),
     )
     p.add_argument(
@@ -842,6 +1002,37 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _filter_by_T_window(
+    datasets: list[IVData],
+    T_lo: Optional[float],
+    T_hi: Optional[float],
+) -> list[IVData]:
+    if T_lo is None and T_hi is None:
+        return datasets
+    out = []
+    for d in datasets:
+        T = _T_key(d)
+        if T_lo is not None and T < T_lo - 1e-9:
+            continue
+        if T_hi is not None and T > T_hi + 1e-9:
+            continue
+        out.append(d)
+    return out
+
+
+def _pick_single_T(datasets: list[IVData], T_target: float) -> IVData:
+    if not datasets:
+        raise SystemExit("No temperature segments available.")
+    Ts = np.array([_T_key(d) for d in datasets])
+    idx = int(np.argmin(np.abs(Ts - T_target)))
+    chosen = datasets[idx]
+    print(
+        f"  [single-T] requested {T_target:g} K → closest setpoint "
+        f"{_T_key(chosen):g} K (index {idx}/{len(datasets)-1})"
+    )
+    return chosen
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _build_parser().parse_args(argv)
 
@@ -849,86 +1040,178 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     y_scale_V, y_scale_I = _scales_VI(args.y_scale, "--y-scale")
     xlim_V, xlim_I = _limits_VI(args.xlim, "--xlim")
     ylim_V, ylim_I = _limits_VI(args.ylim, "--ylim")
+    y_qty = args.quantity
 
     # ----- multi-T pipeline -----
-    if args.multi_t:
-        if len(args.csv_files) != 1:
-            raise SystemExit("--multi-t expects exactly one CSV file.")
+    if args.multi_t is not None:
+        if args.csv_files:
+            raise SystemExit(
+                "Do not pass positional CSV files together with --multi-t CSV; "
+                "the multi-T file is the argument of --multi-t."
+            )
         R = _expand_per_file(args.R_sense, 1, "--R")[0]
         n_pts = _expand_per_file(args.n_points, 1, "--n-points")[0]
         is_bf = _expand_per_file(args.bf, 1, "--bf")[0]
 
-        datasets = load_multi_t_iv(
-            args.csv_files[0],
+        all_datasets, T_full_min, T_full_max = load_multi_t_iv(
+            args.multi_t,
             R_sense=R,
             n_points=n_pts,
             is_bf=is_bf,
-            T_initial=args.T_initial,
-            T_final=args.T_final,
+            T_grid_initial=args.T_grid_initial,
+            T_grid_final=args.T_grid_final,
             T_step=args.T_step,
         )
-        if not datasets:
+        if not all_datasets:
             raise SystemExit("No temperature segments extracted.")
 
+        # --- single temperature from multi-T file ---
+        if args.plot_single_T is not None:
+            d = _pick_single_T(all_datasets, args.plot_single_T)
+            color = _color_for_T(_T_key(d), T_full_min, T_full_max)
+
+            fig_v, ax_v = plot_G_vs_V(
+                d, quantity=args.quantity, x_quantity="V",
+                x_scale=x_scale_V, y_scale=y_scale_V,
+                use_full=args.use_full, color=color, show=False,
+                title=rf"{args.quantity}$(V)$ at {_T_key(d):g} K",
+            )
+            _report_limits(
+                "V", xlim_V, ylim_V,
+                x_quantity="V", y_quantity=y_qty,
+                x_scale=x_scale_V, y_scale=y_scale_V,
+            )
+            _finish_figure(
+                fig_v, ax_v, final=args.final, output=args.output,
+                xlim=xlim_V, ylim=ylim_V, no_show=args.no_show,
+            )
+
+            fig_i, ax_i = plot_G_vs_V(
+                d, quantity=args.quantity, x_quantity="I",
+                x_scale=x_scale_I, y_scale=y_scale_I,
+                use_full=args.use_full, color=color, show=False,
+                title=rf"{args.quantity}$(I)$ at {_T_key(d):g} K",
+            )
+            out_i = None
+            if args.output:
+                root, ext = os.path.splitext(args.output)
+                out_i = f"{root}_vs_I{ext or '.pdf'}"
+            _report_limits(
+                "I", xlim_I, ylim_I,
+                x_quantity="I", y_quantity=y_qty,
+                x_scale=x_scale_I, y_scale=y_scale_I,
+            )
+            _finish_figure(
+                fig_i, ax_i, final=args.final, output=out_i,
+                xlim=xlim_I, ylim=ylim_I, no_show=args.no_show,
+            )
+            return
+
+        # --- waterfall (possibly T-windowed) ---
+        datasets = _filter_by_T_window(
+            all_datasets, args.T_initial, args.T_final,
+        )
+        if not datasets:
+            raise SystemExit(
+                "No temperatures left after --T-initial/--T-final filter."
+            )
+        if args.T_initial is not None or args.T_final is not None:
+            print(
+                f"  [plot window] showing {len(datasets)}/{len(all_datasets)} "
+                f"curves in "
+                f"[{args.T_initial if args.T_initial is not None else T_full_min:g}, "
+                f"{args.T_final if args.T_final is not None else T_full_max:g}] K; "
+                f"colours normalised to full range "
+                f"[{T_full_min:g}, {T_full_max:g}] K"
+            )
+
         n_T = len(datasets)
-        ylim_V_plot = _expand_ylim_for_waterfall(ylim_V, n_T, args.offset)
-        ylim_I_plot = _expand_ylim_for_waterfall(ylim_I, n_T, args.offset)
+        ylim_V_plot = _expand_ylim_for_waterfall(
+            ylim_V, n_T, args.offset, y_scale=y_scale_V,
+        )
+        ylim_I_plot = _expand_ylim_for_waterfall(
+            ylim_I, n_T, args.offset, y_scale=y_scale_I,
+        )
+
         if ylim_V is not None:
             print(
-                f"  [limits] single-T ylim V {ylim_V} → waterfall {ylim_V_plot} "
-                f"({n_T} curves, offset={args.offset:g})"
+                f"  [limits] single-T ylim V "
+                f"[{_fmt_limit_with_unit(ylim_V[0], y_qty, y_scale_V)}, "
+                f"{_fmt_limit_with_unit(ylim_V[1], y_qty, y_scale_V)}] "
+                f"→ waterfall "
+                f"[{_fmt_limit_with_unit(ylim_V_plot[0], y_qty, y_scale_V)}, "
+                f"{_fmt_limit_with_unit(ylim_V_plot[1], y_qty, y_scale_V)}] "
+                f"({n_T} curves, offset={args.offset:g} SI "
+                f"→ {args.offset * y_scale_V:g} plot units)"
             )
         if ylim_I is not None and ylim_I != ylim_V:
             print(
-                f"  [limits] single-T ylim I {ylim_I} → waterfall {ylim_I_plot} "
-                f"({n_T} curves, offset={args.offset:g})"
+                f"  [limits] single-T ylim I "
+                f"[{_fmt_limit_with_unit(ylim_I[0], y_qty, y_scale_I)}, "
+                f"{_fmt_limit_with_unit(ylim_I[1], y_qty, y_scale_I)}] "
+                f"→ waterfall "
+                f"[{_fmt_limit_with_unit(ylim_I_plot[0], y_qty, y_scale_I)}, "
+                f"{_fmt_limit_with_unit(ylim_I_plot[1], y_qty, y_scale_I)}] "
+                f"({n_T} curves, offset={args.offset:g} SI "
+                f"→ {args.offset * y_scale_I:g} plot units)"
             )
 
-        # G vs V waterfall
+        title_v = r"$G(V)$" if args.quantity == "G" else r"$dV/dI(V)$"
+        title_i = r"$G(I)$" if args.quantity == "G" else r"$dV/dI(I)$"
+
         fig_v, ax_v = plot_waterfall(
             datasets,
-            quantity=args.quantity,
-            x_quantity="V",
+            quantity=args.quantity, x_quantity="V",
             offset=args.offset,
-            x_scale=x_scale_V,
-            y_scale=y_scale_V,
+            x_scale=x_scale_V, y_scale=y_scale_V,
             use_full=args.use_full,
+            T_norm_min=T_full_min, T_norm_max=T_full_max,
             show=False,
-            title=r"$G(V)$ temperature waterfall" if args.quantity == "G"
-                  else r"$dV/dI(V)$ temperature waterfall",
+            title=title_v,
         )
-        out_v = args.output
+        _report_limits(
+            "V", xlim_V, ylim_V_plot,
+            x_quantity="V", y_quantity=y_qty,
+            x_scale=x_scale_V, y_scale=y_scale_V, expanded=True,
+        )
         _finish_figure(
-            fig_v, ax_v,
-            final=args.final, output=out_v,
+            fig_v, ax_v, final=args.final, output=args.output,
             xlim=xlim_V, ylim=ylim_V_plot, no_show=args.no_show,
         )
 
-        # G vs I waterfall
         fig_i, ax_i = plot_waterfall(
             datasets,
-            quantity=args.quantity,
-            x_quantity="I",
+            quantity=args.quantity, x_quantity="I",
             offset=args.offset,
-            x_scale=x_scale_I,
-            y_scale=y_scale_I,
+            x_scale=x_scale_I, y_scale=y_scale_I,
             use_full=args.use_full,
+            T_norm_min=T_full_min, T_norm_max=T_full_max,
             show=False,
-            title=r"$G(I)$ temperature waterfall" if args.quantity == "G"
-                  else r"$dV/dI(I)$ temperature waterfall",
+            title=title_i,
         )
         out_i = None
         if args.output:
             root, ext = os.path.splitext(args.output)
             out_i = f"{root}_vs_I{ext or '.pdf'}"
+        _report_limits(
+            "I", xlim_I, ylim_I_plot,
+            x_quantity="I", y_quantity=y_qty,
+            x_scale=x_scale_I, y_scale=y_scale_I, expanded=True,
+        )
         _finish_figure(
-            fig_i, ax_i,
-            final=args.final, output=out_i,
+            fig_i, ax_i, final=args.final, output=out_i,
             xlim=xlim_I, ylim=ylim_I_plot, no_show=args.no_show,
         )
         return
 
     # ----- single-T / multi-file overlay (vs V) -----
+    if not args.csv_files:
+        raise SystemExit(
+            "Pass one or more single-T CSV files, or use --multi-t FILE."
+        )
+    if args.plot_single_T is not None:
+        raise SystemExit("--plot-single-T requires --multi-t FILE.")
+
     n = len(args.csv_files)
     labels = args.labels
     if labels is not None and len(labels) != n:
@@ -963,6 +1246,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         y_scale=y_scale_V,
         use_full=args.use_full,
         show=False,
+    )
+    _report_limits(
+        "V", xlim_V, ylim_V,
+        x_quantity="V", y_quantity=y_qty,
+        x_scale=x_scale_V, y_scale=y_scale_V,
     )
     _finish_figure(
         fig, ax,
